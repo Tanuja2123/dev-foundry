@@ -146,6 +146,13 @@ code {
   color: var(--text-muted);
 }
 
+.sidebar-status {
+  margin: 0;
+  padding: 0 10px;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
 .project-list {
   display: flex;
   flex-direction: column;
@@ -234,6 +241,16 @@ code {
 .chat-empty p {
   margin: 0;
   color: var(--text-muted);
+}
+
+.chat-error {
+  width: min(760px, calc(100% - 32px));
+  margin: 0 auto 12px;
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  border-radius: 8px;
+  padding: 10px 12px;
 }
 
 .bubble {

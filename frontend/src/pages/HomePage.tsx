@@ -1,9 +1,9 @@
 import { useMsal } from '@azure/msal-react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { continueChat, listConversations } from '../api/chat'
 import { ChatPanel } from '../components/ChatPanel'
 import { Sidebar } from '../components/Sidebar'
-import { PROJECTS } from '../constants'
-import type { ChatMessage } from '../types'
+import type { ChatMessage, Project } from '../types'
 
 function createId() {
   return crypto.randomUUID()
@@ -12,66 +12,130 @@ function createId() {
 export function HomePage() {
   const { instance, accounts } = useMsal()
   const account = instance.getActiveAccount() ?? accounts[0]
-  const [selectedProjectId, setSelectedProjectId] = useState(PROJECTS[0].id)
-  const [messagesByProject, setMessagesByProject] = useState<
+  const [conversations, setConversations] = useState<Project[]>([])
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [listStatus, setListStatus] = useState<string | null>('Loading conversations…')
+  const [messagesByConversation, setMessagesByConversation] = useState<
     Record<string, ChatMessage[]>
   >({})
-  const [filesByProject, setFilesByProject] = useState<Record<string, File[]>>(
-    {},
-  )
+  const [filesByConversation, setFilesByConversation] = useState<
+    Record<string, File[]>
+  >({})
+  const [sending, setSending] = useState(false)
+  const [chatError, setChatError] = useState<string | null>(null)
 
-  const project =
-    PROJECTS.find((item) => item.id === selectedProjectId) ?? PROJECTS[0]
-  const messages = messagesByProject[project.id] ?? []
-  const files = filesByProject[project.id] ?? []
+  useEffect(() => {
+    let cancelled = false
+
+    async function load() {
+      try {
+        const items = await listConversations()
+        if (cancelled) return
+        const mapped = items.map((item) => ({
+          id: item.conversation_id,
+          name: item.title,
+        }))
+        setConversations(mapped)
+        setSelectedId((current) => current ?? mapped[0]?.id ?? null)
+        setListStatus(mapped.length === 0 ? 'No conversations yet.' : null)
+      } catch (reason) {
+        if (cancelled) return
+        setListStatus(
+          reason instanceof Error
+            ? reason.message
+            : 'Could not load conversations.',
+        )
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const conversation =
+    conversations.find((item) => item.id === selectedId) ?? null
+  const messages = conversation
+    ? (messagesByConversation[conversation.id] ?? [])
+    : []
+  const files = conversation ? (filesByConversation[conversation.id] ?? []) : []
   const displayName = account?.name ?? account?.username ?? 'Signed in'
 
-  function sendMessage(content: string) {
+  function selectConversation(conversationId: string) {
+    setSelectedId(conversationId)
+    setChatError(null)
+  }
+
+  async function sendMessage(content: string) {
+    if (!conversation || sending) return
+    const conversationId = conversation.id
     const userMessage: ChatMessage = {
       id: createId(),
       role: 'user',
       content,
     }
-    const assistantMessage: ChatMessage = {
-      id: createId(),
-      role: 'assistant',
-      content: `Received for ${project.name}. Chat backend is not connected yet.`,
-    }
 
-    setMessagesByProject((current) => ({
+    setChatError(null)
+    setSending(true)
+    setMessagesByConversation((current) => ({
       ...current,
-      [project.id]: [...(current[project.id] ?? []), userMessage, assistantMessage],
+      [conversationId]: [...(current[conversationId] ?? []), userMessage],
     }))
+
+    try {
+      const result = await continueChat(conversationId, content)
+      const assistantMessage: ChatMessage = {
+        id: createId(),
+        role: 'assistant',
+        content: result.response,
+      }
+      setMessagesByConversation((current) => ({
+        ...current,
+        [conversationId]: [...(current[conversationId] ?? []), assistantMessage],
+      }))
+    } catch (reason) {
+      setChatError(
+        reason instanceof Error ? reason.message : 'Chat request failed.',
+      )
+    } finally {
+      setSending(false)
+    }
   }
 
   function addFiles(fileList: FileList) {
+    if (!conversation) return
     const incoming = Array.from(fileList)
-    setFilesByProject((current) => {
-      const existing = current[project.id] ?? []
+    setFilesByConversation((current) => {
+      const existing = current[conversation.id] ?? []
       const names = new Set(existing.map((file) => file.name))
       const unique = incoming.filter((file) => !names.has(file.name))
-      return { ...current, [project.id]: [...existing, ...unique] }
+      return { ...current, [conversation.id]: [...existing, ...unique] }
     })
   }
 
   function removeFile(name: string) {
-    setFilesByProject((current) => ({
+    if (!conversation) return
+    setFilesByConversation((current) => ({
       ...current,
-      [project.id]: (current[project.id] ?? []).filter((file) => file.name !== name),
+      [conversation.id]: (current[conversation.id] ?? []).filter(
+        (file) => file.name !== name,
+      ),
     }))
   }
 
   return (
     <div className="app-shell">
       <Sidebar
-        projects={PROJECTS}
-        selectedProjectId={project.id}
-        onSelectProject={setSelectedProjectId}
+        projects={conversations}
+        selectedProjectId={conversation?.id ?? null}
+        onSelectProject={selectConversation}
+        status={listStatus}
       />
       <div className="main">
         <header className="topbar">
           <div>
-            <h1>{project.name}</h1>
+            <h1>{conversation?.name ?? 'Conversations'}</h1>
             <p>Requirement chat</p>
           </div>
           <div className="topbar-user">
@@ -81,14 +145,25 @@ export function HomePage() {
             </button>
           </div>
         </header>
-        <ChatPanel
-          project={project}
-          messages={messages}
-          files={files}
-          onSend={sendMessage}
-          onFilesAdded={addFiles}
-          onRemoveFile={removeFile}
-        />
+        {conversation ? (
+          <ChatPanel
+            project={conversation}
+            messages={messages}
+            files={files}
+            sending={sending}
+            error={chatError}
+            onSend={(content) => void sendMessage(content)}
+            onFilesAdded={addFiles}
+            onRemoveFile={removeFile}
+          />
+        ) : (
+          <section className="chat-panel">
+            <div className="chat-empty">
+              <h2>Conversations</h2>
+              <p>{listStatus ?? 'Select a conversation to continue.'}</p>
+            </div>
+          </section>
+        )}
       </div>
     </div>
   )
