@@ -6,6 +6,8 @@ type ChatPanelProps = {
   project: Project
   messages: ChatMessage[]
   files: File[]
+  sending: boolean
+  error: string | null
   onSend: (content: string) => void
   onFilesAdded: (files: FileList) => void
   onRemoveFile: (name: string) => void
@@ -15,6 +17,8 @@ export function ChatPanel({
   project,
   messages,
   files,
+  sending,
+  error,
   onSend,
   onFilesAdded,
   onRemoveFile,
@@ -22,7 +26,10 @@ export function ChatPanel({
   const [draft, setDraft] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
-  const canSend = useMemo(() => draft.trim().length > 0, [draft])
+  const canSend = useMemo(
+    () => draft.trim().length > 0 && !sending,
+    [draft, sending],
+  )
 
   function submit() {
     const content = draft.trim()
@@ -62,6 +69,8 @@ export function ChatPanel({
           ))
         )}
       </div>
+
+      {error && <p className="chat-error">{error}</p>}
 
       <div className="composer">
         {files.length > 0 && (
@@ -106,11 +115,12 @@ export function ChatPanel({
             rows={1}
             value={draft}
             placeholder={`Message ${project.name}…`}
+            disabled={sending}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={onKeyDown}
           />
           <button type="button" className="send-button" disabled={!canSend} onClick={submit}>
-            Send
+            {sending ? 'Sending…' : 'Send'}
           </button>
         </div>
       </div>

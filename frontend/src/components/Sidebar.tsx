@@ -2,20 +2,23 @@ import type { Project } from '../types'
 
 type SidebarProps = {
   projects: Project[]
-  selectedProjectId: string
+  selectedProjectId: string | null
   onSelectProject: (projectId: string) => void
+  status?: string | null
 }
 
 export function Sidebar({
   projects,
   selectedProjectId,
   onSelectProject,
+  status,
 }: SidebarProps) {
   return (
     <aside className="sidebar">
       <div className="sidebar-brand">DevFoundry</div>
-      <p className="sidebar-label">Projects</p>
-      <nav className="project-list" aria-label="Projects">
+      <p className="sidebar-label">Conversations</p>
+      {status && <p className="sidebar-status">{status}</p>}
+      <nav className="project-list" aria-label="Conversations">
         {projects.map((project) => (
           <button
             key={project.id}

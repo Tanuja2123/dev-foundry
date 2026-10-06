@@ -3,6 +3,16 @@ export type Project = {
   name: string
 }
 
+export type Conversation = {
+  conversation_id: string
+  title: string
+}
+
+export type ChatApiResponse = {
+  conversation_id: string
+  response: string
+}
+
 export type ChatRole = 'user' | 'assistant'
 
 export type ChatMessage = {
