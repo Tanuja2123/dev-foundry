@@ -13,6 +13,7 @@ from supabase import create_client, Client
 
 from app.schemas.conversation import ChatResponse, ConversationItem
 from app.services.agents.requirements_agent import process_uploaded_document, get_requirements_agent
+from app.services.agents.repo_setup_agent import get_repo_setup_agent
 from app.core.logger import logger
 
 # Load variables from .env file
@@ -122,23 +123,52 @@ async def generate_chat_response(user_query: str, history: List[Dict]) -> str:
         main_agent_prompt = """
 You are DevFoundry, an AI-powered software development orchestration assistant.
 
-Your purpose is to understand the user's intent within the full conversation context, track workflow state across the software delivery lifecycle, and dynamically coordinate with the specialized Requirements_Agent.
+Your purpose is to understand the user's intent within the full conversation context, track workflow state across the software delivery lifecycle, and dynamically coordinate with the specialized child agents.
 
-AVAILABLE CHILD AGENT:
-- Requirements_Agent:
-  Responsible for both:
-  1. Product Requirements (PRD): Extracts and structures Objective, Problem Statement, Goals, User Experience, User Flow. Clarifies ambiguities and updates PRD based on user feedback.
-  2. Technical Architecture (TRD): Generates and updates the Technical Requirements Document (Frontend, Backend, Database, Infrastructure, Security) based on the approved PRD and user tech stack feedback.
+AVAILABLE CHILD AGENTS:
+1. Requirements_Agent:
+   Responsible for:
+   - Product Requirements (PRD): Extracts and structures Objective, Problem Statement, Goals, User Experience, User Flow. Clarifies ambiguities and updates PRD based on user feedback.
+   - Technical Architecture (TRD): Generates and updates the Technical Requirements Document (Frontend, Backend, Database, Infrastructure, Security) based on the approved PRD and user tech stack feedback.
+
+2. Repo_Setup_Agent:
+   Responsible for Azure DevOps project and repository setup across a state-driven human-in-the-loop workflow:
+   - Proposing project name and description (GENERATE_PROJECT_PROPOSAL)
+   - Updating project proposal details (UPDATE_PROJECT_PROPOSAL)
+   - Creating the ADO project upon explicit user approval (CREATE_PROJECT)
+   - Generating tailored repository directory structure based on PRD/TRD/tech stack (GENERATE_REPOSITORY_STRUCTURE)
+   - Updating repository directory structure based on user feedback (UPDATE_REPOSITORY_STRUCTURE)
+   - Creating the ADO Git repository upon explicit user approval (CREATE_REPOSITORY)
 
 DYNAMIC CONTEXTUAL WORKFLOW ROUTING PRINCIPLES:
 - Do NOT rely on isolated keywords. Evaluate the user's message IN THE CONTEXT of the previous conversation history and current workflow stage.
+
+A. PRD & TRD STAGES (Requirements_Agent):
 - If the assistant previously offered: "Would you like me to create a Technical Requirements Document (TRD) as well?" and the user confirms, responds affirmatively (e.g. "yes", "sure", "go ahead"), or asks to proceed with technical architecture:
   Recognize that the workflow stage is TRD and delegate to Requirements_Agent with operation: "GENERATE_TRD".
 - If a TRD was already generated and the user requests tech stack modifications (e.g. "Use Python FastAPI instead of Node", "Use PostgreSQL instead of MongoDB"):
   Recognize that the workflow stage is TRD modification and delegate to Requirements_Agent with operation: "UPDATE_TRD".
 - If the user provides a project description, uploaded requirement document, answers PRD clarification questions, or requests changes to the functional PRD:
   Recognize that the workflow stage is PRD and delegate to Requirements_Agent with operation: "GENERATE_PRD" or "UPDATE_PRD".
-- If the user query is generic, conversational, informational, or does not require requirements/technical delivery functionality, answer directly and do NOT invoke the child agent.
+
+B. ADO PROJECT & REPO SETUP STAGES (Repo_Setup_Agent):
+- If TRD is complete and user agrees/asks to proceed with repository setup, create Azure DevOps project, or start repo setup:
+  Delegate to Repo_Setup_Agent with operation: "GENERATE_PROJECT_PROPOSAL".
+- If a project proposal is pending review (PROJECT_REVIEW state) and user asks to modify the project name or description:
+  Delegate to Repo_Setup_Agent with operation: "UPDATE_PROJECT_PROPOSAL".
+- If a project proposal is pending review (PROJECT_REVIEW state) and the user explicitly approves/confirms creating the project (e.g. "looks good, create the project", "proceed with creation", "approved"):
+  Delegate to Repo_Setup_Agent with operation: "CREATE_PROJECT".
+- If the project was created (PROJECT_CREATED / REPOSITORY_DECISION state) and user asks/confirms to proceed with repository creation:
+  Delegate to Repo_Setup_Agent with operation: "GENERATE_REPOSITORY_STRUCTURE".
+- If repository structure is pending review (REPOSITORY_REVIEW state) and user requests changes to folders or files:
+  Delegate to Repo_Setup_Agent with operation: "UPDATE_REPOSITORY_STRUCTURE".
+- If repository structure is pending review (REPOSITORY_REVIEW state) and user explicitly approves creating the repository (e.g. "structure looks great, go ahead and create the repo", "approved"):
+  Delegate to Repo_Setup_Agent with operation: "CREATE_REPOSITORY".
+- If user explicitly decides to skip or cancel repository creation:
+  Do not delegate; answer directly acknowledging the decision and concluding the workflow.
+
+C. CONVERSATIONAL / INFORMATIONAL:
+- If the user query is generic, conversational, informational, or does not require child agent functionality, answer directly and do NOT invoke any child agent.
 
 When a user starts a new conversation:
 - You MUST prefix your very first response with "TITLE: <a short 3-5 word title describing the user's project>\\n\\n". Do not include this prefix in subsequent messages.
@@ -146,6 +176,8 @@ When a user starts a new conversation:
 DELEGATION INSTRUCTION:
 - If Requirements_Agent is required, output:
   "DELEGATE_TO: Requirements_Agent | WORKFLOW: <PRD or TRD> | OPERATION: <GENERATE_PRD, UPDATE_PRD, GENERATE_TRD, or UPDATE_TRD>"
+- If Repo_Setup_Agent is required, output:
+  "DELEGATE_TO: Repo_Setup_Agent | OPERATION: <GENERATE_PROJECT_PROPOSAL, UPDATE_PROJECT_PROPOSAL, CREATE_PROJECT, GENERATE_REPOSITORY_STRUCTURE, UPDATE_REPOSITORY_STRUCTURE, or CREATE_REPOSITORY>"
 - If no child agent is required, provide your direct, helpful response to the user.
 """
 
@@ -156,6 +188,7 @@ DELEGATION INSTRUCTION:
         )
 
         requirements_agent = get_requirements_agent(client)
+        repo_setup_agent = get_repo_setup_agent(client)
 
         # Convert history into Agent Framework Messages
         message_list = []
@@ -183,9 +216,10 @@ DELEGATION INSTRUCTION:
                 response_text = parts[1]
 
         # 2. Dynamic Workflow Routing Evaluation
-        should_delegate = "Requirements_Agent" in response_text or "DELEGATE_TO: Requirements_Agent" in response_text
+        is_req_delegation = "Requirements_Agent" in response_text or "DELEGATE_TO: Requirements_Agent" in response_text
+        is_repo_delegation = "Repo_Setup_Agent" in response_text or "DELEGATE_TO: Repo_Setup_Agent" in response_text
 
-        if should_delegate:
+        if is_req_delegation:
             logger.info(f"[Routing Decision] -> Delegating to Requirements_Agent")
 
             # Extract workflow context from Orchestrator's decision if present
@@ -200,7 +234,6 @@ DELEGATION INSTRUCTION:
 
             # Prepare message list for Requirements_Agent with clear workflow context
             req_messages = list(message_list[:-1])
-            # Inject workflow context instruction into the user's turn
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
             req_messages.append(context_user_msg)
 
@@ -259,6 +292,87 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
+
+        elif is_repo_delegation:
+            logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent")
+
+            # Extract operation from Orchestrator's decision
+            operation = "GENERATE_PROJECT_PROPOSAL"
+            if "OPERATION:" in response_text:
+                operation = response_text.split("OPERATION:", 1)[1].strip()
+
+            workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
+
+            # Prepare message list for Repo_Setup_Agent with clear workflow context
+            repo_messages = list(message_list[:-1])
+            context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
+            repo_messages.append(context_user_msg)
+
+            # Invoke Repo Setup Child Agent
+            logger.info(f"[Repo_Setup_Agent] Processing request with operation: {operation}...")
+            child_start = time.time()
+            child_response = await repo_setup_agent.run(messages=repo_messages)
+            child_duration = round((time.time() - child_start) * 1000, 1)
+            child_raw_json = child_response.messages[-1].text if child_response.messages else ""
+            logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
+
+            # Orchestrator Synthesizer for Repo_Setup_Agent
+            logger.info("[Orchestrator] Converting Repo_Setup_Agent output into user-facing natural language...")
+            synthesis_prompt = f"""
+You are the DevFoundry Orchestrator.
+The Repo_Setup_Agent has produced the following structured output:
+{child_raw_json}
+
+Your task:
+Convert this output into a friendly, structured, and professional response for the user:
+
+CASE 1: If status is "ERROR":
+- Clearly and politely explain what went wrong based on the error details (do NOT expose any secrets or tokens).
+- Acknowledge that the project proposal or repository structure remains saved.
+- Guide the user on what corrective steps are needed or offer to retry.
+
+CASE 2: If status is "COMPLETE" and workflow_stage is "PROJECT_REVIEW" (or contains project_proposal):
+- Present the proposed Azure DevOps project details using clean Markdown:
+  * **Proposed Project Name**
+  * **Project Description**
+- Explain that this proposal is based on the project requirements and architecture.
+- Clearly invite the user to review: they can request modifications to the name/description or explicitly approve it to proceed with creating the Azure DevOps project.
+
+CASE 3: If status is "COMPLETE" and workflow_stage is "PROJECT_CREATED" (or contains project details with id/url):
+- Announce that the Azure DevOps project has been created successfully!
+- Show the project details clearly:
+  * **Project Name**: [name]
+  * **Project ID**: [id]
+  * **Project URL**: [link](url)
+- Naturally present the next decision to the user by concluding with:
+  "**Would you like to proceed with repository creation?**"
+
+CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW" (or contains repository_structure):
+- Present the proposed repository directory structure in a clear Markdown code block.
+- Briefly explain how the proposed structure accommodates the project's technology stack (e.g., frontend, backend, configuration, and docs).
+- Clearly invite the user to review: they can request adjustments to folders or files, or explicitly approve it so we can create the repository.
+
+CASE 5: If status is "COMPLETE" and workflow_stage is "REPOSITORY_CREATED" (or contains repository details with id/url):
+- Announce that the Azure DevOps Git repository has been created successfully!
+- Show the repository details clearly:
+  * **Repository Name**: [name]
+  * **Repository ID**: [id]
+  * **Repository URL**: [link](url)
+- Conclude by stating that repository setup is complete and the project is ready for development.
+
+Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
+"""
+            synth_start = time.time()
+            synthesizer_agent = Agent(
+                name="Orchestrator_Synthesizer",
+                instructions=synthesis_prompt,
+                client=client,
+            )
+            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synth_duration = round((time.time() - synth_start) * 1000, 1)
+            response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
+            logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
+
         else:
             logger.info("[Routing Decision] -> Handled directly by Orchestrator (Path A Generic/Conversational)")
 
