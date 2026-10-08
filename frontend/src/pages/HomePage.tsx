@@ -8,6 +8,7 @@ import {
 } from '../api/chat'
 import { ChatPanel } from '../components/ChatPanel'
 import { Sidebar } from '../components/Sidebar'
+import { AdoLogo, WaffleIcon } from '../components/AdoIcons'
 import type { ChatMessage, Project } from '../types'
 
 function createId() {
@@ -260,63 +261,112 @@ export function HomePage() {
   }
 
   return (
-    <div className="app-shell">
-      <Sidebar
-        projects={conversations}
-        selectedProjectId={conversation?.id ?? null}
-        onSelectProject={selectConversation}
-        onNewProject={handleNewConversation}
-        onDeleteProject={(id) => void handleDeleteProject(id)}
-        status={listStatus}
-      />
-      <div className="main">
-        <header className="topbar">
-          <div className="topbar-left">
-            <div className="topbar-breadcrumb">
-              <span>Workspaces</span>
-              <span>›</span>
-              <span>Requirements Engineering</span>
-              {conversation && (
-                <>
-                  <span>›</span>
-                  <span>{conversation.name}</span>
-                </>
-              )}
-            </div>
-            <div className="topbar-title-row">
-              <h1>{activeProject.name}</h1>
-              <div className="topbar-status-chip">
-                <span className="topbar-status-dot" />
-                <span>Multi-Agent Copilot</span>
-              </div>
-            </div>
+    <div className="ado-app">
+      {/* Azure DevOps Top Suite Bar */}
+      <header className="ado-suitebar">
+        <div className="ado-suitebar-left">
+          <button
+            type="button"
+            className="ado-waffle-btn"
+            title="Microsoft 365 / Azure App Launcher"
+            aria-label="App Launcher"
+          >
+            <WaffleIcon size={18} />
+          </button>
+          <div className="ado-suite-brand">
+            <AdoLogo size={20} />
+            <span className="ado-suite-name">Azure DevOps</span>
+            <span className="ado-suite-sep">/</span>
+            <span className="ado-suite-org">DevFoundry</span>
+          </div>
+        </div>
+
+        <div className="ado-suitebar-center">
+          <div className="ado-suitebar-search">
+            <span className="ado-search-icon">🔍</span>
+            <input
+              type="text"
+              placeholder="Search Azure DevOps (/)"
+              className="ado-suitebar-search-input"
+            />
+            <span className="ado-shortcut-badge">/</span>
+          </div>
+        </div>
+
+        <div className="ado-suitebar-right">
+          <div className="ado-mcp-badge" title="Azure DevOps MCP Tools Connected">
+            <span className="ado-mcp-dot" />
+            <span>ADO MCP Online</span>
           </div>
 
-          <div className="topbar-user">
-            <div className="ms-avatar-monogram" title={displayName}>
-              {initials}
-            </div>
-            <span className="topbar-username">{displayName}</span>
+          <div className="ado-user-profile" title={`Signed in as ${displayName}`}>
+            <div className="ado-user-avatar">{initials}</div>
+            <span className="ado-user-name">{displayName}</span>
             <button
               type="button"
-              className="ms-btn-ghost"
+              className="ado-signout-btn"
               onClick={() => instance.logoutRedirect()}
             >
               Sign out
             </button>
           </div>
-        </header>
+        </div>
+      </header>
 
-        <ChatPanel
-          project={activeProject}
-          messages={messages}
-          files={files}
-          sending={sending}
-          error={chatError}
-          onSend={(content) => void sendMessage(content)}
-          onFilesAdded={addFiles}
-          onRemoveFile={removeFile}
+      {/* Main Azure DevOps Body: Left Navigation + Content Hub */}
+      <div className="ado-body-container">
+        <Sidebar
+          projects={conversations}
+          selectedProjectId={conversation?.id ?? null}
+          onSelectProject={selectConversation}
+          onNewProject={handleNewConversation}
+          onDeleteProject={(id) => void handleDeleteProject(id)}
+          status={listStatus}
         />
+
+        <main className="ado-content-hub">
+          {/* Azure DevOps Command Bar & Context Subheader */}
+          <div className="ado-commandbar">
+            <div className="ado-commandbar-left">
+              <nav className="ado-breadcrumb" aria-label="Breadcrumb">
+                <span>DevFoundry</span>
+                <span className="ado-bc-sep">›</span>
+                <span>Requirements & Architecture</span>
+                {conversation && (
+                  <>
+                    <span className="ado-bc-sep">›</span>
+                    <span className="ado-bc-current">{conversation.name}</span>
+                  </>
+                )}
+              </nav>
+
+              <div className="ado-title-row">
+                <h1 className="ado-project-heading">{activeProject.name}</h1>
+                <span className="ado-stage-tag ado-stage-prd">PRD & TRD</span>
+                <span className="ado-stage-tag ado-stage-repo">Azure Repos</span>
+              </div>
+            </div>
+
+            <div className="ado-commandbar-right">
+              <span className="ado-agent-status-pill">
+                <span className="ado-status-pulse" />
+                Multi-Agent Orchestrator
+              </span>
+            </div>
+          </div>
+
+          {/* Azure DevOps Chat / Work Item Copilot View */}
+          <ChatPanel
+            project={activeProject}
+            messages={messages}
+            files={files}
+            sending={sending}
+            error={chatError}
+            onSend={(content) => void sendMessage(content)}
+            onFilesAdded={addFiles}
+            onRemoveFile={removeFile}
+          />
+        </main>
       </div>
     </div>
   )

@@ -1,58 +1,77 @@
+/* ==========================================================================
+   AZURE DEVOPS DESIGN SYSTEM & UI THEME (DevFoundry Copilot)
+   Faithful to Microsoft Azure DevOps (dev.azure.com) Dark Experience
+   ========================================================================== */
+
 :root {
   color-scheme: dark;
-  --ms-primary: #0078d4;
-  --ms-primary-hover: #106ebe;
-  --ms-primary-active: #005a9e;
-  --ms-primary-subtle: rgba(0, 120, 212, 0.12);
-  --ms-copilot-gradient: linear-gradient(135deg, #0078d4 0%, #7738d8 50%, #00b4d8 100%);
-  --ms-copilot-glow: rgba(0, 120, 212, 0.25);
-  
-  --ms-bg-canvas: #0b0d11;
-  --ms-bg-sidebar: #11141c;
-  --ms-bg-topbar: #141722;
-  --ms-bg-card: #171b26;
-  --ms-bg-card-hover: #1e2332;
-  --ms-bg-elevated: #222838;
-  --ms-bg-input: #151924;
-  
-  --ms-border: rgba(255, 255, 255, 0.08);
-  --ms-border-hover: rgba(255, 255, 255, 0.15);
-  --ms-border-active: #0078d4;
-  --ms-border-subtle: rgba(255, 255, 255, 0.05);
-  
-  --ms-text: #f3f4f6;
-  --ms-text-secondary: #9ca3af;
-  --ms-text-muted: #6b7280;
-  
-  --ms-user-bubble: #192131;
-  --ms-user-border: rgba(0, 120, 212, 0.28);
-  --ms-assistant-bubble: #141824;
-  --ms-assistant-border: rgba(255, 255, 255, 0.07);
 
-  --ms-danger: #d13438;
-  --ms-danger-bg: rgba(209, 52, 56, 0.12);
-  --ms-danger-border: rgba(209, 52, 56, 0.35);
+  /* Azure DevOps Brand Accents */
+  --ado-blue: #0078d4;
+  --ado-blue-hover: #106ebe;
+  --ado-blue-pressed: #005a9e;
+  --ado-blue-subtle: rgba(0, 120, 212, 0.14);
+  --ado-blue-border: rgba(0, 120, 212, 0.35);
 
-  --ms-success: #107c41;
-  --ms-font: 'Segoe UI Variable', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
-  
-  --ms-radius-sm: 6px;
-  --ms-radius-md: 10px;
-  --ms-radius-lg: 14px;
-  --ms-radius-xl: 18px;
+  /* Azure DevOps Services Colors */
+  --ado-repos: #d83b01;
+  --ado-boards: #0078d4;
+  --ado-pipelines: #107c41;
+  --ado-testplans: #b4009e;
+  --ado-artifacts: #008272;
 
-  --ms-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.2);
-  --ms-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.25), 0 1px 4px rgba(0, 0, 0, 0.15);
-  --ms-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.2);
+  /* Background Palette (Azure DevOps Dark) */
+  --ado-bg-suitebar: #161616;
+  --ado-bg-canvas: #181818;
+  --ado-bg-sidebar: #1e1e1e;
+  --ado-bg-subnav: #201f1e;
+  --ado-bg-card: #252423;
+  --ado-bg-card-hover: #2d2c2b;
+  --ado-bg-card-active: #1f2d40;
+  --ado-bg-input: #1b1a19;
+  --ado-bg-table-header: #252423;
+  --ado-bg-table-zebra: #201f1e;
 
-  font-family: var(--ms-font);
+  /* Borders & Dividers */
+  --ado-border: #323130;
+  --ado-border-light: #3b3a39;
+  --ado-border-subtle: rgba(255, 255, 255, 0.08);
+  --ado-border-active: #0078d4;
+
+  /* Typography Colors */
+  --ado-text: #ffffff;
+  --ado-text-secondary: #d2d0ce;
+  --ado-text-muted: #8a8886;
+  --ado-text-disabled: #605e5c;
+
+  /* Status Colors */
+  --ado-success: #107c41;
+  --ado-success-bg: rgba(16, 124, 65, 0.15);
+  --ado-warning: #d83b01;
+  --ado-danger: #a80000;
+  --ado-danger-hover: #d13438;
+
+  /* Typography & Layout Tokens */
+  --ado-font: 'Segoe UI Variable', 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif;
+  --ado-font-mono: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+
+  /* Azure DevOps uses sharp 2px-4px corners */
+  --ado-radius-sm: 2px;
+  --ado-radius-md: 4px;
+  --ado-radius-lg: 6px;
+
+  /* Shadows */
+  --ado-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --ado-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --ado-shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  font-family: var(--ado-font);
   line-height: 1.5;
   font-weight: 400;
-  color: var(--ms-text);
-  background: var(--ms-bg-canvas);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
+  color: var(--ado-text);
+  background: var(--ado-bg-canvas);
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 *,
@@ -65,41 +84,19 @@ html,
 body,
 #root {
   margin: 0;
-  min-height: 100%;
+  padding: 0;
   height: 100%;
+  min-height: 100%;
   overflow: hidden;
+  background: var(--ado-bg-canvas);
+  color: var(--ado-text);
 }
 
 button,
+input,
 textarea,
-input {
+select {
   font: inherit;
-}
-
-code {
-  font-family: 'Cascadia Code', 'Consolas', monospace;
-  background: rgba(255, 255, 255, 0.06);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 0.15rem 0.4rem;
-  border-radius: 4px;
-  font-size: 0.88em;
-  color: #93c5fd;
-}
-
-/* Scrollbar Fluent style */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.16);
-  border-radius: 999px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.28);
 }
 
 .sr-only {
@@ -114,319 +111,177 @@ code {
   border: 0;
 }
 
-/* App Shell */
-.app-shell {
-  display: flex;
-  height: 100vh;
-  min-height: 100vh;
-  background: var(--ms-bg-canvas);
-  overflow: hidden;
+/* Scrollbars: Azure DevOps styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
 }
 
-/* Microsoft Fluent Sidebar */
-.sidebar {
-  width: 290px;
-  flex-shrink: 0;
-  background: var(--ms-bg-sidebar);
-  border-right: 1px solid var(--ms-border);
+/* ==========================================================================
+   1. TOP SUITE BAR (Azure DevOps Global Suite Navigation)
+   ========================================================================== */
+
+.ado-app {
   display: flex;
   flex-direction: column;
-  padding: 16px 12px;
-  gap: 12px;
+  height: 100vh;
+  min-height: 100vh;
+  overflow: hidden;
+  background: var(--ado-bg-canvas);
+}
+
+.ado-suitebar {
+  height: 48px;
+  min-height: 48px;
+  background: var(--ado-bg-suitebar);
+  border-bottom: 1px solid var(--ado-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  gap: 16px;
+  z-index: 100;
   user-select: none;
 }
 
-.sidebar-brand-container {
+.ado-suitebar-left {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 4px 8px 10px;
+  gap: 12px;
+  flex-shrink: 0;
 }
 
-.sidebar-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 600;
-  font-size: 1.05rem;
-  letter-spacing: -0.01em;
-  color: #ffffff;
-}
-
-.ms-copilot-icon {
-  width: 22px;
-  height: 22px;
+.ado-waffle-btn {
+  background: transparent;
+  border: none;
+  color: var(--ado-text-secondary);
+  width: 32px;
+  height: 32px;
   display: grid;
   place-items: center;
-  background: var(--ms-copilot-gradient);
-  border-radius: 6px;
-  box-shadow: 0 0 12px var(--ms-copilot-glow);
-  font-size: 13px;
-  color: #fff;
-}
-
-.ms-badge-pill {
-  font-size: 0.7rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: rgba(0, 120, 212, 0.18);
-  color: #60a5fa;
-  border: 1px solid rgba(0, 120, 212, 0.3);
-}
-
-.new-project-button {
-  background: var(--ms-primary);
-  color: #ffffff;
-  border: 1px solid transparent;
-  border-radius: var(--ms-radius-md);
-  padding: 9px 14px;
   cursor: pointer;
-  font-weight: 500;
-  font-size: 0.9rem;
+  border-radius: var(--ado-radius-sm);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.ado-waffle-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ado-text);
+}
+
+.ado-suite-brand {
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 8px;
-  transition: all 0.15s ease;
-  box-shadow: 0 2px 6px rgba(0, 120, 212, 0.3);
 }
 
-.new-project-button:hover {
-  background: var(--ms-primary-hover);
-  box-shadow: 0 3px 10px rgba(0, 120, 212, 0.45);
-  transform: translateY(-1px);
+.ado-suite-name {
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ado-text);
 }
 
-.new-project-button:active {
-  background: var(--ms-primary-active);
-  transform: translateY(0);
+.ado-suite-sep {
+  color: var(--ado-text-muted);
+  font-weight: 300;
+  margin: 0 2px;
 }
 
-/* Sidebar Search */
-.sidebar-search-box {
+.ado-suite-org {
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--ado-text-secondary);
+}
+
+/* Center Global Search */
+.ado-suitebar-center {
+  flex: 1;
+  max-width: 480px;
+  display: flex;
+  justify-content: center;
+}
+
+.ado-suitebar-search {
+  width: 100%;
   position: relative;
   display: flex;
   align-items: center;
 }
 
-.sidebar-search-input {
+.ado-suitebar-search-input {
   width: 100%;
-  background: var(--ms-bg-input);
-  border: 1px solid var(--ms-border);
-  color: var(--ms-text);
-  border-radius: var(--ms-radius-sm);
-  padding: 7px 10px 7px 30px;
+  height: 30px;
+  background: #252423;
+  border: 1px solid #3b3a39;
+  border-radius: var(--ado-radius-sm);
+  color: var(--ado-text);
   font-size: 0.85rem;
+  padding: 0 32px 0 30px;
   outline: none;
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
-.sidebar-search-input:focus {
-  border-color: var(--ms-primary);
-  box-shadow: 0 0 0 2px var(--ms-primary-subtle);
+.ado-suitebar-search-input:focus {
+  background: #1e1e1e;
+  border-color: var(--ado-blue);
+  box-shadow: 0 0 0 1px var(--ado-blue);
 }
 
-.sidebar-search-icon {
+.ado-search-icon {
   position: absolute;
-  left: 9px;
-  color: var(--ms-text-muted);
-  font-size: 0.85rem;
+  left: 8px;
+  font-size: 0.8rem;
+  color: var(--ado-text-muted);
   pointer-events: none;
 }
 
-.sidebar-header-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 4px 8px 0;
-}
-
-.sidebar-label {
-  margin: 0;
-  font-size: 0.75rem;
+.ado-shortcut-badge {
+  position: absolute;
+  right: 8px;
+  font-size: 0.7rem;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--ms-text-muted);
-}
-
-.sidebar-count {
-  font-size: 0.75rem;
-  color: var(--ms-text-muted);
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ado-text-muted);
   padding: 1px 6px;
-  border-radius: 999px;
+  border-radius: var(--ado-radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  pointer-events: none;
 }
 
-.sidebar-status {
-  margin: 0;
-  padding: 8px;
-  color: var(--ms-text-muted);
-  font-size: 0.82rem;
-  text-align: center;
-}
-
-.project-list {
-  flex: 1;
-  overflow-y: auto;
+/* Right Suite Bar Actions */
+.ado-suitebar-right {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding-right: 2px;
-}
-
-.project-item-wrapper {
-  position: relative;
-  display: flex;
-  align-items: center;
-  border-radius: var(--ms-radius-sm);
-  transition: background 0.12s ease;
-}
-
-.project-item-wrapper:hover {
-  background: var(--ms-bg-card-hover);
-}
-
-.project-item-wrapper.active {
-  background: rgba(0, 120, 212, 0.15);
-  border-left: 3px solid var(--ms-primary);
-}
-
-.project-item-button {
-  flex: 1;
-  text-align: left;
-  background: transparent;
-  color: var(--ms-text);
-  border: 0;
-  padding: 9px 10px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-width: 0;
-}
-
-.project-item-icon {
-  font-size: 0.95rem;
-  color: var(--ms-text-secondary);
-  flex-shrink: 0;
-}
-
-.project-item-wrapper.active .project-item-icon {
-  color: #60a5fa;
-}
-
-.project-item-name {
-  font-size: 0.88rem;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 1;
-  color: var(--ms-text);
-}
-
-.project-item-wrapper.active .project-item-name {
-  font-weight: 600;
-  color: #ffffff;
-}
-
-.project-item-delete {
-  opacity: 0;
-  background: transparent;
-  border: 0;
-  color: var(--ms-text-muted);
-  padding: 6px 8px;
-  margin-right: 4px;
-  cursor: pointer;
-  border-radius: 4px;
-  font-size: 0.85rem;
-  transition: all 0.15s ease;
-}
-
-.project-item-wrapper:hover .project-item-delete {
-  opacity: 1;
-}
-
-.project-item-delete:hover {
-  color: #fca5a5;
-  background: rgba(209, 52, 56, 0.2);
-}
-
-/* Main Area */
-.main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--ms-bg-canvas);
-  height: 100vh;
-}
-
-/* Microsoft Fluent Topbar */
-.topbar {
-  display: flex;
-  justify-content: space-between;
   align-items: center;
   gap: 16px;
-  padding: 12px 24px;
-  background: var(--ms-bg-topbar);
-  border-bottom: 1px solid var(--ms-border);
   flex-shrink: 0;
 }
 
-.topbar-left {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-
-.topbar-breadcrumb {
+.ado-mcp-badge {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 0.75rem;
-  color: var(--ms-text-muted);
-  font-weight: 500;
-}
-
-.topbar-breadcrumb span {
-  color: var(--ms-text-secondary);
-}
-
-.topbar-title-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.topbar h1 {
-  margin: 0;
-  font-size: 1.12rem;
-  font-weight: 600;
-  color: #ffffff;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.topbar-status-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.75rem;
-  background: rgba(16, 124, 65, 0.15);
+  background: var(--ado-success-bg);
   color: #4ade80;
-  border: 1px solid rgba(16, 124, 65, 0.3);
-  padding: 2px 8px;
-  border-radius: 999px;
-  font-weight: 500;
+  border: 1px solid rgba(16, 124, 65, 0.4);
+  padding: 3px 10px;
+  border-radius: var(--ado-radius-sm);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
 }
 
-.topbar-status-dot {
+.ado-mcp-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
@@ -434,551 +289,1202 @@ code {
   box-shadow: 0 0 6px #22c55e;
 }
 
-.topbar-user {
+.ado-user-profile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ado-user-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--ado-blue);
+  color: #ffffff;
+  display: grid;
+  place-items: center;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.ado-user-name {
+  font-size: 0.85rem;
+  color: var(--ado-text-secondary);
+  font-weight: 500;
+  max-width: 140px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ado-signout-btn {
+  background: transparent;
+  border: 1px solid #3b3a39;
+  color: var(--ado-text-secondary);
+  padding: 4px 10px;
+  border-radius: var(--ado-radius-sm);
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.ado-signout-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ado-text);
+  border-color: #484644;
+}
+
+/* ==========================================================================
+   2. BODY CONTAINER: SIDEBAR + CONTENT HUB
+   ========================================================================== */
+
+.ado-body-container {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ==========================================================================
+   3. AZURE DEVOPS SIDEBAR (LEFT NAVIGATION RAIL)
+   ========================================================================== */
+
+.ado-sidebar {
+  width: 290px;
+  flex-shrink: 0;
+  background: var(--ado-bg-sidebar);
+  border-right: 1px solid var(--ado-border);
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  gap: 10px;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Project Header */
+.ado-sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px 10px;
+  border-bottom: 1px solid var(--ado-border);
+}
+
+.ado-project-avatar {
+  width: 32px;
+  height: 32px;
+  background: #252423;
+  border: 1px solid #3b3a39;
+  border-radius: var(--ado-radius-sm);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.ado-project-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ado-project-name {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--ado-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ado-project-subtext {
+  font-size: 0.72rem;
+  color: var(--ado-text-muted);
+}
+
+/* Azure DevOps Service Hub Navigation */
+.ado-hub-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0;
+}
+
+.ado-hub-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: var(--ado-radius-sm);
+  font-size: 0.85rem;
+  color: var(--ado-text-secondary);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.ado-hub-item:hover:not(.disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ado-text);
+}
+
+.ado-hub-item.active {
+  background: var(--ado-bg-card-active);
+  color: var(--ado-text);
+  border-left: 3px solid var(--ado-blue);
+  font-weight: 600;
+}
+
+.ado-hub-item.disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.ado-hub-icon {
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.ado-hub-copilot {
+  color: #60a5fa;
+}
+.ado-hub-boards {
+  color: var(--ado-boards);
+}
+.ado-hub-repos {
+  color: var(--ado-repos);
+}
+.ado-hub-pipelines {
+  color: var(--ado-pipelines);
+}
+
+.ado-hub-title {
+  flex: 1;
+}
+
+.ado-hub-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  background: var(--ado-blue-subtle);
+  color: #60a5fa;
+  border: 1px solid var(--ado-blue-border);
+  padding: 1px 6px;
+  border-radius: var(--ado-radius-sm);
+}
+
+.ado-sidebar-divider {
+  height: 1px;
+  background: var(--ado-border);
+  margin: 2px 0;
+}
+
+/* Azure DevOps Primary Button */
+.ado-btn-primary {
+  background: var(--ado-blue);
+  color: #ffffff;
+  border: 1px solid transparent;
+  border-radius: var(--ado-radius-sm);
+  padding: 7px 14px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ado-btn-primary:hover:not(:disabled) {
+  background: var(--ado-blue-hover);
+}
+
+.ado-btn-primary:active:not(:disabled) {
+  background: var(--ado-blue-pressed);
+}
+
+.ado-btn-primary:disabled {
+  background: #323130;
+  color: #8a8886;
+  cursor: not-allowed;
+}
+
+.ado-new-project-btn {
+  width: 100%;
+  padding: 8px 12px;
+}
+
+.ado-btn-plus {
+  font-size: 1rem;
+  line-height: 1;
+}
+
+/* Secondary Button */
+.ado-btn-secondary {
+  background: #252423;
+  color: var(--ado-text-secondary);
+  border: 1px solid #3b3a39;
+  border-radius: var(--ado-radius-sm);
+  padding: 6px 12px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.12s ease;
+}
+
+.ado-btn-secondary:hover:not(:disabled) {
+  background: #2d2c2b;
+  color: var(--ado-text);
+  border-color: #484644;
+}
+
+/* Filter Input */
+.ado-search-box {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.ado-search-input {
+  width: 100%;
+  height: 30px;
+  background: var(--ado-bg-input);
+  border: 1px solid var(--ado-border);
+  color: var(--ado-text);
+  border-radius: var(--ado-radius-sm);
+  padding: 0 28px 0 28px;
+  font-size: 0.82rem;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.ado-search-input:focus {
+  border-color: var(--ado-blue);
+  box-shadow: 0 0 0 1px var(--ado-blue);
+}
+
+.ado-search-icon {
+  position: absolute;
+  left: 8px;
+  font-size: 0.78rem;
+  color: var(--ado-text-muted);
+  pointer-events: none;
+}
+
+.ado-search-clear {
+  position: absolute;
+  right: 6px;
+  background: transparent;
+  border: none;
+  color: var(--ado-text-muted);
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.ado-search-clear:hover {
+  color: var(--ado-text);
+}
+
+/* Section Header */
+.ado-section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 6px 0;
+}
+
+.ado-section-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ado-text-muted);
+}
+
+.ado-section-count {
+  font-size: 0.72rem;
+  color: var(--ado-text-muted);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 6px;
+  border-radius: var(--ado-radius-sm);
+}
+
+.ado-sidebar-status {
+  margin: 0;
+  padding: 8px;
+  color: var(--ado-text-muted);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.ado-empty-state {
+  padding: 16px 8px;
+  text-align: center;
+  color: var(--ado-text-muted);
+  font-size: 0.82rem;
+}
+
+/* Projects List */
+.ado-project-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 2px;
+}
+
+.ado-project-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  border-radius: var(--ado-radius-sm);
+  transition: background 0.12s ease;
+}
+
+.ado-project-item:hover {
+  background: var(--ado-bg-card-hover);
+}
+
+.ado-project-item.active {
+  background: var(--ado-bg-card-active);
+  border-left: 3px solid var(--ado-blue);
+}
+
+.ado-project-btn {
+  flex: 1;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--ado-text-secondary);
+  padding: 7px 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ado-project-item.active .ado-project-btn {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.ado-item-icon {
+  color: var(--ado-repos);
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.ado-item-name {
+  font-size: 0.84rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+}
+
+.ado-item-delete {
+  opacity: 0;
+  background: transparent;
+  border: none;
+  color: var(--ado-text-muted);
+  padding: 6px 8px;
+  cursor: pointer;
+  border-radius: var(--ado-radius-sm);
+  display: grid;
+  place-items: center;
+  transition: all 0.12s ease;
+}
+
+.ado-project-item:hover .ado-item-delete {
+  opacity: 1;
+}
+
+.ado-item-delete:hover {
+  color: #f87171;
+  background: rgba(168, 0, 0, 0.2);
+}
+
+/* Footer / Project Settings */
+.ado-sidebar-footer {
+  border-top: 1px solid var(--ado-border);
+  padding-top: 8px;
+}
+
+.ado-footer-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 8px;
+  color: var(--ado-text-secondary);
+  font-size: 0.82rem;
+  border-radius: var(--ado-radius-sm);
+  cursor: pointer;
+}
+
+.ado-footer-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--ado-text);
+}
+
+/* ==========================================================================
+   4. CONTENT HUB & AZURE DEVOPS COMMAND BAR
+   ========================================================================== */
+
+.ado-content-hub {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ado-bg-canvas);
+  overflow: hidden;
+}
+
+.ado-commandbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 24px;
+  background: var(--ado-bg-subnav);
+  border-bottom: 1px solid var(--ado-border);
+  flex-shrink: 0;
+}
+
+.ado-commandbar-left {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ado-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--ado-text-muted);
+  font-weight: 500;
+}
+
+.ado-bc-sep {
+  color: var(--ado-text-muted);
+}
+
+.ado-bc-current {
+  color: var(--ado-text-secondary);
+  font-weight: 600;
+}
+
+.ado-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ado-project-heading {
+  margin: 0;
+  font-size: 1.12rem;
+  font-weight: 600;
+  color: var(--ado-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ado-stage-tag {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 7px;
+  border-radius: var(--ado-radius-sm);
+}
+
+.ado-stage-prd {
+  background: var(--ado-blue-subtle);
+  color: #60a5fa;
+  border: 1px solid var(--ado-blue-border);
+}
+
+.ado-stage-repo {
+  background: rgba(216, 59, 1, 0.15);
+  color: #fb923c;
+  border: 1px solid rgba(216, 59, 1, 0.35);
+}
+
+.ado-commandbar-right {
   display: flex;
   align-items: center;
   gap: 12px;
 }
 
-.ms-avatar-monogram {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: linear-gradient(135deg, #0078d4, #8764b8);
-  display: grid;
-  place-items: center;
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: #ffffff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-}
-
-.topbar-username {
-  font-size: 0.88rem;
+.ado-agent-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
   font-weight: 500;
-  color: var(--ms-text);
+  color: #4ade80;
+  background: var(--ado-success-bg);
+  border: 1px solid rgba(16, 124, 65, 0.35);
+  padding: 3px 10px;
+  border-radius: var(--ado-radius-sm);
 }
 
-.ms-btn-ghost {
-  background: transparent;
-  color: var(--ms-text-secondary);
-  border: 1px solid var(--ms-border);
-  border-radius: var(--ms-radius-sm);
-  padding: 6px 12px;
-  font-size: 0.82rem;
-  cursor: pointer;
-  transition: all 0.15s ease;
+.ado-status-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 6px #22c55e;
 }
 
-.ms-btn-ghost:hover {
-  background: var(--ms-bg-card-hover);
-  color: #ffffff;
-  border-color: var(--ms-border-hover);
-}
+/* ==========================================================================
+   5. CHAT PANEL & MESSAGES VIEWPORT
+   ========================================================================== */
 
-/* Chat Panel */
-.chat-panel {
+.ado-chat-panel {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  position: relative;
   overflow: hidden;
+  position: relative;
 }
 
-.chat-messages {
+.ado-messages-viewport {
   flex: 1;
   overflow-y: auto;
-  padding: 24px 20px 16px;
+  padding: 24px 32px 12px;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 16px;
+  max-width: 1040px;
+  width: 100%;
+  margin: 0 auto;
 }
 
-/* Microsoft Copilot Empty Welcome Screen */
-.copilot-hero {
-  max-width: 820px;
-  margin: 6vh auto 0;
+/* ==========================================================================
+   6. HERO WELCOME & PROMPT STARTER TILES
+   ========================================================================== */
+
+.ado-hero {
+  padding: 40px 24px 20px;
   text-align: center;
-  padding: 0 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  margin: auto 0;
 }
 
-.copilot-sparkle-badge {
-  width: 54px;
-  height: 54px;
-  margin: 0 auto 16px;
-  border-radius: 16px;
-  background: var(--ms-copilot-gradient);
+.ado-hero-badge-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  border-radius: var(--ado-radius-md);
+  background: rgba(0, 120, 212, 0.12);
+  border: 1px solid var(--ado-blue-border);
+}
+
+.ado-hero-logo {
   display: grid;
   place-items: center;
-  font-size: 26px;
-  box-shadow: 0 0 32px var(--ms-copilot-glow);
-  animation: pulse-glow 3s infinite ease-in-out;
 }
 
-@keyframes pulse-glow {
-  0%, 100% {
-    box-shadow: 0 0 24px rgba(0, 120, 212, 0.35);
-  }
-  50% {
-    box-shadow: 0 0 36px rgba(119, 56, 216, 0.55);
-  }
-}
-
-.copilot-hero h2 {
-  font-size: 1.75rem;
+.ado-hero-title {
+  margin: 4px 0 0;
+  font-size: 1.55rem;
   font-weight: 600;
-  color: #ffffff;
-  margin: 0 0 8px;
-  letter-spacing: -0.02em;
+  color: var(--ado-text);
+  letter-spacing: -0.01em;
 }
 
-.copilot-hero p {
-  color: var(--ms-text-secondary);
-  font-size: 0.98rem;
-  max-width: 580px;
-  margin: 0 auto 32px;
+.ado-hero-subtitle {
+  margin: 0;
+  font-size: 0.92rem;
+  color: var(--ado-text-secondary);
+  max-width: 620px;
   line-height: 1.6;
 }
 
-.copilot-starter-grid {
+/* Starter Tiles Grid */
+.ado-starter-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
   gap: 12px;
-  text-align: left;
+  width: 100%;
+  max-width: 780px;
+  margin-top: 16px;
 }
 
-.copilot-starter-card {
-  background: var(--ms-bg-card);
-  border: 1px solid var(--ms-border);
-  border-radius: var(--ms-radius-md);
+.ado-starter-card {
+  text-align: left;
+  background: var(--ado-bg-card);
+  border: 1px solid var(--ado-border);
+  border-radius: var(--ado-radius-sm);
   padding: 14px 16px;
   cursor: pointer;
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+
+.ado-starter-card:hover {
+  background: var(--ado-bg-card-hover);
+  border-color: var(--ado-blue);
+  box-shadow: 0 2px 8px rgba(0, 120, 212, 0.2);
+  transform: translateY(-1px);
+}
+
+.ado-starter-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ado-starter-icon {
+  font-size: 1.1rem;
+}
+
+.ado-starter-title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--ado-text);
+}
+
+.ado-starter-desc {
+  font-size: 0.78rem;
+  color: var(--ado-text-muted);
+  line-height: 1.45;
+}
+
+/* ==========================================================================
+   7. DISCUSSION CARDS (AZURE DEVOPS WORK ITEM DISCUSSION STYLE)
+   ========================================================================== */
+
+.ado-discussion-card {
+  border-radius: var(--ado-radius-sm);
+  border: 1px solid var(--ado-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: border-color 0.15s ease;
+}
+
+/* User Message: Neutral Card */
+.ado-card-user {
+  background: #21201f;
+  border-color: #3b3a39;
+  border-left: 3px solid #8a8886;
+}
+
+/* Assistant Message: Azure DevOps Blue Accent Card */
+.ado-card-assistant {
+  background: #1e222d;
+  border-color: #2b3547;
+  border-left: 3px solid var(--ado-blue);
+}
+
+.ado-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(0, 0, 0, 0.12);
+}
+
+.ado-card-author {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ado-author-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--ado-radius-sm);
+  display: grid;
+  place-items: center;
+  font-size: 0.8rem;
+}
+
+.avatar-user {
+  background: #3b3a39;
+  color: #ffffff;
+}
+
+.avatar-assistant {
+  background: rgba(0, 120, 212, 0.2);
+}
+
+.ado-author-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ado-text);
+}
+
+.ado-copilot-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  background: var(--ado-blue-subtle);
+  color: #60a5fa;
+  border: 1px solid var(--ado-blue-border);
+  padding: 1px 6px;
+  border-radius: var(--ado-radius-sm);
+}
+
+.ado-card-time {
+  font-size: 0.74rem;
+  color: var(--ado-text-muted);
+}
+
+.ado-card-body {
+  padding: 14px 18px;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  color: var(--ado-text);
+}
+
+.ado-user-text p {
+  color: #f3f4f6;
+  font-size: 0.92rem;
+}
+
+/* ==========================================================================
+   8. MARKDOWN RENDERER (AZURE DEVOPS SPECIFICATION STYLING)
+   ========================================================================== */
+
+.ado-markdown-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ado-markdown-body h1,
+.ado-markdown-body h2,
+.ado-markdown-body h3,
+.ado-markdown-body h4 {
+  margin: 12px 0 4px;
+  font-weight: 600;
+  color: #ffffff;
+  line-height: 1.35;
+}
+
+.ado-markdown-body h1 {
+  font-size: 1.3rem;
+  border-bottom: 1px solid var(--ado-border);
+  padding-bottom: 6px;
+}
+
+.ado-markdown-body h2 {
+  font-size: 1.15rem;
+}
+
+.ado-markdown-body h3 {
+  font-size: 1.02rem;
+  color: #93c5fd;
+}
+
+.ado-markdown-body h4 {
+  font-size: 0.92rem;
+  color: var(--ado-text-secondary);
+}
+
+.ado-para {
+  margin: 0;
+  color: #e5e7eb;
+}
+
+.ado-inline-code {
+  font-family: var(--ado-font-mono);
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 2px 5px;
+  border-radius: var(--ado-radius-sm);
+  font-size: 0.85em;
+  color: #93c5fd;
+}
+
+.ado-blockquote {
+  margin: 6px 0;
+  padding: 8px 14px;
+  border-left: 3px solid var(--ado-blue);
+  background: rgba(0, 120, 212, 0.08);
+  border-radius: 0 var(--ado-radius-sm) var(--ado-radius-sm) 0;
+  color: #e2e8f0;
+  font-style: italic;
+}
+
+.ado-ul,
+.ado-ol {
+  margin: 4px 0;
+  padding-left: 22px;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
-.copilot-starter-card:hover {
-  background: var(--ms-bg-card-hover);
-  border-color: var(--ms-primary);
-  transform: translateY(-2px);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+.ado-ul li,
+.ado-ol li {
+  color: #e5e7eb;
 }
 
-.copilot-starter-title {
+/* Azure DevOps Query Tables */
+.ado-table-wrap {
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid var(--ado-border);
+  border-radius: var(--ado-radius-sm);
+}
+
+.ado-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  text-align: left;
+}
+
+.ado-table th {
+  background: var(--ado-bg-table-header);
+  color: var(--ado-text-secondary);
   font-weight: 600;
-  font-size: 0.9rem;
-  color: #ffffff;
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  text-transform: uppercase;
+  font-size: 0.74rem;
+  letter-spacing: 0.04em;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ado-border);
 }
 
-.copilot-starter-desc {
-  font-size: 0.8rem;
-  color: var(--ms-text-muted);
-  line-height: 1.4;
+.ado-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  color: #f3f4f6;
 }
 
-/* Message Bubbles */
-.bubble {
-  width: min(840px, 100%);
-  margin: 0 auto;
-  padding: 16px 20px;
-  border-radius: var(--ms-radius-lg);
-  box-shadow: var(--ms-shadow-sm);
-  transition: transform 0.1s ease;
+.ado-table tr:nth-child(even) {
+  background: var(--ado-bg-table-zebra);
 }
 
-.bubble-user {
-  background: var(--ms-user-bubble);
-  border: 1px solid var(--ms-user-border);
-  align-self: flex-end;
-}
-
-.bubble-assistant {
-  background: var(--ms-assistant-bubble);
-  border: 1px solid var(--ms-assistant-border);
-  align-self: flex-start;
-}
-
-.bubble-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.bubble-avatar-icon {
-  width: 20px;
-  height: 20px;
-  border-radius: 4px;
-  display: grid;
-  place-items: center;
-  font-size: 11px;
-}
-
-.bubble-avatar-assistant {
-  background: var(--ms-copilot-gradient);
-  color: #fff;
-}
-
-.bubble-avatar-user {
-  background: var(--ms-primary);
-  color: #fff;
-}
-
-.bubble-role-name {
-  font-size: 0.82rem;
-  font-weight: 600;
-  color: var(--ms-text);
-}
-
-.bubble-assistant .bubble-role-name {
-  color: #93c5fd;
-}
-
-/* Markdown styling inside Copilot messages */
-.message-body {
-  font-size: 0.92rem;
-  line-height: 1.65;
-  color: var(--ms-text);
-  word-break: break-word;
-}
-
-.message-body h1,
-.message-body h2,
-.message-body h3,
-.message-body h4 {
-  margin: 16px 0 8px;
-  color: #ffffff;
-  font-weight: 600;
-  line-height: 1.3;
-}
-
-.message-body h1 { font-size: 1.25rem; border-bottom: 1px solid var(--ms-border); padding-bottom: 6px; }
-.message-body h2 { font-size: 1.12rem; color: #93c5fd; }
-.message-body h3 { font-size: 1.02rem; color: #60a5fa; }
-.message-body h4 { font-size: 0.94rem; color: #bfdbfe; }
-
-.message-body p {
-  margin: 0 0 10px;
-}
-
-.message-body p:last-child {
-  margin-bottom: 0;
-}
-
-.message-body ul,
-.message-body ol {
-  margin: 6px 0 12px 20px;
-  padding: 0;
-}
-
-.message-body li {
-  margin-bottom: 6px;
-}
-
-.message-body strong {
-  color: #ffffff;
-  font-weight: 600;
-}
-
-.message-body blockquote {
-  margin: 12px 0;
-  padding: 8px 14px;
+.ado-table tr:hover {
   background: rgba(0, 120, 212, 0.08);
-  border-left: 3px solid var(--ms-primary);
-  border-radius: 0 6px 6px 0;
-  color: #d1d5db;
 }
 
-.message-code-block {
-  margin: 12px 0;
-  background: #0e1117;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: var(--ms-radius-sm);
+/* Code Blocks */
+.ado-code-block {
+  margin: 8px 0;
+  background: #141414;
+  border: 1px solid var(--ado-border);
+  border-radius: var(--ado-radius-sm);
   overflow: hidden;
 }
 
-.message-code-header {
+.ado-code-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 6px 12px;
-  background: rgba(255, 255, 255, 0.04);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: #1e1e1e;
+  border-bottom: 1px solid var(--ado-border);
   font-size: 0.75rem;
-  color: var(--ms-text-muted);
+  color: var(--ado-text-muted);
 }
 
-.message-code-block pre {
-  margin: 0;
-  padding: 12px 14px;
-  overflow-x: auto;
-  font-family: 'Cascadia Code', 'Consolas', monospace;
-  font-size: 0.85rem;
-  line-height: 1.5;
-  color: #e5e7eb;
+.ado-code-lang {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
-.copy-button {
+.ado-copy-btn {
   background: transparent;
-  border: 0;
-  color: var(--ms-text-secondary);
-  font-size: 0.75rem;
+  border: 1px solid #3b3a39;
+  color: var(--ado-text-secondary);
+  border-radius: var(--ado-radius-sm);
+  padding: 2px 8px;
+  font-size: 0.72rem;
   cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 4px;
   transition: all 0.12s ease;
 }
 
-.copy-button:hover {
-  color: #fff;
+.ado-copy-btn:hover {
   background: rgba(255, 255, 255, 0.1);
+  color: var(--ado-text);
 }
 
-/* Chat Error */
-.chat-error {
-  width: min(840px, calc(100% - 32px));
-  margin: 0 auto 10px;
+.ado-code-pre {
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  font-family: var(--ado-font-mono);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  color: #d1d5db;
+}
+
+.ado-code-pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+}
+
+/* Error Banner */
+.ado-error-banner {
+  margin: 8px 32px;
+  background: rgba(168, 0, 0, 0.15);
+  border: 1px solid rgba(209, 52, 56, 0.4);
   color: #fca5a5;
-  background: var(--ms-danger-bg);
-  border: 1px solid var(--ms-danger-border);
-  border-radius: var(--ms-radius-sm);
   padding: 10px 14px;
-  font-size: 0.88rem;
+  border-radius: var(--ado-radius-sm);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
+  font-size: 0.85rem;
 }
 
-/* Floating Copilot Composer */
-.composer-container {
-  width: min(840px, calc(100% - 32px));
-  margin: 0 auto 12px;
+/* ==========================================================================
+   9. AZURE DEVOPS DISCUSSION COMPOSER
+   ========================================================================== */
+
+.ado-composer-container {
+  padding: 8px 32px 16px;
+  max-width: 1040px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.ado-composer-box {
+  background: var(--ado-bg-subnav);
+  border: 1px solid var(--ado-border-light);
+  border-radius: var(--ado-radius-sm);
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-
-.composer {
-  background: var(--ms-bg-input);
-  border: 1px solid var(--ms-border);
-  border-radius: var(--ms-radius-xl);
-  padding: 12px 16px;
-  box-shadow: var(--ms-shadow-md);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.composer:focus-within {
-  border-color: var(--ms-primary);
-  box-shadow: 0 0 0 2px var(--ms-primary-subtle), var(--ms-shadow-md);
+.ado-composer-box:focus-within {
+  border-color: var(--ado-blue);
+  box-shadow: 0 0 0 1px var(--ado-blue);
 }
 
-.file-chips {
+/* File Chips */
+.ado-file-chips {
   list-style: none;
+  margin: 0;
+  padding: 8px 12px 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin: 0 0 10px;
-  padding: 0;
+  gap: 6px;
 }
 
-.file-chip {
-  display: flex;
+.ado-file-chip {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  background: var(--ms-bg-elevated);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: var(--ms-radius-sm);
-  padding: 5px 10px;
+  gap: 6px;
+  background: #292827;
+  border: 1px solid #3b3a39;
+  border-radius: var(--ado-radius-sm);
+  padding: 3px 8px;
+  font-size: 0.78rem;
+  color: var(--ado-text-secondary);
+}
+
+.ado-chip-icon {
   font-size: 0.8rem;
-  color: #bfdbfe;
 }
 
-.file-chip-icon {
-  font-size: 0.9rem;
+.ado-chip-name {
+  max-width: 220px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.file-chip button {
-  border: 0;
+.ado-chip-remove {
   background: transparent;
-  color: var(--ms-text-muted);
+  border: none;
+  color: var(--ado-text-muted);
   cursor: pointer;
   padding: 0 2px;
-  font-size: 0.95rem;
-  line-height: 1;
+  font-size: 0.75rem;
 }
 
-.file-chip button:hover {
-  color: #fca5a5;
+.ado-chip-remove:hover {
+  color: #f87171;
 }
 
-.composer-row {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
+.ado-composer-input-row {
+  padding: 10px 12px 4px;
 }
 
-.composer-row textarea {
-  flex: 1;
-  resize: none;
-  min-height: 44px;
-  max-height: 180px;
-  border: 0;
+.ado-composer-input-row textarea {
+  width: 100%;
   background: transparent;
-  color: #ffffff;
-  outline: none;
-  padding: 8px 0;
-  font-size: 0.92rem;
+  border: none;
+  color: var(--ado-text);
+  font-family: var(--ado-font);
+  font-size: 0.9rem;
   line-height: 1.5;
+  resize: vertical;
+  min-height: 48px;
+  max-height: 200px;
+  outline: none;
 }
 
-.composer-row textarea::placeholder {
-  color: var(--ms-text-muted);
+.ado-composer-input-row textarea::placeholder {
+  color: var(--ado-text-muted);
 }
 
-.composer-actions {
+/* Composer Toolbar */
+.ado-composer-toolbar {
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  gap: 8px;
+  padding: 8px 12px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
 
-.upload-button {
-  background: transparent;
-  border: 1px solid var(--ms-border);
-  color: var(--ms-text-secondary);
-  border-radius: var(--ms-radius-sm);
-  padding: 8px 12px;
-  font-size: 0.82rem;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  transition: all 0.15s ease;
+.ado-attach-btn {
+  font-size: 0.8rem;
+  padding: 5px 10px;
 }
 
-.upload-button:hover {
-  background: var(--ms-bg-card-hover);
-  color: #ffffff;
-  border-color: var(--ms-border-hover);
-}
-
-.send-button {
-  background: var(--ms-primary);
-  color: #ffffff;
-  border: 0;
-  border-radius: var(--ms-radius-sm);
-  padding: 8px 16px;
+.ado-send-btn {
+  padding: 6px 16px;
   font-size: 0.85rem;
-  font-weight: 500;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  transition: all 0.15s ease;
 }
 
-.send-button:hover:not(:disabled) {
-  background: var(--ms-primary-hover);
-  box-shadow: 0 2px 8px rgba(0, 120, 212, 0.4);
+.ado-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: ado-spin 0.8s linear infinite;
 }
 
-.send-button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+@keyframes ado-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-/* Microsoft Copilot Disclaimer Footer */
-.composer-disclaimer {
+.ado-composer-footnote {
+  margin: 6px 0 0;
   text-align: center;
   font-size: 0.72rem;
-  color: var(--ms-text-muted);
-  margin: 0;
-  user-select: none;
+  color: var(--ado-text-muted);
 }
 
-/* Auth Screens */
+/* ==========================================================================
+   10. AZURE DEVOPS AUTH SCREEN (SIGN IN)
+   ========================================================================== */
+
 .auth-screen {
   min-height: 100vh;
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #141414;
   padding: 24px;
-  background: radial-gradient(circle at 50% 20%, #151a26 0%, #0b0d11 100%);
 }
 
 .auth-card {
-  width: min(440px, 100%);
-  background: var(--ms-bg-sidebar);
-  border: 1px solid var(--ms-border);
-  border-radius: var(--ms-radius-xl);
+  width: 100%;
+  max-width: 420px;
+  background: var(--ado-bg-card);
+  border: 1px solid var(--ado-border);
+  border-radius: var(--ado-radius-sm);
   padding: 36px 32px;
-  box-shadow: var(--ms-shadow-lg);
+  box-shadow: var(--ado-shadow-lg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   text-align: center;
 }
 
 .ms-brand-logo {
   display: grid;
-  grid-template-columns: repeat(2, 11px);
-  gap: 2px;
-  margin: 0 auto 16px;
-  width: 24px;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  width: 32px;
+  height: 32px;
+  margin-bottom: 16px;
 }
 
-.ms-tile-red { background: #f25022; width: 11px; height: 11px; }
-.ms-tile-green { background: #7fba00; width: 11px; height: 11px; }
-.ms-tile-blue { background: #00a4ef; width: 11px; height: 11px; }
-.ms-tile-yellow { background: #ffb900; width: 11px; height: 11px; }
+.ms-tile-red { background: #f25022; }
+.ms-tile-green { background: #7fba00; }
+.ms-tile-blue { background: #00a4ef; }
+.ms-tile-yellow { background: #ffb900; }
 
 .auth-card h1 {
   margin: 0 0 8px;
-  font-size: 1.55rem;
+  font-size: 1.45rem;
   font-weight: 600;
-  color: #ffffff;
+  color: var(--ado-text);
 }
 
 .auth-card p {
   margin: 0 0 24px;
-  color: var(--ms-text-secondary);
-  font-size: 0.92rem;
+  color: var(--ado-text-secondary);
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.auth-error {
+  margin-bottom: 16px !important;
+  color: #f87171 !important;
+  background: rgba(168, 0, 0, 0.15);
+  border: 1px solid rgba(209, 52, 56, 0.4);
+  padding: 8px 12px;
+  border-radius: var(--ado-radius-sm);
+  font-size: 0.82rem;
+  width: 100%;
 }
 
 .ms-signin-button {
   width: 100%;
-  background: var(--ms-primary);
+  background: var(--ado-blue);
   color: #ffffff;
-  border: 0;
-  border-radius: var(--ms-radius-md);
-  padding: 12px 20px;
-  font-size: 0.95rem;
-  font-weight: 500;
+  border: 1px solid transparent;
+  border-radius: var(--ado-radius-sm);
+  padding: 10px 16px;
+  font-size: 0.92rem;
+  font-weight: 600;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  transition: all 0.15s ease;
-  box-shadow: 0 2px 8px rgba(0, 120, 212, 0.35);
+  transition: background 0.15s ease;
 }
 
-.ms-signin-button:hover {
-  background: var(--ms-primary-hover);
-  box-shadow: 0 4px 14px rgba(0, 120, 212, 0.45);
+.ms-signin-button:hover:not(:disabled) {
+  background: var(--ado-blue-hover);
 }
 
-@media (max-width: 820px) {
-  .app-shell {
-    flex-direction: column;
-  }
-  .sidebar {
-    width: 100%;
-    height: auto;
-    max-height: 220px;
-  }
-  .copilot-starter-grid {
-    grid-template-columns: 1fr;
-  }
+.ms-signin-button:active:not(:disabled) {
+  background: var(--ado-blue-pressed);
+}
+
+.ms-signin-button:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
 }

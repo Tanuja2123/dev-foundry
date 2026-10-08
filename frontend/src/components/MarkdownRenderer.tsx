@@ -18,14 +18,14 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
   }
 
   return (
-    <div className="message-code-block">
-      <div className="message-code-header">
-        <span>{language || 'text'}</span>
-        <button type="button" className="copy-button" onClick={() => void handleCopy()}>
+    <div className="ado-code-block">
+      <div className="ado-code-header">
+        <span className="ado-code-lang">{language || 'text'}</span>
+        <button type="button" className="ado-copy-btn" onClick={() => void handleCopy()}>
           {copied ? '✓ Copied' : 'Copy'}
         </button>
       </div>
-      <pre>
+      <pre className="ado-code-pre">
         <code>{code}</code>
       </pre>
     </div>
@@ -37,7 +37,11 @@ function formatInline(text: string) {
   const codeParts = text.split(/(`[^`]+`)/g)
   return codeParts.map((part, i) => {
     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
-      return <code key={i}>{part.slice(1, -1)}</code>
+      return (
+        <code key={i} className="ado-inline-code">
+          {part.slice(1, -1)}
+        </code>
+      )
     }
 
     // Process bold text: **bold**
@@ -87,7 +91,7 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
   }
 
   return (
-    <div className="message-body">
+    <div className="ado-markdown-body">
       {tokens.map((token, tokenIdx) => {
         if (token.type === 'code') {
           return (
@@ -105,6 +109,51 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
           const trimmed = para.trim()
           if (!trimmed) return null
 
+          // Markdown Table
+          const lines = trimmed.split('\n')
+          if (
+            lines.length >= 2 &&
+            lines[0].includes('|') &&
+            lines[1].includes('|') &&
+            lines[1].includes('-')
+          ) {
+            const headerCells = lines[0]
+              .split('|')
+              .map((c) => c.trim())
+              .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1)
+
+            const bodyRows = lines.slice(2).filter((l) => l.trim().startsWith('|'))
+
+            return (
+              <div className="ado-table-wrap" key={`${tokenIdx}-${paraIdx}`}>
+                <table className="ado-table">
+                  <thead>
+                    <tr>
+                      {headerCells.map((h, hIdx) => (
+                        <th key={hIdx}>{formatInline(h)}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bodyRows.map((row, rIdx) => {
+                      const cells = row
+                        .split('|')
+                        .map((c) => c.trim())
+                        .filter((_, idx, arr) => idx > 0 && idx < arr.length - 1)
+                      return (
+                        <tr key={rIdx}>
+                          {cells.map((cell, cIdx) => (
+                            <td key={cIdx}>{formatInline(cell)}</td>
+                          ))}
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )
+          }
+
           // Headings
           if (trimmed.startsWith('#### ')) {
             return <h4 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(5))}</h4>
@@ -119,24 +168,35 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
             return <h1 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(2))}</h1>
           }
 
-          // Blockquote
+          // Blockquote / Callout
           if (trimmed.startsWith('> ')) {
             return (
-              <blockquote key={`${tokenIdx}-${paraIdx}`}>
+              <blockquote className="ado-blockquote" key={`${tokenIdx}-${paraIdx}`}>
                 {formatInline(trimmed.replace(/^>\s*/gm, ''))}
               </blockquote>
             )
           }
 
-          // Bullet lists
-          const lines = trimmed.split('\n')
+          // Bullet or Numbered lists
           const isBulletList = lines.every((l) => /^\s*([*•-]\s|\d+\.\s)/.test(l))
           if (isBulletList && lines.length > 0) {
+            const isNumbered = /^\s*\d+\.\s/.test(lines[0])
+            if (isNumbered) {
+              return (
+                <ol className="ado-ol" key={`${tokenIdx}-${paraIdx}`}>
+                  {lines.map((line, liIdx) => (
+                    <li key={liIdx}>
+                      {formatInline(line.replace(/^\s*\d+\.\s/, ''))}
+                    </li>
+                  ))}
+                </ol>
+              )
+            }
             return (
-              <ul key={`${tokenIdx}-${paraIdx}`}>
+              <ul className="ado-ul" key={`${tokenIdx}-${paraIdx}`}>
                 {lines.map((line, liIdx) => (
                   <li key={liIdx}>
-                    {formatInline(line.replace(/^\s*([*•-]\s|\d+\.\s)/, ''))}
+                    {formatInline(line.replace(/^\s*[*•-]\s/, ''))}
                   </li>
                 ))}
               </ul>
@@ -145,7 +205,7 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
 
           // Standard paragraph with line breaks
           return (
-            <p key={`${tokenIdx}-${paraIdx}`}>
+            <p className="ado-para" key={`${tokenIdx}-${paraIdx}`}>
               {lines.map((line, lineIdx) => (
                 <span key={lineIdx}>
                   {formatInline(line)}
