@@ -56,7 +56,7 @@ def remove_conversation(conversation_id: str):
 
 @router.post("/chat", response_model=ChatResponse)
 async def create_chat(
-    conversation_id: str = Form(..., description="Existing conversation identifier"),
+    conversation_id: Optional[str] = Form(None, description="Optional existing conversation identifier. If null/omitted, a new conversation is created automatically."),
     user_query: str = Form(..., description="User message for the AI agent"),
     file: Optional[UploadFile] = File(None, description="Optional PDF or Word file")
 ) -> ChatResponse:

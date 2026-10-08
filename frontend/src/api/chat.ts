@@ -47,12 +47,14 @@ export async function createConversation(): Promise<Conversation> {
 }
 
 export async function continueChat(
-  conversationId: string,
+  conversationId: string | null | undefined,
   userQuery: string,
   file?: File | null,
 ): Promise<ChatApiResponse> {
   const formData = new FormData()
-  formData.append('conversation_id', conversationId)
+  if (conversationId) {
+    formData.append('conversation_id', conversationId)
+  }
   formData.append('user_query', userQuery)
   if (file) {
     formData.append('file', file)

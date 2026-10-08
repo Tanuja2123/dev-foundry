@@ -382,16 +382,24 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
         logger.error(f"[Agent Pipeline] Error: {str(e)}")
         return f"Error communicating with Agent Framework: {str(e)}"
 
-async def process_chat_request(conversation_id: str, user_query: str, file: Optional[UploadFile] = None) -> ChatResponse:
+async def process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None) -> ChatResponse:
     overall_start = time.time()
+
+    # If conversation_id is not provided, create a new conversation for this initial message
+    if not conversation_id or str(conversation_id).strip().lower() in ("null", "none", ""):
+        logger.info("[Conversation] No conversation_id provided; creating new conversation row for initial message.")
+        new_conv = create_new_conversation(title="New Project")
+        conversation_id = new_conv.conversation_id
+        conv = {"conv_id": conversation_id, "title": "New Project", "content": []}
+    else:
+        conv = get_conversation_by_id(conversation_id)
+        if not conv:
+            logger.warning(f"[Supabase] Conversation '{conversation_id}' not found in DB.")
+            raise ValueError(f"Conversation '{conversation_id}' not found.")
+
     logger.info(f"=== Starting chat processing pipeline for conversation '{conversation_id}' ===")
-
-    conv = get_conversation_by_id(conversation_id)
-    if not conv:
-        logger.warning(f"[Supabase] Conversation '{conversation_id}' not found in DB.")
-        raise ValueError(f"Conversation '{conversation_id}' not found.")
-
     content_array = conv.get("content") or []
+
     
     # Process document upload if provided
     if file:

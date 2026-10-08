@@ -33,6 +33,8 @@ Then fill in `.env`:
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | Optional — falls back to demo responses |
 | `AZURE_OPENAI_VERSION` | API version (default: `2024-12-01-preview`) | Optional |
 | `AZURE_OPENAI_DEPLOYMENT` | Deployment name (default: `gpt-4`) | Optional |
+| `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
+| `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project/code read & write scopes | Yes (for ADO project & repo creation) |
 
 > **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  
 > **Without Azure OpenAI credentials**, `/api/chat` returns a placeholder demo response.
