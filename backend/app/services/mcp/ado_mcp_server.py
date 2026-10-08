@@ -2,7 +2,7 @@ import os
 import base64
 import re
 import urllib.parse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import httpx
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -199,6 +199,153 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
         return {
             "status": "error",
             "message": "Azure DevOps repository creation encountered an unexpected error.",
+            "details": err_msg
+        }
+
+@mcp.tool(name="push_repository_scaffold", description="Push initial directory structure, starter boilerplate files, and .gitkeep placeholder files to an Azure DevOps Git repository.")
+def push_repository_scaffold(
+    project_id_or_name: str,
+    repository_name_or_id: str,
+    files: List[Dict[str, str]],
+    commit_message: str = "Initial commit: Project structure scaffolding"
+) -> Dict[str, Any]:
+    """
+    TOOL 3 — ADO REPOSITORY SCAFFOLD INITIALIZATION
+    Pushes the approved file and folder structure directly to the Azure DevOps Git repository
+    via the Azure DevOps Git Pushes REST API.
+    """
+    config = get_ado_config()
+    org_url = config.get("org_url")
+    pat = config.get("pat")
+
+    logger.info(f"[ADO MCP] Tool invoked: push_repository_scaffold(project='{project_id_or_name}', repo='{repository_name_or_id}', file_count={len(files) if files else 0})")
+
+    if not org_url or not pat:
+        logger.warning("[ADO MCP] Azure DevOps organization name or PAT is missing in environment variables.")
+        return {
+            "status": "error",
+            "message": "Azure DevOps configuration missing.",
+            "details": "AZURE_DEVOPS_ORG_NAME and AZURE_DEVOPS_PAT environment variables must be configured."
+        }
+
+    # Normalize file paths and assemble Git changes array
+    changes = []
+    seen_paths = set()
+
+    for f in (files or []):
+        if not isinstance(f, dict):
+            continue
+        raw_path = str(f.get("path", "")).strip().replace("\\", "/")
+        if not raw_path:
+            continue
+
+        if not raw_path.startswith("/"):
+            raw_path = "/" + raw_path
+
+        # If it points to an empty folder or ends with a slash, place a .gitkeep
+        if raw_path.endswith("/"):
+            raw_path = raw_path + ".gitkeep"
+
+        if raw_path in seen_paths:
+            continue
+        seen_paths.add(raw_path)
+
+        content = f.get("content")
+        if content is None:
+            content = ""
+
+        changes.append({
+            "changeType": "add",
+            "item": {
+                "path": raw_path
+            },
+            "newContent": {
+                "content": str(content),
+                "contentType": "rawtext"
+            }
+        })
+
+    # Ensure at least README.md is present if no valid files were provided
+    if not changes:
+        changes.append({
+            "changeType": "add",
+            "item": {"path": "/README.md"},
+            "newContent": {
+                "content": f"# {repository_name_or_id}\n\nProject initialized with DevFoundry.",
+                "contentType": "rawtext"
+            }
+        })
+
+    auth_header = "Basic " + base64.b64encode(f":{pat}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": auth_header,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    encoded_project = urllib.parse.quote(str(project_id_or_name).strip())
+    encoded_repo = urllib.parse.quote(str(repository_name_or_id).strip())
+
+    try:
+        with httpx.Client(timeout=45.0) as client:
+            # Query refs to determine if refs/heads/main already has an initial objectId
+            ref_url = f"{org_url}/{encoded_project}/_apis/git/repositories/{encoded_repo}/refs?filter=heads/main&api-version=7.1-preview.1"
+            old_object_id = "0000000000000000000000000000000000000000"
+            ref_resp = client.get(ref_url, headers=headers)
+            if ref_resp.status_code == 200:
+                refs_data = ref_resp.json().get("value", [])
+                if refs_data and len(refs_data) > 0:
+                    old_object_id = refs_data[0].get("objectId", old_object_id)
+
+            push_url = f"{org_url}/{encoded_project}/_apis/git/repositories/{encoded_repo}/pushes?api-version=7.1-preview.2"
+            payload = {
+                "refUpdates": [
+                    {
+                        "name": "refs/heads/main",
+                        "oldObjectId": old_object_id
+                    }
+                ],
+                "commits": [
+                    {
+                        "comment": commit_message or "Initial commit: Project structure scaffolding",
+                        "changes": changes
+                    }
+                ]
+            }
+
+            response = client.post(push_url, json=payload, headers=headers)
+            if response.status_code in (200, 201):
+                push_data = response.json()
+                commit_id = ""
+                commits = push_data.get("commits") or []
+                if commits and isinstance(commits, list) and len(commits) > 0:
+                    commit_id = commits[0].get("commitId", "")
+
+                repo_url = f"{org_url}/{project_id_or_name}/_git/{repository_name_or_id}"
+                logger.info(f"[ADO MCP] Pushed {len(changes)} files to repository '{repository_name_or_id}' (Commit: {commit_id}).")
+                return {
+                    "status": "success",
+                    "repository": repository_name_or_id,
+                    "branch": "main",
+                    "commit_id": commit_id,
+                    "pushed_files_count": len(changes),
+                    "files": [c["item"]["path"] for c in changes],
+                    "url": repo_url
+                }
+            else:
+                raw_err = sanitize_error(response.text, pat)
+                logger.error(f"[ADO MCP] Failed to push scaffold to repository '{repository_name_or_id}'. Status {response.status_code}: {raw_err}")
+                return {
+                    "status": "error",
+                    "message": f"Azure DevOps repository scaffold push failed with status code {response.status_code}.",
+                    "details": raw_err
+                }
+    except Exception as e:
+        err_msg = sanitize_error(str(e), pat)
+        logger.error(f"[ADO MCP] Exception during repository scaffold push: {err_msg}")
+        return {
+            "status": "error",
+            "message": "Azure DevOps repository scaffold push encountered an unexpected error.",
             "details": err_msg
         }
 

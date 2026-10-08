@@ -132,13 +132,13 @@ AVAILABLE CHILD AGENTS:
    - Technical Architecture (TRD): Generates and updates the Technical Requirements Document (Frontend, Backend, Database, Infrastructure, Security) based on the approved PRD and user tech stack feedback.
 
 2. Repo_Setup_Agent:
-   Responsible for Azure DevOps project and repository setup across a state-driven human-in-the-loop workflow:
+   Responsible for Azure DevOps project, repository, and file structure setup across a state-driven human-in-the-loop workflow:
    - Proposing project name and description (GENERATE_PROJECT_PROPOSAL)
    - Updating project proposal details (UPDATE_PROJECT_PROPOSAL)
    - Creating the ADO project upon explicit user approval (CREATE_PROJECT)
    - Generating tailored repository directory structure based on PRD/TRD/tech stack (GENERATE_REPOSITORY_STRUCTURE)
    - Updating repository directory structure based on user feedback (UPDATE_REPOSITORY_STRUCTURE)
-   - Creating the ADO Git repository upon explicit user approval (CREATE_REPOSITORY)
+   - Creating the ADO Git repository and initializing its file/folder scaffolding upon explicit user approval (CREATE_REPOSITORY)
 
 DYNAMIC CONTEXTUAL WORKFLOW ROUTING PRINCIPLES:
 - Do NOT rely on isolated keywords. Evaluate the user's message IN THE CONTEXT of the previous conversation history and current workflow stage.
@@ -353,12 +353,16 @@ CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW" (or co
 - Clearly invite the user to review: they can request adjustments to folders or files, or explicitly approve it so we can create the repository.
 
 CASE 5: If status is "COMPLETE" and workflow_stage is "REPOSITORY_CREATED" (or contains repository details with id/url):
-- Announce that the Azure DevOps Git repository has been created successfully!
+- Announce that the Azure DevOps Git repository and initial project file structure have been created successfully!
 - Show the repository details clearly:
   * **Repository Name**: [name]
   * **Repository ID**: [id]
-  * **Repository URL**: [link](url)
-- Conclude by stating that repository setup is complete and the project is ready for development.
+  * **Repository URL**: [View Repository on Azure DevOps](url)
+- If files were pushed or initialized (check commit_id, pushed_files_count, or files_created):
+  * State that the approved folder and file scaffolding has been committed and pushed to the `main` branch.
+  * Mention the commit ID and the number of initialized files/folders (pushed_files_count).
+  * List key starter files created (such as README.md, .gitignore, main application entry points).
+- Conclude by stating that repository setup is complete and the codebase is scaffolded and ready for development.
 
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
 """
