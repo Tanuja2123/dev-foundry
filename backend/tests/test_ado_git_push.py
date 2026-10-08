@@ -8,6 +8,8 @@ from app.services.mcp import ado_git_push as gp
 from app.services.mcp.ado_git_push import AdoPushError, ZERO_OBJECT_ID, push_files_to_repo
 from tests.fake_ado import FakeAdo, ORG_URL, PAT
 
+pytestmark = pytest.mark.usefixtures("no_real_network")
+
 FILES = {"/README.md": "# Repo\n", "backend/app/__init__.py": '"""pkg"""\n'}
 
 
@@ -376,9 +378,7 @@ def test_pat_is_redacted_from_error_details():
     assert PAT not in json.dumps(err.value.to_dict())
 
 
-def test_missing_configuration(monkeypatch):
-    monkeypatch.delenv("AZURE_DEVOPS_ORG_NAME", raising=False)
-    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+def test_missing_configuration(no_ado_config):
     with pytest.raises(AdoPushError) as err:
         push_files_to_repo("Proj", "repo", FILES)
     assert err.value.error_type == "CONFIGURATION_ERROR"

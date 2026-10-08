@@ -32,6 +32,21 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
   )
 }
 
+function formatBold(text: string, keyPrefix: string) {
+  // Process bold text: **bold**
+  const boldParts = text.split(/(\*\*[^*]+\*\*)/g)
+  return boldParts.map((subPart, j) => {
+    if (subPart.startsWith('**') && subPart.endsWith('**') && subPart.length > 4) {
+      return <strong key={`${keyPrefix}-${j}`}>{subPart.slice(2, -2)}</strong>
+    }
+    return subPart
+  })
+}
+
+// Links: [text](https://...) — only http(s) URLs are turned into anchors
+const LINK_SPLIT = /(\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g
+const LINK_MATCH = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/
+
 function formatInline(text: string) {
   // Process inline code first: `foo`
   const codeParts = text.split(/(`[^`]+`)/g)
@@ -40,13 +55,16 @@ function formatInline(text: string) {
       return <code key={i}>{part.slice(1, -1)}</code>
     }
 
-    // Process bold text: **bold**
-    const boldParts = part.split(/(\*\*[^*]+\*\*)/g)
-    return boldParts.map((subPart, j) => {
-      if (subPart.startsWith('**') && subPart.endsWith('**') && subPart.length > 4) {
-        return <strong key={`${i}-${j}`}>{subPart.slice(2, -2)}</strong>
+    return part.split(LINK_SPLIT).map((linkPart, k) => {
+      const link = linkPart.match(LINK_MATCH)
+      if (link) {
+        return (
+          <a key={`${i}-${k}`} href={link[2]} target="_blank" rel="noopener noreferrer">
+            {formatBold(link[1], `${i}-${k}`)}
+          </a>
+        )
       }
-      return subPart
+      return formatBold(linkPart, `${i}-${k}`)
     })
   })
 }
@@ -117,6 +135,11 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
           }
           if (trimmed.startsWith('# ')) {
             return <h1 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(2))}</h1>
+          }
+
+          // Horizontal rule
+          if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
+            return <hr key={`${tokenIdx}-${paraIdx}`} />
           }
 
           // Blockquote

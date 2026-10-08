@@ -4,6 +4,8 @@ from app.services.mcp.ado_git_push import AdoPushError
 from app.services.repo_structure import (apply_structure_update, files_to_map, normalize_structure,
                                          render_structure_tree, structure_folders)
 
+pytestmark = pytest.mark.usefixtures("no_real_network")
+
 BASE = [
     {"path": "/README.md", "content": "# app\n"},
     {"path": "/src/main.py", "content": '"""entry"""\n'},

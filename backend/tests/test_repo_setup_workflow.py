@@ -9,6 +9,8 @@ from app.services import project_store as store
 from app.services.agents import repo_setup_agent as rsa
 from tests.fake_supabase import FakeSupabase
 
+pytestmark = pytest.mark.usefixtures("no_real_network")
+
 CONV = "conv-123"
 TRD = {"Backend Technology Stack": {"language": "Go", "framework": "Gin"}}
 STRUCTURE = [

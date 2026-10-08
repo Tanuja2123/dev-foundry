@@ -6,6 +6,8 @@ import pytest
 from app.services.mcp import ado_git_push as gp
 from app.services.mcp import ado_mcp_server as server
 
+pytestmark = pytest.mark.usefixtures("no_real_network")
+
 
 @pytest.fixture
 def ado_env(monkeypatch):
@@ -172,8 +174,6 @@ def test_create_ado_repository_unchanged(scripted):
                       "url": "https://dev.azure.com/fake-org/Proj/_git/repo"}
 
 
-def test_existing_tools_report_missing_config(monkeypatch):
-    monkeypatch.delenv("AZURE_DEVOPS_ORG_NAME", raising=False)
-    monkeypatch.delenv("AZURE_DEVOPS_PAT", raising=False)
+def test_existing_tools_report_missing_config(no_ado_config):
     assert server.create_ado_project("P", "D")["status"] == "error"
     assert server.create_ado_repository("P", "r")["status"] == "error"
