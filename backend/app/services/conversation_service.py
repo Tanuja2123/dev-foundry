@@ -14,6 +14,8 @@ from supabase import create_client, Client
 from app.schemas.conversation import ChatResponse, ConversationItem
 from app.services.agents.requirements_agent import process_uploaded_document, get_requirements_agent
 from app.services.agents.repo_setup_agent import get_repo_setup_agent
+from app.services import project_store as store
+from app.services.repo_structure import render_structure_tree
 from app.core.logger import logger
 
 # Load variables from .env file
@@ -92,7 +94,86 @@ def get_agent_framework_client() -> OpenAIChatCompletionClient:
         api_version=api_version,
     )
 
-async def generate_chat_response(user_query: str, history: List[Dict]) -> str:
+# Workflow state persistence (Project / Repository tables)
+
+STRUCTURE_PLACEHOLDER = "[[REPOSITORY_STRUCTURE]]"
+STRUCTURE_STAGES = ("REPOSITORY_CREATED", "STRUCTURE_REVIEW", "STRUCTURE_PUSHED")
+
+def parse_agent_json(text: str) -> Optional[Dict]:
+    """Extracts the JSON object a child agent returned (tolerates ```json fences)."""
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+def persist_requirements_output(conversation_id: Optional[str], raw_output: str) -> None:
+    """Stores a completed PRD/TRD in the Project row of the conversation."""
+    data = parse_agent_json(raw_output)
+    if not conversation_id or not data or data.get("status") != "COMPLETE":
+        return
+    fields = {}
+    if data.get("structured_project_response"):
+        fields["prd"] = data["structured_project_response"]
+    if data.get("technical_requirements_document"):
+        fields["trd"] = data["technical_requirements_document"]
+    if not fields:
+        return
+    try:
+        project = store.ensure_project(conversation_id)
+        store.update_project(project["project_id"], **fields)
+        logger.info(f"[ProjectStore] Saved {', '.join(fields).upper()} for conversation '{conversation_id}'")
+    except store.StoreError as e:
+        logger.error(f"[ProjectStore] Could not save requirements: {e}")
+
+def persist_repo_setup_output(conversation_id: Optional[str], raw_output: str) -> None:
+    """Stores project/repository proposals from the Repo_Setup_Agent. Created resources are stored by its tools."""
+    data = parse_agent_json(raw_output)
+    if not conversation_id or not data or data.get("status") != "COMPLETE":
+        return
+    stage = data.get("workflow_stage")
+    try:
+        proposal = data.get("project_proposal") or {}
+        if stage == "PROJECT_REVIEW" and proposal.get("project_name"):
+            project = store.ensure_project(conversation_id)
+            if not project.get("ado_project_id"):
+                store.update_project(project["project_id"], project_name=proposal["project_name"].strip(),
+                                     project_description=(proposal.get("project_description") or "").strip(),
+                                     workflow_stage=store.STAGE_PROJECT_REVIEW)
+        repo_proposal = data.get("repository_proposal") or {}
+        if stage in ("PROJECT_CREATED", "REPOSITORY_REVIEW") and (repo_proposal.get("repo_name") or "").strip():
+            project = store.get_project(conversation_id)
+            if project and project.get("ado_project_id"):
+                store.propose_repository_name(project["project_id"], repo_proposal["repo_name"].strip())
+                store.update_project(project["project_id"], workflow_stage=store.STAGE_REPOSITORY_REVIEW)
+    except store.StoreError as e:
+        logger.error(f"[ProjectStore] Could not save repository setup proposal: {e}")
+
+def render_structure_for_display(state: Dict) -> Optional[str]:
+    """Renders the stored structure (the exact files that are / will be pushed) as Markdown."""
+    repository = (state or {}).get("repository") or {}
+    files = repository.get("structure") or []
+    if not files:
+        return None
+    pushed = repository.get("status") == store.REPO_PUSHED
+    title = "Pushed repository structure" if pushed else "Proposed repository structure"
+    header = f"**{title}** (version {repository.get('structure_version')}, {len(files)} files)"
+    return header + "\n\n" + render_structure_tree(files, root_name=repository.get("repo_name"))
+
+def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
+    """Replaces the synthesizer's placeholder with the code-rendered tree (appends it if the placeholder is missing)."""
+    if not tree_markdown:
+        return text.replace(STRUCTURE_PLACEHOLDER, "")
+    if STRUCTURE_PLACEHOLDER in text:
+        return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
+    return text.rstrip() + "\n\n" + tree_markdown
+
+async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
     """Uses Microsoft Agent Framework to generate a response with conversation history."""
     try:
         client = get_agent_framework_client()
@@ -113,13 +194,16 @@ AVAILABLE CHILD AGENTS:
    Responsible for Azure DevOps project and repository setup across a state-driven human-in-the-loop workflow:
    - Proposing project name and description (GENERATE_PROJECT_PROPOSAL)
    - Updating project proposal details (UPDATE_PROJECT_PROPOSAL)
-   - Creating the ADO project upon explicit user approval (CREATE_PROJECT)
-   - Generating tailored repository directory structure based on PRD/TRD/tech stack (GENERATE_REPOSITORY_STRUCTURE)
-   - Updating repository directory structure based on user feedback (UPDATE_REPOSITORY_STRUCTURE)
-   - Creating the ADO Git repository upon explicit user approval (CREATE_REPOSITORY)
+   - Creating the ADO project upon explicit user approval, then suggesting a repository name (CREATE_PROJECT)
+   - Proposing / renaming the repository (GENERATE_REPOSITORY_PROPOSAL, UPDATE_REPOSITORY_PROPOSAL)
+   - Creating the empty ADO Git repository upon explicit approval of its name, then proposing its folder structure from the TRD (CREATE_REPOSITORY)
+   - Regenerating / updating the proposed folder structure based on user feedback (GENERATE_REPOSITORY_STRUCTURE, UPDATE_REPOSITORY_STRUCTURE)
+   - Pushing the approved folder structure to the main branch as one commit upon explicit approval (PUSH_REPOSITORY_STRUCTURE)
 
 DYNAMIC CONTEXTUAL WORKFLOW ROUTING PRINCIPLES:
 - Do NOT rely on isolated keywords. Evaluate the user's message IN THE CONTEXT of the previous conversation history and current workflow stage.
+- The system appends a "[Current Workflow State (database)]" block to the user's latest message. It is authoritative for what already exists
+  (workflow_stage, project proposal, ADO project created, repository name/status, structure version). Prefer it over the chat history.
 
 A. PRD & TRD STAGES (Requirements_Agent):
 - If the assistant previously offered: "Would you like me to create a Technical Requirements Document (TRD) as well?" and the user confirms, responds affirmatively (e.g. "yes", "sure", "go ahead"), or asks to proceed with technical architecture:
@@ -130,18 +214,24 @@ A. PRD & TRD STAGES (Requirements_Agent):
   Recognize that the workflow stage is PRD and delegate to Requirements_Agent with operation: "GENERATE_PRD" or "UPDATE_PRD".
 
 B. ADO PROJECT & REPO SETUP STAGES (Repo_Setup_Agent):
-- If TRD is complete and user agrees/asks to proceed with repository setup, create Azure DevOps project, or start repo setup:
+- If TRD is complete and user agrees/asks to proceed with repository setup, create Azure DevOps project, or start repo setup (workflow_stage REQUIREMENTS):
   Delegate to Repo_Setup_Agent with operation: "GENERATE_PROJECT_PROPOSAL".
-- If a project proposal is pending review (PROJECT_REVIEW state) and user asks to modify the project name or description:
+- If a project proposal is pending review (workflow_stage PROJECT_REVIEW) and user asks to modify the project name or description:
   Delegate to Repo_Setup_Agent with operation: "UPDATE_PROJECT_PROPOSAL".
-- If a project proposal is pending review (PROJECT_REVIEW state) and the user explicitly approves/confirms creating the project (e.g. "looks good, create the project", "proceed with creation", "approved"):
+- If a project proposal is pending review (workflow_stage PROJECT_REVIEW) and the user explicitly approves/confirms creating the project (e.g. "looks good, create the project", "proceed with creation", "approved"):
   Delegate to Repo_Setup_Agent with operation: "CREATE_PROJECT".
-- If the project was created (PROJECT_CREATED / REPOSITORY_DECISION state) and user asks/confirms to proceed with repository creation:
-  Delegate to Repo_Setup_Agent with operation: "GENERATE_REPOSITORY_STRUCTURE".
-- If repository structure is pending review (REPOSITORY_REVIEW state) and user requests changes to folders or files:
-  Delegate to Repo_Setup_Agent with operation: "UPDATE_REPOSITORY_STRUCTURE".
-- If repository structure is pending review (REPOSITORY_REVIEW state) and user explicitly approves creating the repository (e.g. "structure looks great, go ahead and create the repo", "approved"):
+- If the ADO project was created (workflow_stage REPOSITORY_REVIEW) but no repository name was proposed yet:
+  Delegate to Repo_Setup_Agent with operation: "GENERATE_REPOSITORY_PROPOSAL".
+- If a repository name is pending review (workflow_stage REPOSITORY_REVIEW) and the user asks for a different repository name:
+  Delegate to Repo_Setup_Agent with operation: "UPDATE_REPOSITORY_PROPOSAL".
+- If a repository name is pending review (workflow_stage REPOSITORY_REVIEW) and the user explicitly approves creating the repository:
   Delegate to Repo_Setup_Agent with operation: "CREATE_REPOSITORY".
+- If a folder structure is pending review (workflow_stage STRUCTURE_REVIEW) and the user requests changes to folders or files:
+  Delegate to Repo_Setup_Agent with operation: "UPDATE_REPOSITORY_STRUCTURE" (or "GENERATE_REPOSITORY_STRUCTURE" if they want a completely new structure).
+- If a folder structure is pending review (workflow_stage STRUCTURE_REVIEW) and the user explicitly approves it (e.g. "looks good, push it", "approved"), optionally with a commit message:
+  Delegate to Repo_Setup_Agent with operation: "PUSH_REPOSITORY_STRUCTURE".
+- If workflow_stage is COMPLETE, repository setup is finished: answer directly.
+- Once the ADO project has been created, the PRD and TRD are final: do NOT delegate PRD/TRD or tech stack changes to Requirements_Agent; explain that they were finalized during the requirements stage.
 - If user explicitly decides to skip or cancel repository creation:
   Do not delegate; answer directly acknowledging the decision and concluding the workflow.
 
@@ -155,7 +245,7 @@ DELEGATION INSTRUCTION:
 - If Requirements_Agent is required, output:
   "DELEGATE_TO: Requirements_Agent | WORKFLOW: <PRD or TRD> | OPERATION: <GENERATE_PRD, UPDATE_PRD, GENERATE_TRD, or UPDATE_TRD>"
 - If Repo_Setup_Agent is required, output:
-  "DELEGATE_TO: Repo_Setup_Agent | OPERATION: <GENERATE_PROJECT_PROPOSAL, UPDATE_PROJECT_PROPOSAL, CREATE_PROJECT, GENERATE_REPOSITORY_STRUCTURE, UPDATE_REPOSITORY_STRUCTURE, or CREATE_REPOSITORY>"
+  "DELEGATE_TO: Repo_Setup_Agent | OPERATION: <GENERATE_PROJECT_PROPOSAL, UPDATE_PROJECT_PROPOSAL, CREATE_PROJECT, GENERATE_REPOSITORY_PROPOSAL, UPDATE_REPOSITORY_PROPOSAL, CREATE_REPOSITORY, GENERATE_REPOSITORY_STRUCTURE, UPDATE_REPOSITORY_STRUCTURE, or PUSH_REPOSITORY_STRUCTURE>"
 - If no child agent is required, provide your direct, helpful response to the user.
 """
 
@@ -166,7 +256,11 @@ DELEGATION INSTRUCTION:
         )
 
         requirements_agent = get_requirements_agent(client)
-        repo_setup_agent = get_repo_setup_agent(client)
+        repo_setup_agent = get_repo_setup_agent(client, conversation_id)
+
+        # Stored workflow state (Project / Repository tables) for routing and child agents. Never persisted in chat history.
+        workflow_state = store.get_workflow_state(conversation_id) if conversation_id else None
+        state_note = f"\n\n{store.describe_workflow_state(workflow_state)}" if workflow_state is not None else ""
 
         # Convert history into Agent Framework Messages
         message_list = []
@@ -181,7 +275,8 @@ DELEGATION INSTRUCTION:
         # 1. Execute the Orchestrator
         logger.info(f"[Orchestrator] Running Orchestrator Agent (Model: {deployment}, History: {len(history)} messages)...")
         orch_start = time.time()
-        orchestrator_response = await orchestrator.run(messages=message_list)
+        orchestrator_messages = list(message_list[:-1]) + [Message(role="user", contents=[user_query + state_note])]
+        orchestrator_response = await orchestrator.run(messages=orchestrator_messages)
         orch_duration = round((time.time() - orch_start) * 1000, 1)
         response_text = orchestrator_response.messages[-1].text if orchestrator_response.messages else "No response."
         logger.info(f"[Orchestrator] Completed in {orch_duration}ms")
@@ -222,6 +317,7 @@ DELEGATION INSTRUCTION:
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
+            persist_requirements_output(conversation_id, child_raw_json)
 
             # 3. Follow-Up Flow: Child Agent -> Orchestrator Synthesizer -> User
             logger.info("[Orchestrator] Converting Requirements_Agent output into user-facing natural language...")
@@ -280,6 +376,9 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
                 operation = response_text.split("OPERATION:", 1)[1].strip()
 
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
+            if workflow_state is not None:
+                workflow_context_note += "\n\n" + store.describe_workflow_state(
+                    workflow_state, include_requirements=True, include_structure=True)
 
             # Prepare message list for Repo_Setup_Agent with clear workflow context
             repo_messages = list(message_list[:-1])
@@ -293,6 +392,13 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
+            persist_repo_setup_output(conversation_id, child_raw_json)
+
+            # The structure shown to the user is rendered from the stored files (the same files that get pushed)
+            child_data = parse_agent_json(child_raw_json) or {}
+            structure_tree = None
+            if conversation_id and child_data.get("workflow_stage") in STRUCTURE_STAGES:
+                structure_tree = render_structure_for_display(store.get_workflow_state(conversation_id))
 
             # Orchestrator Synthesizer for Repo_Setup_Agent
             logger.info("[Orchestrator] Converting Repo_Setup_Agent output into user-facing natural language...")
@@ -306,7 +412,7 @@ Convert this output into a friendly, structured, and professional response for t
 
 CASE 1: If status is "ERROR":
 - Clearly and politely explain what went wrong based on the error details (do NOT expose any secrets or tokens).
-- Acknowledge that the project proposal or repository structure remains saved.
+- Acknowledge that the saved proposal or repository structure remains saved.
 - Guide the user on what corrective steps are needed or offer to retry.
 
 CASE 2: If status is "COMPLETE" and workflow_stage is "PROJECT_REVIEW" (or contains project_proposal):
@@ -316,27 +422,36 @@ CASE 2: If status is "COMPLETE" and workflow_stage is "PROJECT_REVIEW" (or conta
 - Explain that this proposal is based on the project requirements and architecture.
 - Clearly invite the user to review: they can request modifications to the name/description or explicitly approve it to proceed with creating the Azure DevOps project.
 
-CASE 3: If status is "COMPLETE" and workflow_stage is "PROJECT_CREATED" (or contains project details with id/url):
+CASE 3: If status is "COMPLETE" and workflow_stage is "PROJECT_CREATED":
 - Announce that the Azure DevOps project has been created successfully!
 - Show the project details clearly:
   * **Project Name**: [name]
   * **Project ID**: [id]
   * **Project URL**: [link](url)
-- Naturally present the next decision to the user by concluding with:
-  "**Would you like to proceed with repository creation?**"
+- Present the next step: the suggested repository name (**Suggested Repository Name**: repository_proposal.repo_name).
+- Conclude by asking: "**Shall I create the repository with this name, or would you prefer a different name?**"
 
-CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW" (or contains repository_structure):
-- Present the proposed repository directory structure in a clear Markdown code block.
-- Briefly explain how the proposed structure accommodates the project's technology stack (e.g., frontend, backend, configuration, and docs).
-- Clearly invite the user to review: they can request adjustments to folders or files, or explicitly approve it so we can create the repository.
+CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW":
+- Present the **Proposed Repository Name** (repository_proposal.repo_name).
+- Conclude by asking whether to create the repository with this name or use a different name.
 
-CASE 5: If status is "COMPLETE" and workflow_stage is "REPOSITORY_CREATED" (or contains repository details with id/url):
-- Announce that the Azure DevOps Git repository has been created successfully!
-- Show the repository details clearly:
-  * **Repository Name**: [name]
-  * **Repository ID**: [id]
-  * **Repository URL**: [link](url)
-- Conclude by stating that repository setup is complete and the project is ready for development.
+CASE 5: If status is "COMPLETE" and workflow_stage is "REPOSITORY_CREATED":
+- Announce that the (empty) Azure DevOps Git repository has been created successfully, with **Repository Name**, **Repository ID** and **Repository URL** ([link](url)).
+- Briefly explain the proposed folder structure (structure.summary), then output the placeholder line (see STRUCTURE RULE).
+- Invite the user to review it: they can request changes to folders/files, or approve it to push it to the main branch as a single initial commit.
+
+CASE 6: If status is "COMPLETE" and workflow_stage is "STRUCTURE_REVIEW":
+- Briefly state what changed (structure.summary), then output the placeholder line (see STRUCTURE RULE).
+- Invite the user to request further changes or approve pushing it to the main branch as a single initial commit.
+
+CASE 7: If status is "COMPLETE" and workflow_stage is "STRUCTURE_PUSHED":
+- Announce that the approved structure was pushed as a single commit.
+- Show **Repository**, **Commit ID**, **Commit Message**, **Branch**, **Files** (files_count) and a link to the commit (commit_url).
+- Output the placeholder line (see STRUCTURE RULE), then state that repository setup is complete and the project is ready for development.
+
+STRUCTURE RULE (CASES 5, 6, 7):
+- Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs. The system replaces it with the exact stored structure.
+- NEVER draw the folder tree or list the files yourself.
 
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
 """
@@ -349,6 +464,7 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
             synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
+            response_text = insert_structure_tree(response_text, structure_tree)
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
 
         else:
@@ -378,7 +494,7 @@ async def process_chat_request(conversation_id: str, user_query: str, file: Opti
             user_query = user_query + f"\n\n[Attached File Content]:\n{file_info}"
 
     # Generate response via multi-agent pipeline
-    response_text = await generate_chat_response(user_query, content_array)
+    response_text = await generate_chat_response(user_query, content_array, conversation_id)
     
     # Extract dynamically generated title on first message
     if response_text.startswith("TITLE:"):

@@ -1,7 +1,9 @@
 import os
 import base64
 import re
-from typing import Dict, Any, Optional
+import time
+from typing import Dict, Any, List, Optional
+from urllib.parse import quote
 import httpx
 from mcp.server.fastmcp import FastMCP
 from app.core.logger import logger
@@ -45,6 +47,51 @@ def sanitize_error(text: str, pat: Optional[str] = None) -> str:
     sanitized = re.sub(r"Basic\s+[A-Za-z0-9+/=]+", "Basic [REDACTED]", sanitized)
     return sanitized
 
+PROJECT_CREATION_TIMEOUT_SECONDS = 90
+PROJECT_POLL_INTERVAL_SECONDS = 2
+_sleep = time.sleep
+
+def wait_for_project_creation(client: httpx.Client, org_url: str, operation_id: Optional[str], project_name: str,
+                              headers: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Polls Operations - Get until the queued project creation finishes, then reads the project.
+    Returns {"status": "success", "id": <project id>, "url": <web url>} or an error dict.
+    https://learn.microsoft.com/en-us/rest/api/azure/devops/operations/operations/get?view=azure-devops-rest-7.1
+    """
+    if operation_id:
+        deadline = time.monotonic() + PROJECT_CREATION_TIMEOUT_SECONDS
+        while True:
+            op = client.get(f"{org_url}/_apis/operations/{operation_id}?api-version=7.1", headers=headers)
+            status = op.json().get("status") if op.status_code == 200 else None
+            if status == "succeeded":
+                break
+            if status in ("failed", "cancelled"):
+                body = op.json()
+                return {
+                    "status": "error",
+                    "message": f"Azure DevOps project creation {status}.",
+                    "details": body.get("detailedMessage") or body.get("resultMessage") or ""
+                }
+            if time.monotonic() >= deadline:
+                return {
+                    "status": "error",
+                    "error_type": "PROVISIONING_TIMEOUT",
+                    "message": f"Azure DevOps is still creating project '{project_name}'. Check again in a minute before retrying.",
+                    "details": f"Operation {operation_id} status: {status}"
+                }
+            _sleep(PROJECT_POLL_INTERVAL_SECONDS)
+
+    project = client.get(f"{org_url}/_apis/projects/{quote(project_name, safe='')}?api-version=7.1", headers=headers)
+    if project.status_code != 200:
+        return {
+            "status": "error",
+            "message": f"Project '{project_name}' was queued but could not be read back (status {project.status_code}).",
+            "details": project.text[:500]
+        }
+    data = project.json()
+    web_url = (data.get("_links") or {}).get("web", {}).get("href") or f"{org_url}/{quote(project_name)}"
+    return {"status": "success", "id": data.get("id"), "url": web_url}
+
 @mcp.tool(name="create_ado_project", description="Create a new Azure DevOps project using the approved project name and description.")
 def create_ado_project(project_name: str, project_description: str) -> Dict[str, Any]:
     """
@@ -87,16 +134,21 @@ def create_ado_project(project_name: str, project_description: str) -> Dict[str,
             response = client.post(url, json=payload, headers=headers)
             
             if response.status_code in (200, 202):
-                data = response.json()
-                project_id = data.get("id") or data.get("operationId", "")
-                project_url = f"{org_url}/{project_name}"
+                # The create call only queues the project and returns an OperationReference: its "id" is the
+                # operation id, not the project id. Wait for the operation, then read the real project.
+                operation_id = response.json().get("id")
+                created = wait_for_project_creation(client, org_url, operation_id, project_name, headers)
+                if created.get("status") == "error":
+                    created["details"] = sanitize_error(created.get("details", ""), pat)
+                    logger.error(f"[ADO MCP] Project '{project_name}' was not created: {created['message']}")
+                    return created
                 logger.info(f"[ADO MCP] Azure DevOps project '{project_name}' created successfully.")
                 return {
                     "status": "success",
                     "name": project_name,
                     "description": project_description,
-                    "id": project_id,
-                    "url": project_url
+                    "id": created["id"],
+                    "url": created["url"]
                 }
             else:
                 raw_err = sanitize_error(response.text, pat)
@@ -178,6 +230,41 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
             "message": "Azure DevOps repository creation encountered an unexpected error.",
             "details": err_msg
         }
+
+@mcp.tool(name="push_repository_files", description="Push a list of files (path + non-empty content) to a newly created, empty Azure DevOps repository as a single initial commit.")
+def push_repository_files(project_id_or_name: str, repository_name: str, files: List[Dict[str, str]],
+                          commit_message: Optional[str] = None, branch: Optional[str] = None) -> Dict[str, Any]:
+    """
+    TOOL 3 — REPOSITORY FILE PUSH
+    Pushes caller-supplied files ([{"path": ..., "content": ...}]) as one commit (validated paths, non-empty content,
+    size limits). Refuses (without changing anything) if the target branch already has commits.
+    """
+    from app.services.mcp.ado_git_push import AdoPushError, push_files_to_repo
+
+    logger.info(f"[ADO MCP] Tool invoked: push_repository_files(project='{project_id_or_name}', "
+                f"repository_name='{repository_name}', files={len(files or [])})")
+    try:
+        file_map: Dict[str, str] = {}
+        for index, item in enumerate(files or []):
+            data = item if isinstance(item, dict) else (item.model_dump() if hasattr(item, "model_dump") else {})
+            path, content = data.get("path"), data.get("content")
+            if not isinstance(path, str) or not isinstance(content, str):
+                raise AdoPushError(f"File #{index + 1} must have string 'path' and 'content' fields.",
+                                   error_type="VALIDATION_ERROR")
+            if path in file_map:
+                raise AdoPushError(f"Duplicate file path '{path}'.", error_type="VALIDATION_ERROR")
+            file_map[path] = content
+        return push_files_to_repo(project_id_or_name, repository_name, file_map, commit_message=commit_message,
+                                  branch=branch, allow_existing_branch=False)
+    except AdoPushError as e:
+        logger.error(f"[ADO MCP] Custom file push failed: {e.error_type}: {e.message}")
+        return e.to_dict()
+    except Exception as e:
+        err_msg = sanitize_error(str(e), get_ado_config().get("pat"))
+        logger.error(f"[ADO MCP] Exception during custom file push: {err_msg}")
+        return {"status": "error", "error_type": "UNEXPECTED_ERROR",
+                "message": "Custom file push encountered an unexpected error.", "details": err_msg}
+
 
 if __name__ == "__main__":
     mcp.run()

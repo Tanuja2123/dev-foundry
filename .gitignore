@@ -19,3 +19,5 @@ htmlcov/
 .vscode/
 *.swp
 *.swo
+
+ISSUES.md
