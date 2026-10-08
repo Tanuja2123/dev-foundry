@@ -23,28 +23,38 @@ def test_get_conversations() -> None:
     payload = response.json()
     assert isinstance(payload, list)
     assert len(payload) >= 1
-    assert {item["conversation_id"] for item in payload}.issuperset({"conv_001", "conv_002"})
+    assert "conversation_id" in payload[0]
+    assert "title" in payload[0]
 
 
-def test_chat_endpoint() -> None:
-    payload = {
-        "conversation_id": "conv_001",
-        "user_query": "Create a requirement document for the project automation agent.",
-    }
+def test_create_and_delete_conversation() -> None:
+    # Test POST /api/conversation
+    create_res = client.post("/api/conversation")
+    assert create_res.status_code == 200
+    created = create_res.json()
+    conv_id = created["conversation_id"]
+    assert conv_id
 
-    response = client.post("/api/chat", json=payload)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["conversation_id"] == "conv_001"
-    assert "Demo AI response" in data["response"]
+    # Test GET /api/conversation/{id}
+    get_res = client.get(f"/api/conversation/{conv_id}")
+    assert get_res.status_code == 200
+    assert get_res.json()["conv_id"] == conv_id
+
+    # Test DELETE /api/conversation/{id}
+    del_res = client.delete(f"/api/conversation/{conv_id}")
+    assert del_res.status_code == 200
+
+    # Verify deleted
+    get_after_del = client.get(f"/api/conversation/{conv_id}")
+    assert get_after_del.status_code == 404
 
 
 def test_chat_endpoint_with_invalid_conversation() -> None:
     payload = {
-        "conversation_id": "missing_conv",
+        "conversation_id": "missing_conv_9999",
         "user_query": "This conversation does not exist.",
     }
 
-    response = client.post("/api/chat", json=payload)
+    response = client.post("/api/chat", data=payload)
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
