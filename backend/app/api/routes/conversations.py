@@ -2,7 +2,13 @@ from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
 from typing import Optional
 
 from app.schemas.conversation import ChatResponse, ConversationItem
-from app.services.conversation_service import get_conversations, process_chat_request, create_new_conversation
+from app.services.conversation_service import (
+    get_conversations,
+    process_chat_request,
+    create_new_conversation,
+    delete_conversation,
+    get_conversation_by_id,
+)
 from app.core.logger import logger
 
 router = APIRouter(prefix="/api", tags=["conversation"])
@@ -14,10 +20,38 @@ def list_conversations() -> list[ConversationItem]:
     return get_conversations()
 
 
+@router.get("/conversation/{conversation_id}")
+def get_single_conversation(conversation_id: str):
+    logger.info(f"[Route] GET /api/conversation/{conversation_id} called")
+    conv = get_conversation_by_id(conversation_id)
+    if not conv:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation '{conversation_id}' not found",
+        )
+    return conv
+
+
 @router.post("/conversation", response_model=ConversationItem)
 def create_conversation() -> ConversationItem:
     logger.info("[Route] POST /api/conversation called -> Creating new conversation")
     return create_new_conversation()
+
+
+
+@router.delete("/conversation/{conversation_id}")
+def remove_conversation(conversation_id: str):
+    logger.info(f"[Route] DELETE /api/conversation/{conversation_id} called")
+    try:
+        delete_conversation(conversation_id)
+        return {"status": "success", "conversation_id": conversation_id}
+    except Exception as exc:
+        logger.error(f"[Route] Error deleting conversation: {str(exc)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete conversation: {str(exc)}",
+        ) from exc
+
 
 
 @router.post("/chat", response_model=ChatResponse)

@@ -30,7 +30,7 @@ def get_supabase_client() -> Client:
 def get_conversations() -> List[ConversationItem]:
     supabase = get_supabase_client()
     try:
-        response = supabase.table("Conversation").select("*").execute()
+        response = supabase.table("Conversation").select("*").order("created_at", desc=True).execute()
         items = []
         for row in response.data:
             conv_id = row.get("conv_id")
@@ -60,7 +60,28 @@ def create_new_conversation(title: str = "New Project") -> ConversationItem:
         logger.error(f"[Supabase] Failed to create new conversation: {str(e)}")
         raise
 
+def delete_conversation(conversation_id: str) -> bool:
+    try:
+        uuid.UUID(str(conversation_id))
+    except (ValueError, TypeError):
+        return False
+
+    supabase = get_supabase_client()
+    try:
+        supabase.table("Conversation").delete().eq("conv_id", conversation_id).execute()
+        logger.info(f"[Supabase] Deleted conversation '{conversation_id}'")
+        return True
+    except Exception as e:
+        logger.error(f"[Supabase] Failed to delete conversation '{conversation_id}': {str(e)}")
+        raise
+
+
 def get_conversation_by_id(conversation_id: str) -> Optional[Dict]:
+    try:
+        uuid.UUID(str(conversation_id))
+    except (ValueError, TypeError):
+        return None
+
     supabase = get_supabase_client()
     try:
         response = supabase.table("Conversation").select("*").eq("conv_id", conversation_id).execute()
@@ -70,6 +91,7 @@ def get_conversation_by_id(conversation_id: str) -> Optional[Dict]:
     except Exception as e:
         logger.error(f"[Supabase] Error retrieving conversation '{conversation_id}': {str(e)}")
         raise
+
 
 
 # Agent Framework Client configuration
@@ -278,6 +300,22 @@ async def process_chat_request(conversation_id: str, user_query: str, file: Opti
                 logger.info(f"[Supabase] Updated conversation title to: '{new_title}'")
             except Exception as e:
                 logger.error(f"[Supabase] Failed to update title: {str(e)}")
+    elif conv.get("title") in ("New Project", "New Conversation"):
+        # Fallback: Auto-generate a title from the user query if LLM didn't prefix TITLE:
+        clean_query = user_query.split("[Attached File Content]")[0].strip()
+        if clean_query:
+            first_line = clean_query.split("\n")[0].strip()
+            words = [w for w in first_line.split() if w]
+            candidate_title = " ".join(words[:5])
+            if len(candidate_title) > 36:
+                candidate_title = candidate_title[:33] + "..."
+            if candidate_title:
+                supabase = get_supabase_client()
+                try:
+                    supabase.table("Conversation").update({"title": candidate_title}).eq("conv_id", conversation_id).execute()
+                    logger.info(f"[Supabase] Auto-updated default conversation title to: '{candidate_title}'")
+                except Exception as e:
+                    logger.error(f"[Supabase] Failed to auto-update title: {str(e)}")
 
     # Persist updated conversation history
     content_array.append({"role": "user", "text": user_query})
