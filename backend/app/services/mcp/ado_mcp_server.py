@@ -2,11 +2,19 @@ import os
 import base64
 import re
 import time
+import urllib.parse
 from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 import httpx
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from app.core.logger import logger
+
+# Load environment variables from repo root and local paths
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../../../.env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../../.env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../.env"))
+load_dotenv()
 
 # Initialize FastMCP Server for Azure DevOps
 mcp = FastMCP("azure-devops-mcp")
@@ -14,26 +22,39 @@ mcp = FastMCP("azure-devops-mcp")
 def get_ado_config() -> Dict[str, Optional[str]]:
     """
     Retrieves Azure DevOps configuration securely from environment variables.
+    Handles org names formatted as plain text or full URLs, and strips enclosing quotes.
     Credentials are NEVER hardcoded or exposed in logs or return structures.
     """
-    org_name = os.getenv("AZURE_DEVOPS_ORG_NAME")
-    pat = os.getenv("AZURE_DEVOPS_PAT")
+    # Ensure fresh read from environment
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../../../.env"))
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../../.env"))
+    load_dotenv()
 
-    logger.info(f"[ADO DEBUG] AZURE_DEVOPS_ORG_NAME = {org_name}")
-    
-    
+    raw_org = os.getenv("AZURE_DEVOPS_ORG_NAME")
+    raw_pat = os.getenv("AZURE_DEVOPS_PAT")
+
+    org_name = raw_org.strip().strip('"').strip("'") if raw_org else None
+    pat = raw_pat.strip().strip('"').strip("'") if raw_pat else None
+
     org_url = None
     if org_name:
-        clean_org_name = org_name.strip().strip("/")
-        org_url = f"https://dev.azure.com/{clean_org_name}"
+        if org_name.startswith("http://") or org_name.startswith("https://"):
+            org_url = org_name.rstrip("/")
+            clean_org_name = org_url.split("/")[-1]
+        else:
+            clean_org_name = org_name.strip("/")
+            org_url = f"https://dev.azure.com/{clean_org_name}"
+    else:
+        clean_org_name = None
 
-    logger.info(f"[ADO DEBUG] Constructed org_url = {org_url}")
-        
+    logger.info(f"[ADO Config] Organization: '{clean_org_name}', URL: '{org_url}', PAT configured: {bool(pat)}")
+
     return {
-        "org_name": org_name,
+        "org_name": clean_org_name,
         "org_url": org_url,
         "pat": pat
     }
+
 
 
 def sanitize_error(text: str, pat: Optional[str] = None) -> str:
@@ -112,7 +133,7 @@ def create_ado_project(project_name: str, project_description: str) -> Dict[str,
             "details": "AZURE_DEVOPS_ORG_NAME and AZURE_DEVOPS_PAT environment variables must be configured."
         }
 
-    auth_header = "Basic " + base64.b64encode(f":{pat}".encode("ascii")).decode("ascii")
+    auth_header = "Basic " + base64.b64encode(f":{pat}".encode("utf-8")).decode("ascii")
     headers = {
         "Authorization": auth_header,
         "Content-Type": "application/json",
@@ -187,17 +208,19 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
             "details": "AZURE_DEVOPS_ORG_NAME and AZURE_DEVOPS_PAT environment variables must be configured."
         }
 
-    auth_header = "Basic " + base64.b64encode(f":{pat}".encode("ascii")).decode("ascii")
+    auth_header = "Basic " + base64.b64encode(f":{pat}".encode("utf-8")).decode("ascii")
     headers = {
         "Authorization": auth_header,
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
 
-    url = f"{org_url}/{project_id_or_name}/_apis/git/repositories?api-version=7.1-preview.1"
+    encoded_project = urllib.parse.quote(str(project_id_or_name).strip())
+    url = f"{org_url}/{encoded_project}/_apis/git/repositories?api-version=7.1-preview.1"
     payload = {
         "name": repository_name
     }
+
 
     try:
         with httpx.Client(timeout=30.0) as client:

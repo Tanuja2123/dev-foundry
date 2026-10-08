@@ -41,11 +41,23 @@ function LoginScreen() {
   return (
     <div className="auth-screen">
       <div className="auth-card">
+        <div className="ms-brand-logo" aria-hidden="true">
+          <div className="ms-tile-red" />
+          <div className="ms-tile-green" />
+          <div className="ms-tile-blue" />
+          <div className="ms-tile-yellow" />
+        </div>
         <h1>DevFoundry</h1>
-        <p>Sign in with your Microsoft account to continue.</p>
+        <p>Sign in with your Microsoft account to continue to DevFoundry Copilot.</p>
         {error && <p className="auth-error">{error}</p>}
-        <button type="button" disabled={busy} onClick={() => void signIn()}>
-          {busy ? 'Redirecting…' : 'Sign in with Microsoft'}
+        <button
+          type="button"
+          className="ms-signin-button"
+          disabled={busy}
+          onClick={() => void signIn()}
+        >
+          <span>❖</span>
+          <span>{busy ? 'Redirecting to Microsoft…' : 'Sign in with Microsoft'}</span>
         </button>
       </div>
     </div>

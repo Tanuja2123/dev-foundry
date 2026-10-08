@@ -1,6 +1,11 @@
 import { useMsal } from '@azure/msal-react'
 import { useEffect, useState } from 'react'
-import { continueChat, listConversations } from '../api/chat'
+import {
+  continueChat,
+  deleteConversation,
+  getConversation,
+  listConversations,
+} from '../api/chat'
 import { ChatPanel } from '../components/ChatPanel'
 import { Sidebar } from '../components/Sidebar'
 import type { ChatMessage, Project } from '../types'
@@ -9,18 +14,29 @@ function createId() {
   return crypto.randomUUID()
 }
 
+function getInitials(name: string) {
+  if (!name) return 'U'
+  const parts = name.trim().split(/\s+/)
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase()
+  }
+  return name.slice(0, 2).toUpperCase()
+}
+
 export function HomePage() {
   const { instance, accounts } = useMsal()
   const account = instance.getActiveAccount() ?? accounts[0]
   const [conversations, setConversations] = useState<Project[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [listStatus, setListStatus] = useState<string | null>('Loading conversations…')
+  const [listStatus, setListStatus] = useState<string | null>('Loading projects…')
   const [messagesByConversation, setMessagesByConversation] = useState<
     Record<string, ChatMessage[]>
   >({})
   const [filesByConversation, setFilesByConversation] = useState<
     Record<string, File[]>
   >({})
+  const [draftMessages, setDraftMessages] = useState<ChatMessage[]>([])
+  const [draftFiles, setDraftFiles] = useState<File[]>([])
   const [sending, setSending] = useState(false)
   const [chatError, setChatError] = useState<string | null>(null)
 
@@ -37,13 +53,13 @@ export function HomePage() {
         }))
         setConversations(mapped)
         setSelectedId((current) => current ?? mapped[0]?.id ?? null)
-        setListStatus(mapped.length === 0 ? 'No conversations yet.' : null)
+        setListStatus(mapped.length === 0 ? 'No projects yet.' : null)
       } catch (reason) {
         if (cancelled) return
         setListStatus(
           reason instanceof Error
             ? reason.message
-            : 'Could not load conversations.',
+            : 'Could not load projects.',
         )
       }
     }
@@ -54,46 +70,151 @@ export function HomePage() {
     }
   }, [])
 
+  // Automatically fetch existing conversation history when switching projects
+  useEffect(() => {
+    if (!selectedId) return
+    if (messagesByConversation[selectedId]) return // Already cached
+
+    let cancelled = false
+
+    async function fetchHistory() {
+      try {
+        const data = await getConversation(selectedId!)
+        if (cancelled) return
+        if (Array.isArray(data.content) && data.content.length > 0) {
+          const loaded: ChatMessage[] = data.content.map((m) => ({
+            id: createId(),
+            role: m.role,
+            content: m.text,
+          }))
+          setMessagesByConversation((prev) => ({
+            ...prev,
+            [selectedId!]: loaded,
+          }))
+        }
+      } catch {
+        // Conversation might be newly created without messages yet
+      }
+    }
+
+    void fetchHistory()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedId, messagesByConversation])
+
   const conversation =
     conversations.find((item) => item.id === selectedId) ?? null
   const messages = conversation
     ? (messagesByConversation[conversation.id] ?? [])
-    : []
-  const files = conversation ? (filesByConversation[conversation.id] ?? []) : []
+    : draftMessages
+  const files = conversation
+    ? (filesByConversation[conversation.id] ?? [])
+    : draftFiles
+
   const displayName = account?.name ?? account?.username ?? 'Signed in'
+  const initials = getInitials(displayName)
 
   function selectConversation(conversationId: string) {
     setSelectedId(conversationId)
+    setDraftMessages([])
+    setDraftFiles([])
     setChatError(null)
   }
 
+  function handleNewConversation() {
+    setSelectedId(null)
+    setDraftMessages([])
+    setDraftFiles([])
+    setChatError(null)
+  }
+
+  async function handleDeleteProject(projectId: string) {
+    try {
+      await deleteConversation(projectId)
+      const remaining = conversations.filter((c) => c.id !== projectId)
+      setConversations(remaining)
+      if (selectedId === projectId) {
+        setSelectedId(remaining[0]?.id ?? null)
+      }
+      setMessagesByConversation((prev) => {
+        const next = { ...prev }
+        delete next[projectId]
+        return next
+      })
+    } catch (reason) {
+      setChatError(
+        reason instanceof Error ? reason.message : 'Could not delete conversation.',
+      )
+    }
+  }
+
   async function sendMessage(content: string) {
-    if (!conversation || sending) return
-    const conversationId = conversation.id
+    if (sending) return
+    const isNew = !conversation
+    const conversationId = conversation?.id ?? null
     const userMessage: ChatMessage = {
       id: createId(),
       role: 'user',
       content,
     }
+    const attachedFile = files[0] ?? null
 
     setChatError(null)
     setSending(true)
-    setMessagesByConversation((current) => ({
-      ...current,
-      [conversationId]: [...(current[conversationId] ?? []), userMessage],
-    }))
+
+    if (isNew) {
+      setDraftMessages([userMessage])
+    } else {
+      setMessagesByConversation((current) => ({
+        ...current,
+        [conversationId!]: [...(current[conversationId!] ?? []), userMessage],
+      }))
+    }
 
     try {
-      const result = await continueChat(conversationId, content)
+      // Pass null for conversationId on the very first message
+      const result = await continueChat(conversationId, content, attachedFile)
       const assistantMessage: ChatMessage = {
         id: createId(),
         role: 'assistant',
         content: result.response,
       }
-      setMessagesByConversation((current) => ({
-        ...current,
-        [conversationId]: [...(current[conversationId] ?? []), assistantMessage],
-      }))
+
+      if (isNew) {
+        const newId = result.conversation_id
+        let projectTitle = 'New Project'
+        try {
+          const fresh = await getConversation(newId)
+          if (fresh.title) projectTitle = fresh.title
+        } catch {
+          // fallback
+        }
+
+        const newProject: Project = {
+          id: newId,
+          name: projectTitle,
+        }
+        setConversations((prev) => [newProject, ...prev])
+        setSelectedId(newId)
+        setMessagesByConversation((prev) => ({
+          ...prev,
+          [newId]: [userMessage, assistantMessage],
+        }))
+        setDraftMessages([])
+        setDraftFiles([])
+      } else {
+        if (attachedFile) {
+          setFilesByConversation((current) => ({
+            ...current,
+            [conversationId!]: [],
+          }))
+        }
+        setMessagesByConversation((current) => ({
+          ...current,
+          [conversationId!]: [...(current[conversationId!] ?? []), assistantMessage],
+        }))
+      }
     } catch (reason) {
       setChatError(
         reason instanceof Error ? reason.message : 'Chat request failed.',
@@ -104,8 +225,14 @@ export function HomePage() {
   }
 
   function addFiles(fileList: FileList) {
-    if (!conversation) return
     const incoming = Array.from(fileList)
+    if (!conversation) {
+      setDraftFiles((prev) => {
+        const names = new Set(prev.map((f) => f.name))
+        return [...prev, ...incoming.filter((f) => !names.has(f.name))]
+      })
+      return
+    }
     setFilesByConversation((current) => {
       const existing = current[conversation.id] ?? []
       const names = new Set(existing.map((file) => file.name))
@@ -115,7 +242,10 @@ export function HomePage() {
   }
 
   function removeFile(name: string) {
-    if (!conversation) return
+    if (!conversation) {
+      setDraftFiles((prev) => prev.filter((f) => f.name !== name))
+      return
+    }
     setFilesByConversation((current) => ({
       ...current,
       [conversation.id]: (current[conversation.id] ?? []).filter(
@@ -124,46 +254,69 @@ export function HomePage() {
     }))
   }
 
+  const activeProject: Project = conversation ?? {
+    id: '',
+    name: 'New Project',
+  }
+
   return (
     <div className="app-shell">
       <Sidebar
         projects={conversations}
         selectedProjectId={conversation?.id ?? null}
         onSelectProject={selectConversation}
+        onNewProject={handleNewConversation}
+        onDeleteProject={(id) => void handleDeleteProject(id)}
         status={listStatus}
       />
       <div className="main">
         <header className="topbar">
-          <div>
-            <h1>{conversation?.name ?? 'Conversations'}</h1>
-            <p>Requirement chat</p>
+          <div className="topbar-left">
+            <div className="topbar-breadcrumb">
+              <span>Workspaces</span>
+              <span>›</span>
+              <span>Requirements Engineering</span>
+              {conversation && (
+                <>
+                  <span>›</span>
+                  <span>{conversation.name}</span>
+                </>
+              )}
+            </div>
+            <div className="topbar-title-row">
+              <h1>{activeProject.name}</h1>
+              <div className="topbar-status-chip">
+                <span className="topbar-status-dot" />
+                <span>Multi-Agent Copilot</span>
+              </div>
+            </div>
           </div>
+
           <div className="topbar-user">
-            <span>{displayName}</span>
-            <button type="button" onClick={() => instance.logoutRedirect()}>
+            <div className="ms-avatar-monogram" title={displayName}>
+              {initials}
+            </div>
+            <span className="topbar-username">{displayName}</span>
+            <button
+              type="button"
+              className="ms-btn-ghost"
+              onClick={() => instance.logoutRedirect()}
+            >
               Sign out
             </button>
           </div>
         </header>
-        {conversation ? (
-          <ChatPanel
-            project={conversation}
-            messages={messages}
-            files={files}
-            sending={sending}
-            error={chatError}
-            onSend={(content) => void sendMessage(content)}
-            onFilesAdded={addFiles}
-            onRemoveFile={removeFile}
-          />
-        ) : (
-          <section className="chat-panel">
-            <div className="chat-empty">
-              <h2>Conversations</h2>
-              <p>{listStatus ?? 'Select a conversation to continue.'}</p>
-            </div>
-          </section>
-        )}
+
+        <ChatPanel
+          project={activeProject}
+          messages={messages}
+          files={files}
+          sending={sending}
+          error={chatError}
+          onSend={(content) => void sendMessage(content)}
+          onFilesAdded={addFiles}
+          onRemoveFile={removeFile}
+        />
       </div>
     </div>
   )

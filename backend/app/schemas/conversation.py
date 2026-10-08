@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -7,8 +8,9 @@ class ConversationItem(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    conversation_id: str = Field(..., description="Existing conversation identifier")
+    conversation_id: Optional[str] = Field(None, description="Optional existing conversation identifier")
     user_query: str = Field(..., min_length=1, description="User message for the AI agent")
+
 
 
 class ChatResponse(BaseModel):
