@@ -114,6 +114,8 @@ class _ScriptedClient:
                 return httpx.Response(cls.project_status_code, text="not found")
             return httpx.Response(200, json={"id": "real-project-guid", "name": "My Proj", "state": "wellFormed",
                                              "_links": {"web": {"href": "https://dev.azure.com/fake-org/My%20Proj"}}})
+        if request.method == "PATCH" and "/_apis/projects/" in path:
+            return httpx.Response(202, json={"id": "op-1", "status": "notSet"})
         if request.method == "POST" and path.endswith("/_apis/git/repositories"):
             return httpx.Response(201, json={"id": "repo-1", "webUrl": "https://dev.azure.com/fake-org/Proj/_git/repo"})
         return httpx.Response(400, text="unexpected")
@@ -165,6 +167,32 @@ def test_create_ado_project_reports_unreadable_project(scripted):
     _ScriptedClient.reset(["succeeded"], project_status_code=404)
     result = server.create_ado_project("My Proj", "Desc")
     assert result["status"] == "error" and "could not be read back" in result["message"]
+
+
+def test_update_ado_project_waits_for_operation_and_returns_project(scripted):
+    _ScriptedClient.reset(["inProgress", "succeeded"])
+    result = server.update_ado_project("real-project-guid", project_name="My Proj", project_description="New desc")
+    assert result["status"] == "success"
+    assert (result["id"], result["name"], result["url"]) == ("real-project-guid", "My Proj", "https://dev.azure.com/fake-org/My%20Proj")
+    patch = _ScriptedClient.requests[0]
+    assert patch.method == "PATCH" and patch.url.path.endswith("/_apis/projects/real-project-guid")
+    assert json.loads(patch.content) == {"name": "My Proj", "description": "New desc"}
+
+
+def test_update_ado_project_validation_and_failure(scripted):
+    _ScriptedClient.reset([])
+    assert server.update_ado_project("id", project_name="  ", project_description=None)["error_type"] == "VALIDATION_ERROR"
+    assert _ScriptedClient.requests == []
+    _ScriptedClient.reset(["failed"])
+    failed = server.update_ado_project("id", project_name="Taken name")
+    assert failed["status"] == "error" and "TF200019" in failed["details"]
+
+
+def test_push_repository_changes_passes_base_files(captured_push):
+    result = server.push_repository_changes("Proj", "repo", base_files=[{"path": "/a.txt", "content": "a"}],
+                                            files=[{"path": "/a.txt", "content": "A"}], commit_message="update")
+    assert result["status"] == "success"
+    assert captured_push[0]["base_files"] == {"/a.txt": "a"} and captured_push[0]["files"] == {"/a.txt": "A"}
 
 
 def test_create_ado_repository_unchanged(scripted):

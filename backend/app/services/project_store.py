@@ -14,6 +14,8 @@ REPOSITORY_TABLE = "Repository"
 
 # Project.workflow_stage values
 STAGE_REQUIREMENTS = "REQUIREMENTS"
+STAGE_PRD_REVIEW = "PRD_REVIEW"
+STAGE_TRD_REVIEW = "TRD_REVIEW"
 STAGE_PROJECT_REVIEW = "PROJECT_REVIEW"
 STAGE_REPOSITORY_REVIEW = "REPOSITORY_REVIEW"
 STAGE_STRUCTURE_REVIEW = "STRUCTURE_REVIEW"
@@ -125,9 +127,49 @@ def propose_repository_name(project_id: str, repo_name: str) -> Dict[str, Any]:
     return create_repository(project_id, repo_name)
 
 
-def save_structure(repo_id: str, structure: List[Dict[str, str]], current_version: int) -> Dict[str, Any]:
-    return update_repository(repo_id, structure=structure, structure_version=(current_version or 0) + 1,
-                             status=REPO_STRUCTURE_REVIEW)
+def save_structure(repo_id: str, structure: List[Dict[str, str]], current_version: int,
+                   trd_version: Optional[int] = None) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {"structure": structure, "structure_version": (current_version or 0) + 1,
+                              "status": REPO_STRUCTURE_REVIEW}
+    if trd_version is not None:
+        fields["structure_trd_version"] = trd_version
+    return update_repository(repo_id, **fields)
+
+
+# ---------------------------------------------------------------------------
+# Outdated artifacts (documents and artifacts record the version of the document they were built from)
+# ---------------------------------------------------------------------------
+
+TRD_OUTDATED = "TRD_OUTDATED"                                # PRD changed after the TRD was written
+PROJECT_PROPOSAL_OUTDATED = "PROJECT_PROPOSAL_OUTDATED"      # TRD changed after the (not yet created) proposal
+ADO_PROJECT_OUTDATED = "ADO_PROJECT_OUTDATED"                # TRD changed after the ADO project was created/updated
+STRUCTURE_OUTDATED = "STRUCTURE_OUTDATED"                    # TRD changed after the repository structure was written
+STRUCTURE_CHANGES_NOT_PUSHED = "STRUCTURE_CHANGES_NOT_PUSHED"  # structure edited after it was pushed
+
+OUTDATED_DESCRIPTIONS = {
+    TRD_OUTDATED: "the TRD does not reflect the latest PRD changes",
+    PROJECT_PROPOSAL_OUTDATED: "the project name/description proposal does not reflect the latest TRD",
+    ADO_PROJECT_OUTDATED: "the Azure DevOps project name/description does not reflect the latest requirements",
+    STRUCTURE_OUTDATED: "the repository structure does not reflect the latest TRD",
+    STRUCTURE_CHANGES_NOT_PUSHED: "the repository structure has changes that are not pushed yet",
+}
+
+
+def outdated_items(state: Dict[str, Any]) -> List[str]:
+    project = (state or {}).get("project") or {}
+    repository = (state or {}).get("repository") or {}
+    prd_version = project.get("prd_version") or 0
+    trd_version = project.get("trd_version") or 0
+    items = []
+    if project.get("trd") and (project.get("trd_prd_version") or 0) < prd_version:
+        items.append(TRD_OUTDATED)
+    if project.get("project_name") and (project.get("proposal_trd_version") or 0) < trd_version:
+        items.append(ADO_PROJECT_OUTDATED if project.get("ado_project_id") else PROJECT_PROPOSAL_OUTDATED)
+    if repository.get("structure") and (repository.get("structure_trd_version") or 0) < trd_version:
+        items.append(STRUCTURE_OUTDATED)
+    if repository.get("pushed_structure") is not None and repository.get("structure") != repository.get("pushed_structure"):
+        items.append(STRUCTURE_CHANGES_NOT_PUSHED)
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +220,10 @@ def describe_workflow_state(state: Dict[str, Any], include_requirements: bool = 
             lines.append(f"pushed_commit: {repository.get('commit_id')} on {repository.get('branch')}")
     else:
         lines.append("repository: none proposed yet")
+    lines.append(f"document_versions: prd={project.get('prd_version') or 0}, trd={project.get('trd_version') or 0} "
+                 f"(trd based on prd {project.get('trd_prd_version') or 0})")
+    outdated = outdated_items(state)
+    lines.append("outdated: " + ("; ".join(f"{item} ({OUTDATED_DESCRIPTIONS[item]})" for item in outdated) or "none"))
 
     if include_requirements and project.get("prd"):
         lines.append("approved_prd_json: " + json.dumps(project["prd"], ensure_ascii=False))

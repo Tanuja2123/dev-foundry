@@ -14,6 +14,7 @@ API_VERSION = "7.1"
 ZERO_OBJECT_ID = "0" * 40
 
 DEFAULT_COMMIT_MESSAGE = "chore: initial project scaffold"
+DEFAULT_UPDATE_COMMIT_MESSAGE = "chore: update project scaffold"
 DEFAULT_BRANCH = "main"
 
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -147,22 +148,38 @@ def prepare_files(files: Mapping[str, str], *, max_files: int = MAX_FILES,
     return prepared
 
 
-def build_push_body(branch: str, old_object_id: str, commit_message: str, files: Mapping[str, str]) -> Dict[str, Any]:
-    """Builds the Pushes - Create request body: one commit containing one 'add' change per file."""
+def compute_changes(base_files: Mapping[str, str], files: Mapping[str, str]) -> List[Tuple[str, str, Optional[str]]]:
+    """(changeType, path, content) changes that turn `base_files` into `files`: add, edit and delete (sorted by path)."""
+    changes: List[Tuple[str, str, Optional[str]]] = []
+    for path in sorted(set(base_files) | set(files)):
+        if path not in base_files:
+            changes.append(("add", path, files[path]))
+        elif path not in files:
+            changes.append(("delete", path, None))
+        elif base_files[path] != files[path]:
+            changes.append(("edit", path, files[path]))
+    return changes
+
+
+def build_changes_body(branch: str, old_object_id: str, commit_message: str,
+                       changes: List[Tuple[str, str, Optional[str]]]) -> Dict[str, Any]:
+    """Builds the Pushes - Create request body: one commit with the given add/edit/delete changes."""
+    body_changes = []
+    for change_type, path, content in changes:
+        change: Dict[str, Any] = {"changeType": change_type, "item": {"path": path}}
+        if change_type != "delete":
+            change["newContent"] = {"content": content, "contentType": "rawtext"}
+        body_changes.append(change)
     return {
         "refUpdates": [{"name": f"refs/heads/{branch}", "oldObjectId": old_object_id}],
-        "commits": [{
-            "comment": commit_message,
-            "changes": [
-                {
-                    "changeType": "add",
-                    "item": {"path": path},
-                    "newContent": {"content": content, "contentType": "rawtext"},
-                }
-                for path, content in files.items()
-            ],
-        }],
+        "commits": [{"comment": commit_message, "changes": body_changes}],
     }
+
+
+def build_push_body(branch: str, old_object_id: str, commit_message: str, files: Mapping[str, str]) -> Dict[str, Any]:
+    """Builds the Pushes - Create request body: one commit containing one 'add' change per file."""
+    return build_changes_body(branch, old_object_id, commit_message,
+                              [("add", path, content) for path, content in files.items()])
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +301,7 @@ def push_files_to_repo(
     branch: Optional[str] = None,
     *,
     allow_existing_branch: bool = True,
+    base_files: Optional[Mapping[str, str]] = None,
     org_url: Optional[str] = None,
     pat: Optional[str] = None,
     client: Optional[httpx.Client] = None,
@@ -298,6 +316,8 @@ def push_files_to_repo(
     - An existing branch is updated from its current head, unless `allow_existing_branch` is False,
       in which case an ALREADY_INITIALIZED error is raised before anything is pushed.
     - If the branch moves between reading the head and pushing (409), the head is re-read and the push retried once.
+    - With `base_files` (the files as last pushed), the branch must already exist and the commit contains only the
+      differences: new files are added, changed files edited, missing files deleted. No differences -> NO_CHANGES error.
 
     Returns a structured result dict. Raises AdoPushError with the sanitized server response on failure.
     """
@@ -306,11 +326,17 @@ def push_files_to_repo(
     if not repository or not str(repository).strip():
         raise AdoPushError("Repository name or id is required.", error_type="VALIDATION_ERROR")
 
-    message = (commit_message or "").strip() or get_default_commit_message()
+    update_mode = base_files is not None
+    message = (commit_message or "").strip() or (DEFAULT_UPDATE_COMMIT_MESSAGE if update_mode
+                                                  else get_default_commit_message())
     if len(message) > MAX_COMMIT_MESSAGE_LENGTH:
         raise AdoPushError(f"Commit message exceeds {MAX_COMMIT_MESSAGE_LENGTH} characters.",
                            error_type="VALIDATION_ERROR")
     prepared = prepare_files(files)
+    changes = compute_changes(prepare_files(base_files) if base_files else {}, prepared) if update_mode else None
+    if update_mode and not changes:
+        raise AdoPushError("The structure is identical to what was already pushed; there is nothing to push.",
+                           error_type="NO_CHANGES")
     requested_branch = normalize_branch(branch) if branch and branch.strip() else None
 
     if org_url is None or pat is None:
@@ -348,16 +374,20 @@ def push_files_to_repo(
                     f"(project='{project}', branch='{target_branch}')")
 
         head = _get_branch_head(ctx, target_branch)
+        if update_mode and head is None:
+            raise AdoPushError(f"Branch '{target_branch}' does not exist yet, so there is no pushed structure to update.",
+                               error_type="BASE_MISSING")
         conflict_retry_used = False
         while True:
-            if head is not None and not allow_existing_branch:
+            if head is not None and not allow_existing_branch and not update_mode:
                 raise AdoPushError(
                     f"Branch '{target_branch}' already has commits in repository '{repository}'. "
                     "The starter structure was not pushed again, so nothing was changed.",
                     error_type="ALREADY_INITIALIZED", status_code=409)
 
             old_object_id = head or ZERO_OBJECT_ID
-            body = build_push_body(target_branch, old_object_id, message, prepared)
+            body = (build_changes_body(target_branch, old_object_id, message, changes) if update_mode
+                    else build_push_body(target_branch, old_object_id, message, prepared))
             retries_before = ctx.retries_used
             response = _send(ctx, "POST", f"{repo_url}/pushes?api-version={API_VERSION}", "push the files", body)
 
@@ -366,7 +396,7 @@ def push_files_to_repo(
                 commits = data.get("commits") or [{}]
                 commit_id = commits[-1].get("commitId") or ""
                 return _success(org_url, project, repository, target_branch, message, prepared, commit_id,
-                                data.get("pushId"), data.get("url"), old_object_id == ZERO_OBJECT_ID)
+                                data.get("pushId"), data.get("url"), old_object_id == ZERO_OBJECT_ID, changes)
 
             if response.status_code == 409:
                 fresh_head = _get_branch_head(ctx, target_branch)
@@ -375,7 +405,7 @@ def push_files_to_repo(
                     if _get_commit_comment(ctx, fresh_head) == message:
                         logger.info("[ADO Push] Earlier attempt already applied the push; treating as success.")
                         return _success(org_url, project, repository, target_branch, message, prepared, fresh_head,
-                                        None, None, head is None)
+                                        None, None, head is None, changes)
                 if not conflict_retry_used:
                     conflict_retry_used = True
                     head = fresh_head
@@ -389,12 +419,13 @@ def push_files_to_repo(
 
 
 def _success(org_url: str, project: str, repository: str, branch: str, message: str, files: Mapping[str, str],
-             commit_id: str, push_id: Any, push_url: Optional[str], created_branch: bool) -> Dict[str, Any]:
+             commit_id: str, push_id: Any, push_url: Optional[str], created_branch: bool,
+             changes: Optional[List[Tuple[str, str, Optional[str]]]] = None) -> Dict[str, Any]:
     project_segment = quote(str(project).strip(), safe="")
     repo_segment = quote(str(repository).strip(), safe="")
     repo_web_url = f"{org_url}/{project_segment}/_git/{repo_segment}"
     logger.info(f"[ADO Push] Pushed {len(files)} files to '{repository}' on '{branch}' (commit {commit_id[:8]})")
-    return {
+    result = {
         "status": "success",
         "project": project,
         "repository": repository,
@@ -409,3 +440,7 @@ def _success(org_url: str, project: str, repository: str, branch: str, message: 
         "commit_url": f"{repo_web_url}/commit/{commit_id}" if commit_id else None,
         "repository_url": repo_web_url,
     }
+    if changes is not None:
+        result["changes"] = {kind: [path for change_type, path, _ in changes if change_type == kind]
+                             for kind in ("add", "edit", "delete")}
+    return result

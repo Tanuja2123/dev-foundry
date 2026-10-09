@@ -384,6 +384,50 @@ def test_missing_configuration(no_ado_config):
     assert err.value.error_type == "CONFIGURATION_ERROR"
 
 
+# ---------------------------------------------------------------------------
+# Follow-up commits (base_files): add / edit / delete only the differences
+# ---------------------------------------------------------------------------
+
+def test_compute_changes():
+    base = {"/a.txt": "a", "/b.txt": "b", "/c.txt": "c"}
+    new = {"/a.txt": "a", "/b.txt": "B", "/d.txt": "d"}
+    assert gp.compute_changes(base, new) == [("edit", "/b.txt", "B"), ("delete", "/c.txt", None), ("add", "/d.txt", "d")]
+    assert gp.compute_changes(base, dict(base)) == []
+
+
+def test_follow_up_push_sends_only_differences_from_head():
+    fake = FakeAdo(branches={"main": "a" * 40}, default_branch="main")
+    base = {"/README.md": "# Repo\n", "/old.txt": "old\n"}
+    new = {"/README.md": "# Repo v2\n", "/new.txt": "new\n"}
+    result = push(fake, files=new, base_files=base, allow_existing_branch=False)
+    body = push_bodies(fake)[0]
+    assert body["refUpdates"] == [{"name": "refs/heads/main", "oldObjectId": "a" * 40}]
+    assert body["commits"][0]["comment"] == gp.DEFAULT_UPDATE_COMMIT_MESSAGE
+    assert body["commits"][0]["changes"] == [                            # sorted by path
+        {"changeType": "edit", "item": {"path": "/README.md"}, "newContent": {"content": "# Repo v2\n", "contentType": "rawtext"}},
+        {"changeType": "add", "item": {"path": "/new.txt"}, "newContent": {"content": "new\n", "contentType": "rawtext"}},
+        {"changeType": "delete", "item": {"path": "/old.txt"}},
+    ]
+    assert result["changes"] == {"add": ["/new.txt"], "edit": ["/README.md"], "delete": ["/old.txt"]}
+    assert result["created_branch"] is False
+
+
+def test_follow_up_push_without_differences_is_rejected_before_any_request():
+    fake = FakeAdo(branches={"main": "a" * 40}, default_branch="main")
+    with pytest.raises(AdoPushError) as err:
+        push(fake, files=FILES, base_files=dict(FILES))
+    assert err.value.error_type == "NO_CHANGES"
+    assert fake.requests == []
+
+
+def test_follow_up_push_requires_existing_branch():
+    fake = FakeAdo()
+    with pytest.raises(AdoPushError) as err:
+        push(fake, files={"/a.txt": "a"}, base_files={"/b.txt": "b"})
+    assert err.value.error_type == "BASE_MISSING"
+    assert fake.posts() == []
+
+
 def test_validation_happens_before_any_request():
     fake = FakeAdo()
     with pytest.raises(AdoPushError):

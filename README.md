@@ -97,9 +97,22 @@ After the PRD and TRD are approved, the Repo Setup Agent works through these ste
 
 The structure shown in chat and the files pushed are guaranteed to be the same. Both come from the `Repository.structure` row in Supabase: the tree is drawn by code, and the push tool reads that row instead of taking files from the model.
 
-- **Database:** run `backend/db/migrations/001_create_project_and_repository.sql` once in the Supabase SQL editor. It creates the `Project` table (one row per conversation, with the PRD, TRD and ADO project) and the `Repository` table (the structure, its version and the commit).
+**Routing:** the Orchestrator returns a structured routing decision through Agent Framework's `response_format`. Code checks the decision against the operations allowed in the current stage (`backend/app/services/workflow_routing.py`).
+- **No skipped steps:** approving the PRD or TRD only confirms it. Moving on to the TRD or to repository setup needs an explicit request.
+- **Technology requests:** any message about technology updates the TRD, even if the TRD already uses that technology.
+
+**Changes at any stage:** the PRD and TRD can be updated at any time, even after the project, repository or push exist.
+- **Version tracking:** each document has a version number, and the TRD, project and structure record which version they were built from.
+- **Out-of-date items:** a PRD change marks the TRD as out of date. A TRD change marks the project proposal (or the created ADO project) and the repository structure as out of date.
+- **Updating them:** the agent offers to update each out-of-date item. Created ADO projects can be renamed or re-described. A structure that was already pushed is updated with a follow-up commit that adds, edits and deletes only what changed.
+- **Suggestion chips:** every chat reply, and every conversation load, includes `suggestions`, which are next steps worked out from the stored state. The dashboard shows them as clickable chips above the input box.
+
+- **Database:** run these migrations once, in order, in the Supabase SQL editor:
+  1. `backend/db/migrations/001_create_project_and_repository.sql` creates the `Project` table (one row per conversation, with the PRD, TRD and ADO project) and the `Repository` table (the structure, its version and the commit).
+  2. `backend/db/migrations/002_document_versions.sql` adds the version columns used to detect out-of-date items, plus the baseline used for follow-up commits.
 - **Code:**
-  - `backend/app/services/project_store.py`: database access.
+  - `backend/app/services/workflow_routing.py`: the routing decision, the stage checks and the suggestions.
+  - `backend/app/services/project_store.py`: database access and out-of-date detection.
   - `backend/app/services/repo_structure.py`: validation, applying changes and drawing the tree.
   - `backend/app/services/agents/repo_setup_agent.py`: the agent and its tools.
   - `backend/app/services/mcp/ado_git_push.py`: the push, using the Azure DevOps Git *Pushes - Create* API.

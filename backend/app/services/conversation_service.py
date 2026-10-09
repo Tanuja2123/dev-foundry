@@ -16,6 +16,9 @@ from app.services.agents.requirements_agent import process_uploaded_document, ge
 from app.services.agents.repo_setup_agent import get_repo_setup_agent
 from app.services import project_store as store
 from app.services.repo_structure import render_structure_tree
+from app.services.workflow_routing import (RoutingDecision, blocked_reply, effective_stage, next_steps,
+                                           parse_routing_decision, routing_context, validate_decision,
+                                           apply_intent_rules)
 from app.core.logger import logger
 
 # Load variables from .env file
@@ -139,15 +142,31 @@ def persist_requirements_output(conversation_id: Optional[str], raw_output: str)
     data = parse_agent_json(raw_output)
     if not conversation_id or not data or data.get("status") != "COMPLETE":
         return
-    fields = {}
-    if data.get("structured_project_response"):
-        fields["prd"] = data["structured_project_response"]
-    if data.get("technical_requirements_document"):
-        fields["trd"] = data["technical_requirements_document"]
-    if not fields:
+    prd = data.get("structured_project_response")
+    trd = data.get("technical_requirements_document")
+    if not prd and not trd:
         return
     try:
         project = store.ensure_project(conversation_id)
+        stage = project.get("workflow_stage") or store.STAGE_REQUIREMENTS
+        versioned = "prd_version" in project  # migration 002 applied
+        fields: Dict = {}
+        prd_version = project.get("prd_version") or 0
+        if prd:
+            fields["prd"] = prd
+            if versioned:
+                prd_version += 1
+                fields["prd_version"] = prd_version
+            # Documents can change at any stage; only the requirements stages move forward here.
+            if stage in (store.STAGE_REQUIREMENTS, store.STAGE_PRD_REVIEW):
+                fields["workflow_stage"] = store.STAGE_PRD_REVIEW
+        if trd:
+            fields["trd"] = trd
+            if versioned:
+                fields["trd_version"] = (project.get("trd_version") or 0) + 1
+                fields["trd_prd_version"] = prd_version
+            if stage in (store.STAGE_REQUIREMENTS, store.STAGE_PRD_REVIEW, store.STAGE_TRD_REVIEW):
+                fields["workflow_stage"] = store.STAGE_TRD_REVIEW
         store.update_project(project["project_id"], **fields)
         logger.info(f"[ProjectStore] Saved {', '.join(fields).upper()} for conversation '{conversation_id}'")
     except store.StoreError as e:
@@ -164,9 +183,10 @@ def persist_repo_setup_output(conversation_id: Optional[str], raw_output: str) -
         if stage == "PROJECT_REVIEW" and proposal.get("project_name"):
             project = store.ensure_project(conversation_id)
             if not project.get("ado_project_id"):
+                versions = {"proposal_trd_version": project.get("trd_version") or 0} if "trd_version" in project else {}
                 store.update_project(project["project_id"], project_name=proposal["project_name"].strip(),
                                      project_description=(proposal.get("project_description") or "").strip(),
-                                     workflow_stage=store.STAGE_PROJECT_REVIEW)
+                                     workflow_stage=store.STAGE_PROJECT_REVIEW, **versions)
         repo_proposal = data.get("repository_proposal") or {}
         if stage in ("PROJECT_CREATED", "REPOSITORY_REVIEW") and (repo_proposal.get("repo_name") or "").strip():
             project = store.get_project(conversation_id)
@@ -175,6 +195,19 @@ def persist_repo_setup_output(conversation_id: Optional[str], raw_output: str) -
                 store.update_project(project["project_id"], workflow_stage=store.STAGE_REPOSITORY_REVIEW)
     except store.StoreError as e:
         logger.error(f"[ProjectStore] Could not save repository setup proposal: {e}")
+
+def follow_up_note(conversation_id: Optional[str]) -> str:
+    """Outdated artifacts after this turn, for the synthesizer to mention (empty when nothing is outdated)."""
+    if not conversation_id:
+        return ""
+    state = store.get_workflow_state(conversation_id)
+    items = store.outdated_items(state) if not state.get("error") else []
+    if not items:
+        return ""
+    lines = "\n".join(f"- {store.OUTDATED_DESCRIPTIONS[item]}" for item in items)
+    return ("\n\nFOLLOW-UPS: Because documents changed, these items are now outdated:\n" + lines +
+            "\nEnd your answer with a short '**Suggested next steps**' list offering to update them (in that order), "
+            "instead of moving the workflow forward.")
 
 def render_structure_for_display(state: Dict) -> Optional[str]:
     """Renders the stored structure (the exact files that are / will be pushed) as Markdown."""
@@ -204,71 +237,75 @@ async def generate_chat_response(user_query: str, history: List[Dict], conversat
         main_agent_prompt = """
 You are DevFoundry, an AI-powered software development orchestration assistant.
 
-Your purpose is to understand the user's intent within the full conversation context, track workflow state across the software delivery lifecycle, and dynamically coordinate with the specialized child agents.
+For every user message you decide ONE thing: answer the user directly, or delegate exactly ONE operation to ONE child agent.
+You return a structured decision (reasoning, action, agent, operation, reply, title). You never write PRDs, TRDs or proposals yourself.
 
-AVAILABLE CHILD AGENTS:
-1. Requirements_Agent:
-   Responsible for:
-   - Product Requirements (PRD): Extracts and structures Objective, Problem Statement, Goals, User Experience, User Flow. Clarifies ambiguities and updates PRD based on user feedback.
-   - Technical Architecture (TRD): Generates and updates the Technical Requirements Document (Frontend, Backend, Database, Infrastructure, Security) based on the approved PRD and user tech stack feedback.
+AVAILABLE CHILD AGENTS AND OPERATIONS:
+1. Requirements_Agent
+   - GENERATE_PRD: create the Product Requirements Document from a project description, an uploaded document, or answers to clarifying questions.
+   - UPDATE_PRD: change functional requirements (features, users, roles, flows, goals) of an existing PRD.
+   - GENERATE_TRD: create the Technical Requirements Document from the PRD.
+   - UPDATE_TRD: change, add, remove or confirm technologies in an existing TRD.
+2. Repo_Setup_Agent
+   - GENERATE_PROJECT_PROPOSAL / UPDATE_PROJECT_PROPOSAL: propose / change the Azure DevOps project name and description (before it exists).
+   - CREATE_PROJECT: create the Azure DevOps project (explicit approval only); it also suggests a repository name.
+   - UPDATE_ADO_PROJECT: rename / change the description of the already created Azure DevOps project.
+   - GENERATE_REPOSITORY_PROPOSAL / UPDATE_REPOSITORY_PROPOSAL: propose / rename the repository.
+   - CREATE_REPOSITORY: create the empty repository (explicit approval only); it also proposes the folder structure.
+   - GENERATE_REPOSITORY_STRUCTURE / UPDATE_REPOSITORY_STRUCTURE: propose a new structure / change the shown structure.
+   - PUSH_REPOSITORY_STRUCTURE: push the approved structure to the main branch (explicit approval only); if it was pushed
+     before, only the changes are pushed as a follow-up commit.
 
-2. Repo_Setup_Agent:
-   Responsible for Azure DevOps project and repository setup across a state-driven human-in-the-loop workflow:
-   - Proposing project name and description (GENERATE_PROJECT_PROPOSAL)
-   - Updating project proposal details (UPDATE_PROJECT_PROPOSAL)
-   - Creating the ADO project upon explicit user approval, then suggesting a repository name (CREATE_PROJECT)
-   - Proposing / renaming the repository (GENERATE_REPOSITORY_PROPOSAL, UPDATE_REPOSITORY_PROPOSAL)
-   - Creating the empty ADO Git repository upon explicit approval of its name, then proposing its folder structure from the TRD (CREATE_REPOSITORY)
-   - Regenerating / updating the proposed folder structure based on user feedback (GENERATE_REPOSITORY_STRUCTURE, UPDATE_REPOSITORY_STRUCTURE)
-   - Pushing the approved folder structure to the main branch as one commit upon explicit approval (PUSH_REPOSITORY_STRUCTURE)
+WORKFLOW STAGES (in order):
+REQUIREMENTS -> PRD_REVIEW -> TRD_REVIEW -> PROJECT_REVIEW -> REPOSITORY_REVIEW -> STRUCTURE_REVIEW -> COMPLETE
+The system appends a "[Current Workflow State (database)]" block to the user's latest message with current_stage and
+allowed_operations. It is authoritative. You may ONLY delegate an operation listed in allowed_operations.
 
-DYNAMIC CONTEXTUAL WORKFLOW ROUTING PRINCIPLES:
-- Do NOT rely on isolated keywords. Evaluate the user's message IN THE CONTEXT of the previous conversation history and current workflow stage.
-- The system appends a "[Current Workflow State (database)]" block to the user's latest message. It is authoritative for what already exists
-  (workflow_stage, project proposal, ADO project created, repository name/status, structure version). Prefer it over the chat history.
+ROUTING RULES:
+1. Never skip a step. Moving to the next step requires the user to EXPLICITLY ask for that next step.
+   - PRD -> TRD: delegate GENERATE_TRD only if the user explicitly asks for the TRD (e.g. "create the TRD",
+     "go ahead with the technical requirements", or "yes" as a direct answer to the question "Would you like me to create a TRD?").
+     Approving or praising the PRD ("the PRD looks good", "PRD approved") is NOT a request for the TRD:
+     respond, confirming the PRD is approved, and ask whether you should create the TRD now.
+   - TRD -> repository setup: delegate GENERATE_PROJECT_PROPOSAL only if the user explicitly asks to proceed with repository /
+     Azure DevOps project setup (e.g. "let's proceed with repository setup", "set up the ADO project").
+     Approving the TRD alone ("the TRD looks good") is NOT that request: respond, confirming the TRD is final, and ask
+     whether to proceed with repository setup.
+2. The PRD and TRD can be updated at ANY stage, even after the Azure DevOps project, repository or push exist.
+   - Any message about technologies (use, add, replace, remove or keep a language, framework, database, library or cloud
+     service) is UPDATE_TRD, EVEN IF the TRD already contains that technology. Never treat it as approval to move on.
+   - Changes to features, users, roles or flows -> UPDATE_PRD.
+   Updating one document never updates the next one automatically: the state block then lists "outdated" items and the
+   user is offered to update them.
+3. Outdated items (see "outdated" in the state block) are updated only when the user asks for it:
+   - "update the TRD accordingly" (TRD_OUTDATED) -> UPDATE_TRD.
+   - project name/description (PROJECT_PROPOSAL_OUTDATED, before creation) -> UPDATE_PROJECT_PROPOSAL;
+     (ADO_PROJECT_OUTDATED, after creation, or any rename request) -> UPDATE_ADO_PROJECT.
+   - repository structure (STRUCTURE_OUTDATED) -> UPDATE_REPOSITORY_STRUCTURE; pushing the updated structure again -> PUSH_REPOSITORY_STRUCTURE.
+4. A project description, an uploaded document, or answers to clarifying questions -> GENERATE_PRD (no PRD yet) or UPDATE_PRD.
+5. Project / repository / structure steps:
+   - PROJECT_REVIEW: name/description changes -> UPDATE_PROJECT_PROPOSAL; explicit approval to create -> CREATE_PROJECT.
+   - REPOSITORY_REVIEW: different repository name -> UPDATE_REPOSITORY_PROPOSAL; explicit approval to create -> CREATE_REPOSITORY;
+     no repository name proposed yet -> GENERATE_REPOSITORY_PROPOSAL.
+   - STRUCTURE_REVIEW: changes to folders/files -> UPDATE_REPOSITORY_STRUCTURE; a completely new structure -> GENERATE_REPOSITORY_STRUCTURE;
+     explicit approval to push (optionally with a commit message) -> PUSH_REPOSITORY_STRUCTURE.
+6. COMPLETE: the structure was pushed. Further structure changes -> UPDATE_REPOSITORY_STRUCTURE (pushed later as a follow-up
+   commit after explicit approval); project rename/description -> UPDATE_ADO_PROJECT; otherwise respond directly.
+7. Never "re-push" when nothing changed: if the user asks to push again and the state shows no unpushed changes, respond.
+8. Greetings, general questions, status questions, or a request to skip/cancel a step -> respond directly.
+9. If you cannot tell whether the user is approving, asking for a change, or asking for the next step, respond with ONE short
+   clarifying question instead of delegating.
 
-A. PRD & TRD STAGES (Requirements_Agent):
-- If the assistant previously offered: "Would you like me to create a Technical Requirements Document (TRD) as well?" and the user confirms, responds affirmatively (e.g. "yes", "sure", "go ahead"), or asks to proceed with technical architecture:
-  Recognize that the workflow stage is TRD and delegate to Requirements_Agent with operation: "GENERATE_TRD".
-- If a TRD was already generated and the user requests tech stack modifications (e.g. "Use Python FastAPI instead of Node", "Use PostgreSQL instead of MongoDB"):
-  Recognize that the workflow stage is TRD modification and delegate to Requirements_Agent with operation: "UPDATE_TRD".
-- If the user provides a project description, uploaded requirement document, answers PRD clarification questions, or requests changes to the functional PRD:
-  Recognize that the workflow stage is PRD and delegate to Requirements_Agent with operation: "GENERATE_PRD" or "UPDATE_PRD".
-
-B. ADO PROJECT & REPO SETUP STAGES (Repo_Setup_Agent):
-- If TRD is complete and user agrees/asks to proceed with repository setup, create Azure DevOps project, or start repo setup (workflow_stage REQUIREMENTS):
-  Delegate to Repo_Setup_Agent with operation: "GENERATE_PROJECT_PROPOSAL".
-- If a project proposal is pending review (workflow_stage PROJECT_REVIEW) and user asks to modify the project name or description:
-  Delegate to Repo_Setup_Agent with operation: "UPDATE_PROJECT_PROPOSAL".
-- If a project proposal is pending review (workflow_stage PROJECT_REVIEW) and the user explicitly approves/confirms creating the project (e.g. "looks good, create the project", "proceed with creation", "approved"):
-  Delegate to Repo_Setup_Agent with operation: "CREATE_PROJECT".
-- If the ADO project was created (workflow_stage REPOSITORY_REVIEW) but no repository name was proposed yet:
-  Delegate to Repo_Setup_Agent with operation: "GENERATE_REPOSITORY_PROPOSAL".
-- If a repository name is pending review (workflow_stage REPOSITORY_REVIEW) and the user asks for a different repository name:
-  Delegate to Repo_Setup_Agent with operation: "UPDATE_REPOSITORY_PROPOSAL".
-- If a repository name is pending review (workflow_stage REPOSITORY_REVIEW) and the user explicitly approves creating the repository:
-  Delegate to Repo_Setup_Agent with operation: "CREATE_REPOSITORY".
-- If a folder structure is pending review (workflow_stage STRUCTURE_REVIEW) and the user requests changes to folders or files:
-  Delegate to Repo_Setup_Agent with operation: "UPDATE_REPOSITORY_STRUCTURE" (or "GENERATE_REPOSITORY_STRUCTURE" if they want a completely new structure).
-- If a folder structure is pending review (workflow_stage STRUCTURE_REVIEW) and the user explicitly approves it (e.g. "looks good, push it", "approved"), optionally with a commit message:
-  Delegate to Repo_Setup_Agent with operation: "PUSH_REPOSITORY_STRUCTURE".
-- If workflow_stage is COMPLETE, repository setup is finished: answer directly.
-- Once the ADO project has been created, the PRD and TRD are final: do NOT delegate PRD/TRD or tech stack changes to Requirements_Agent; explain that they were finalized during the requirements stage.
-- If user explicitly decides to skip or cancel repository creation:
-  Do not delegate; answer directly acknowledging the decision and concluding the workflow.
-
-C. CONVERSATIONAL / INFORMATIONAL:
-- If the user query is generic, conversational, informational, or does not require child agent functionality, answer directly and do NOT invoke any child agent.
-
-When a user starts a new conversation:
-- You MUST prefix your very first response with "TITLE: <a short 3-5 word title describing the user's project>\\n\\n". Do not include this prefix in subsequent messages.
-
-DELEGATION INSTRUCTION:
-- If Requirements_Agent is required, output:
-  "DELEGATE_TO: Requirements_Agent | WORKFLOW: <PRD or TRD> | OPERATION: <GENERATE_PRD, UPDATE_PRD, GENERATE_TRD, or UPDATE_TRD>"
-- If Repo_Setup_Agent is required, output:
-  "DELEGATE_TO: Repo_Setup_Agent | OPERATION: <GENERATE_PROJECT_PROPOSAL, UPDATE_PROJECT_PROPOSAL, CREATE_PROJECT, GENERATE_REPOSITORY_PROPOSAL, UPDATE_REPOSITORY_PROPOSAL, CREATE_REPOSITORY, GENERATE_REPOSITORY_STRUCTURE, UPDATE_REPOSITORY_STRUCTURE, or PUSH_REPOSITORY_STRUCTURE>"
-- If no child agent is required, provide your direct, helpful response to the user.
+DECISION FIELDS:
+- reasoning: one short sentence (for logs).
+- user_intent: classify the latest user message on its own (approve_only, explicit_next_step, change_request, question, other).
+  "The PRD/TRD looks good" or "approved" is approve_only. "yes" in direct answer to an offer of the next step is explicit_next_step.
+  An instruction such as "Use PostgreSQL as the database" is change_request even if the TRD already uses it.
+- mentions_technology: true if the message names a language, framework, database, library or cloud/infrastructure service.
+- action: "delegate" or "respond".
+- agent + operation: required when delegating (operation must be in allowed_operations).
+- reply: required when responding. Friendly, concise Markdown that ends with the clear next step the user can take.
+- title: only for the very first user message of a new conversation (there are no previous messages): a 3-5 word project title. Otherwise null.
 """
 
         orchestrator = Agent(
@@ -282,7 +319,8 @@ DELEGATION INSTRUCTION:
 
         # Stored workflow state (Project / Repository tables) for routing and child agents. Never persisted in chat history.
         workflow_state = store.get_workflow_state(conversation_id) if conversation_id else None
-        state_note = f"\n\n{store.describe_workflow_state(workflow_state)}" if workflow_state is not None else ""
+        stage = effective_stage(workflow_state)
+        state_note = "\n\n" + routing_context(workflow_state)
 
         # Convert history into Agent Framework Messages
         message_list = []
@@ -290,42 +328,47 @@ DELEGATION INSTRUCTION:
             role = msg.get("role", "user")
             text = msg.get("text", "")
             message_list.append(Message(role=role, contents=[text]))
-            
+
         new_msg = Message(role="user", contents=[user_query])
         message_list.append(new_msg)
 
-        # 1. Execute the Orchestrator
-        logger.info(f"[Orchestrator] Running Orchestrator Agent (Model: {deployment}, History: {len(history)} messages)...")
+        # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
+        logger.info(f"[Orchestrator] Running Orchestrator Agent (Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
         orchestrator_messages = list(message_list[:-1]) + [Message(role="user", contents=[user_query + state_note])]
-        orchestrator_response = await orchestrator.run(messages=orchestrator_messages)
+        orchestrator_response = await orchestrator.run(messages=orchestrator_messages,
+                                                       options={"response_format": RoutingDecision})
         orch_duration = round((time.time() - orch_start) * 1000, 1)
-        response_text = orchestrator_response.messages[-1].text if orchestrator_response.messages else "No response."
-        logger.info(f"[Orchestrator] Completed in {orch_duration}ms")
+        decision = parse_routing_decision(orchestrator_response)
+        logger.info(f"[Orchestrator] Completed in {orch_duration}ms -> {decision.action} "
+                    f"{decision.agent or ''} {decision.operation or ''} | intent={decision.user_intent}, "
+                    f"tech={decision.mentions_technology} | {decision.reasoning}")
 
         title_prefix = ""
-        if response_text.startswith("TITLE:"):
-            parts = response_text.split("\n\n", 1)
-            if len(parts) > 1:
-                title_prefix = parts[0] + "\n\n"
-                response_text = parts[1]
+        if decision.title and decision.title.strip() and not history:
+            title_prefix = f"TITLE: {decision.title.strip()}\n\n"
 
-        # 2. Dynamic Workflow Routing Evaluation
-        is_req_delegation = "Requirements_Agent" in response_text or "DELEGATE_TO: Requirements_Agent" in response_text
-        is_repo_delegation = "Repo_Setup_Agent" in response_text or "DELEGATE_TO: Repo_Setup_Agent" in response_text
+        # 2. Workflow guard: the operation must be allowed in the current stage
+        corrected = apply_intent_rules(decision, stage, workflow_state)
+        if corrected is not decision:
+            logger.warning(f"[Routing Guard] {decision.action} {decision.operation or ''} -> {corrected.action} "
+                           f"{corrected.operation or ''} ({corrected.reasoning})")
+            decision = corrected
+        blocked = validate_decision(decision, stage, workflow_state)
+        if blocked:
+            logger.warning(f"[Routing Guard] {decision.operation} is not allowed in stage {stage}; answering directly")
+            decision = RoutingDecision(reasoning="blocked by workflow guard", action="respond",
+                                       reply=blocked_reply(stage, blocked))
+        route_agent = decision.agent if decision.action == "delegate" else None
+        operation = decision.operation
+        response_text = decision.reply or blocked_reply(stage, "")
 
-        if is_req_delegation:
-            logger.info(f"[Routing Decision] -> Delegating to Requirements_Agent")
+        if route_agent == "Requirements_Agent":
+            logger.info(f"[Routing Decision] -> Delegating to Requirements_Agent ({operation})")
 
-            # Extract workflow context from Orchestrator's decision if present
-            workflow_context_note = ""
-            if "OPERATION:" in response_text:
-                op_part = response_text.split("OPERATION:", 1)[1].strip()
-                workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {op_part}]"
-            elif "TRD" in response_text:
-                workflow_context_note = "\n[Workflow Context from Orchestrator: Workflow = TRD]"
-            else:
-                workflow_context_note = "\n[Workflow Context from Orchestrator: Workflow = PRD]"
+            workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
+            if workflow_state is not None and workflow_state.get("project"):
+                workflow_context_note += "\n\n" + store.describe_workflow_state(workflow_state, include_requirements=True)
 
             # Prepare message list for Requirements_Agent with clear workflow context
             req_messages = list(message_list[:-1])
@@ -333,13 +376,14 @@ DELEGATION INSTRUCTION:
             req_messages.append(context_user_msg)
 
             # Invoke Requirements Child Agent
-            logger.info(f"[Requirements_Agent] Processing request with workflow context: {workflow_context_note.strip()}...")
+            logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
             child_start = time.time()
             child_response = await requirements_agent.run(messages=req_messages)
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
             persist_requirements_output(conversation_id, child_raw_json)
+            follow_ups = follow_up_note(conversation_id)
 
             # 3. Follow-Up Flow: Child Agent -> Orchestrator Synthesizer -> User
             logger.info("[Orchestrator] Converting Requirements_Agent output into user-facing natural language...")
@@ -357,6 +401,10 @@ CASE 1: If status is "CLARIFICATION_REQUIRED" or "NEEDS_INPUT":
 - If "choices" are provided, present them clearly as selectable options/bullet points.
 
 CASE 2: If status is "COMPLETE" and workflow_stage is "PRD" (or contains structured_project_response):
+- Start with ONE introductory sentence before the first heading, e.g. "Here is the **Product Requirements Document (PRD)**
+  based on your project description:" (say "based on the uploaded document" if the requirements came from an attached file).
+  For an updated PRD (change_notes present) say "Here is the **updated Product Requirements Document (PRD)**:" and then
+  summarize what changed in one short "**What changed:**" paragraph based on change_notes.
 - Present the complete structured PRD specification using clear Markdown headings:
   * **Objective**
   * **Problem Statement**
@@ -368,15 +416,21 @@ CASE 2: If status is "COMPLETE" and workflow_stage is "PRD" (or contains structu
   "**Would you like me to create a Technical Requirements Document (TRD) as well?**"
 
 CASE 3: If status is "COMPLETE" and workflow_stage is "TRD" (or contains technical_requirements_document):
+- Start with ONE introductory sentence before the first heading, e.g. "Here is the **Technical Requirements Document (TRD)**
+  based on the approved PRD:" (or "Here is the **updated Technical Requirements Document (TRD)**:" when change_notes is present).
 - Present the comprehensive technical stack recommendations using clean Markdown headings:
   * **Frontend Technology Stack** (Framework, Supporting Technologies, Tools & Libraries, Rationale)
   * **Backend Technology Stack** (Language, Framework, API Technologies, Supporting Technologies, Rationale)
   * **Database Technology Stack** (Database, Database Type, Supporting Technologies, Rationale)
   * **Integration & Infrastructure** (if present)
-- If changes were made to an existing architecture, highlight what was updated based on change_notes.
+- Under each heading use ONE flat bullet per field, e.g. "- **Framework:** React" and "- **Supporting Technologies:** Redux Toolkit, React Router".
+  Do not nest lists. Put the rationale in its own short paragraph starting with "**Rationale:**".
+- If change_notes is present, start with a short "**What changed:**" paragraph based on change_notes (including when nothing needed to change).
 - Conclude by asking if the user would like to make any modifications to these technology choices, or if they are ready to proceed with repository setup.
 
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
+Put a blank line before and after every heading, divider (---) and list; never put "---" at the end of a text line.
+{follow_ups}
 """
             synth_start = time.time()
             synthesizer_agent = Agent(
@@ -389,13 +443,8 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
 
-        elif is_repo_delegation:
-            logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent")
-
-            # Extract operation from Orchestrator's decision
-            operation = "GENERATE_PROJECT_PROPOSAL"
-            if "OPERATION:" in response_text:
-                operation = response_text.split("OPERATION:", 1)[1].strip()
+        elif route_agent == "Repo_Setup_Agent":
+            logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
 
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None:
@@ -415,6 +464,7 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
             persist_repo_setup_output(conversation_id, child_raw_json)
+            follow_ups = follow_up_note(conversation_id)
 
             # The structure shown to the user is rendered from the stored files (the same files that get pushed)
             child_data = parse_agent_json(child_raw_json) or {}
@@ -467,15 +517,21 @@ CASE 6: If status is "COMPLETE" and workflow_stage is "STRUCTURE_REVIEW":
 - Invite the user to request further changes or approve pushing it to the main branch as a single initial commit.
 
 CASE 7: If status is "COMPLETE" and workflow_stage is "STRUCTURE_PUSHED":
-- Announce that the approved structure was pushed as a single commit.
+- Announce that the approved structure was pushed as a single commit (say whether it is the initial commit or a follow-up
+  commit; for a follow-up commit list the added, edited and deleted files from push.changes).
 - Show **Repository**, **Commit ID**, **Commit Message**, **Branch**, **Files** (files_count) and a link to the commit (commit_url).
 - Output the placeholder line (see STRUCTURE RULE), then state that repository setup is complete and the project is ready for development.
+
+CASE 8: If status is "COMPLETE" and workflow_stage is "ADO_PROJECT_UPDATED":
+- Announce that the Azure DevOps project was updated, with **Project Name**, **Project Description** and **Project URL** ([link](url)).
 
 STRUCTURE RULE (CASES 5, 6, 7):
 - Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs. The system replaces it with the exact stored structure.
 - NEVER draw the folder tree or list the files yourself.
 
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
+Put a blank line before and after every heading, divider (---) and list; never put "---" at the end of a text line.
+{follow_ups}
 """
             synth_start = time.time()
             synthesizer_agent = Agent(
@@ -497,6 +553,16 @@ Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
     except Exception as e:
         logger.error(f"[Agent Pipeline] Error: {str(e)}")
         return f"Error communicating with Agent Framework: {str(e)}"
+
+def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
+    """Next-step suggestions (label + prompt) for the chips above the chat input."""
+    if not conversation_id:
+        return []
+    try:
+        return next_steps(store.get_workflow_state(conversation_id))
+    except Exception as e:
+        logger.error(f"[Suggestions] Could not compute suggestions: {e}")
+        return []
 
 async def process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None) -> ChatResponse:
     overall_start = time.time()
@@ -569,6 +635,7 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
     total_time = round((time.time() - overall_start) * 1000, 1)
     logger.info(f"=== Chat pipeline completed successfully in {total_time}ms ===")
 
-    return ChatResponse(conversation_id=conversation_id, response=response_text)
+    return ChatResponse(conversation_id=conversation_id, response=response_text,
+                        suggestions=get_suggestions(conversation_id))
 
 

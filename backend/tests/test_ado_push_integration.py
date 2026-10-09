@@ -143,3 +143,45 @@ def test_project_store_round_trip():
     finally:
         live.delete_project_rows(conv_id)
     assert store.get_project(conv_id) is None
+
+
+def test_follow_up_commit_adds_edits_and_deletes(fresh_repo):
+    repo = fresh_repo()
+    first = server.push_repository_files(PROJECT, repo, STRUCTURE, commit_message="Initial scaffold")
+    assert first["status"] == "success", first
+    updated = [dict(f) for f in STRUCTURE if f["path"] != "/internal/models/.gitkeep"]       # delete
+    for f in updated:
+        if f["path"] == "/README.md":
+            f["content"] = "# it-scaffold\n\nUpdated after the PRD changed.\n"                 # edit
+    updated.append({"path": "/docs/adr/README.md", "content": "# ADRs\n"})                    # add
+
+    result = server.push_repository_changes(PROJECT, repo, base_files=STRUCTURE, files=updated,
+                                            commit_message="Update scaffold")
+    assert result["status"] == "success", result
+    assert result["changes"] == {"add": ["/docs/adr/README.md"], "edit": ["/README.md"],
+                                 "delete": ["/internal/models/.gitkeep"]}
+    commits = live.list_commits(PROJECT, repo, "main")
+    assert [c["comment"].strip() for c in commits] == ["Update scaffold", "Initial scaffold"]
+    tree = live.tree_paths(live.list_tree(PROJECT, repo, "main"))
+    assert {p for p, f in tree.items() if not f} == {f["path"] for f in updated}
+    assert "/internal/models" not in tree                                  # folder disappears with its last file
+    assert live.get_file_content(PROJECT, repo, "/README.md", "main").endswith("Updated after the PRD changed.\n")
+
+    again = server.push_repository_changes(PROJECT, repo, base_files=updated, files=updated)
+    assert again["error_type"] == "NO_CHANGES"
+
+
+def test_update_ado_project_renames_and_redescribes():
+    name = live.unique("DevFoundry-IT")
+    created = server.create_ado_project(name, "original description")
+    assert created["status"] == "success", created
+    try:
+        updated = server.update_ado_project(created["id"], project_name=name + "-v2",
+                                            project_description="Updated after the TRD changed")
+        assert updated["status"] == "success", updated
+        assert (updated["id"], updated["name"], updated["description"]) == (
+            created["id"], name + "-v2", "Updated after the TRD changed")
+        assert updated["url"].rstrip("/").endswith(name + "-v2")
+        print(f"\n[evidence] renamed {name} -> {updated['name']} (id {updated['id']})")
+    finally:
+        print(f"[cleanup] delete project: HTTP {live.delete_project(created['id'])}")

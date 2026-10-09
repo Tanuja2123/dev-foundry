@@ -49,9 +49,27 @@ def ado(monkeypatch):
                 "branch": "main", "files_count": len(files), "files": sorted(f["path"] for f in files),
                 "commit_url": "https://dev.azure.com/org/p/_git/r/commit/c0ffee"}
 
+    def push_changes(project_id_or_name, repository_name, base_files, files, commit_message=None, branch=None):
+        base = {f["path"]: f["content"] for f in base_files}
+        new = {f["path"]: f["content"] for f in files}
+        if base == new:
+            return {"status": "error", "error_type": "NO_CHANGES", "message": "nothing to push"}
+        calls.append(("push_repository_changes", project_id_or_name, repository_name, base, new, commit_message))
+        return {"status": "success", "commit_id": f"c0ffee{len(calls)}", "branch": branch or "main",
+                "commit_message": commit_message or "chore: update project scaffold", "files_count": len(files),
+                "changes": {"add": sorted(set(new) - set(base)), "edit": sorted(p for p in new if p in base and new[p] != base[p]),
+                            "delete": sorted(set(base) - set(new))}}
+
+    def update_project(project_id, project_name=None, project_description=None):
+        calls.append(("update_ado_project", project_id, project_name, project_description))
+        return {"status": "success", "id": project_id, "name": project_name or "Svc",
+                "description": project_description, "url": f"https://dev.azure.com/org/{project_name or 'Svc'}"}
+
     monkeypatch.setattr(rsa, "create_ado_project", create_project)
     monkeypatch.setattr(rsa, "create_ado_repository", create_repo)
     monkeypatch.setattr(rsa, "push_repository_files", push)
+    monkeypatch.setattr(rsa, "push_repository_changes", push_changes)
+    monkeypatch.setattr(rsa, "update_ado_project", update_project)
     return calls
 
 
@@ -145,7 +163,7 @@ def test_full_lifecycle_pushes_exactly_the_reviewed_structure(db, ado):
     # ... and the push sends exactly that stored row
     _, project_name, repo_name, files, message = ado[-1]
     stored = store.get_active_repository(project["project_id"])
-    assert (project_name, repo_name, message) == ("Svc", "svc", "Initial scaffold")
+    assert (project_name, repo_name, message) == ("proj-guid", "svc", "Initial scaffold")   # id survives renames
     assert files == stored["structure"]
     assert stored["status"] == store.REPO_PUSHED and stored["commit_id"] == "c0ffee"
     assert store.get_project(CONV)["workflow_stage"] == store.STAGE_COMPLETE
@@ -170,11 +188,8 @@ def test_guards_prevent_out_of_order_and_duplicate_actions(db, ado):
 
     call(t, "save_repository_structure", files=STRUCTURE)
     call(t, "push_repository_structure")
-    for name, args in [("save_repository_structure", {"files": STRUCTURE}),
-                       ("update_repository_structure", {"remove_paths": ["/README.md"]}),
-                       ("push_repository_structure", {})]:
-        result = call(t, name, **args)
-        assert result["status"] == "error" and "already pushed" in result["message"]
+    again = call(t, "push_repository_structure")                      # nothing changed since the push
+    assert again["status"] == "error" and again["error_type"] == "NO_CHANGES"
     assert [c[0] for c in ado].count("push_repository_files") == 1
     assert [c[0] for c in ado].count("create_ado_project") == 1
 
@@ -209,18 +224,69 @@ def test_tools_without_conversation_context_fail_cleanly(ado):
     assert call(t, "push_repository_structure")["status"] == "error"
 
 
-def test_agent_registers_the_five_workflow_tools():
+def _pushed_setup(t):
+    store.ensure_project(CONV)
+    call(t, "create_ado_project", project_name="Svc", project_description="Go service")
+    call(t, "create_ado_repository", project_id_or_name="Svc", repository_name="svc")
+    call(t, "save_repository_structure", files=STRUCTURE)
+    call(t, "push_repository_structure", commit_message="Initial scaffold")
+
+
+def test_structure_can_evolve_after_push_as_follow_up_commit(db, ado):
+    t = tools()
+    _pushed_setup(t)
+    project = store.get_project(CONV)
+    repo = store.get_active_repository(project["project_id"])
+    assert repo["pushed_structure"] == STRUCTURE and project["workflow_stage"] == store.STAGE_COMPLETE
+
+    updated = call(t, "update_repository_structure",
+                   upsert_files=[{"path": "/README.md", "content": "# svc v2\n"}, {"path": "/Makefile", "content": "all:\n"}],
+                   remove_paths=["/internal/handlers"])
+    assert updated["status"] == "success" and updated["structure_version"] == 2
+    assert store.get_project(CONV)["workflow_stage"] == store.STAGE_STRUCTURE_REVIEW
+    assert store.STRUCTURE_CHANGES_NOT_PUSHED in store.outdated_items(store.get_workflow_state(CONV))
+
+    pushed = call(t, "push_repository_structure", commit_message="Update scaffold")
+    assert pushed["status"] == "success" and pushed["push_type"] == "follow-up commit"
+    kind, ref, repo_name, base, new, message = ado[-1]
+    assert (kind, ref, repo_name, message) == ("push_repository_changes", "proj-guid", "svc", "Update scaffold")
+    assert base == {f["path"]: f["content"] for f in STRUCTURE}            # baseline = what was pushed before
+    assert pushed["changes"] == {"add": ["/Makefile"], "edit": ["/README.md"], "delete": ["/internal/handlers/.gitkeep"]}
+    repo = store.get_active_repository(project["project_id"])
+    assert repo["pushed_structure"] == repo["structure"] and repo["pushed_structure_version"] == 2
+    assert store.get_project(CONV)["workflow_stage"] == store.STAGE_COMPLETE
+    assert store.outdated_items(store.get_workflow_state(CONV)) == []
+
+
+def test_update_ado_project_uses_stored_id_and_marks_it_current(db, ado):
+    t = tools()
+    assert call(t, "update_ado_project", project_description="x")["status"] == "error"   # nothing created yet
+    store.ensure_project(CONV)
+    call(t, "create_ado_project", project_name="Svc", project_description="Go service")
+    project = store.get_project(CONV)
+    store.update_project(project["project_id"], trd_version=3)                           # TRD changed since
+    assert store.ADO_PROJECT_OUTDATED in store.outdated_items(store.get_workflow_state(CONV))
+
+    result = call(t, "update_ado_project", project_name="Svc API", project_description="Go REST API")
+    assert result["status"] == "success"
+    assert ado[-1] == ("update_ado_project", "proj-guid", "Svc API", "Go REST API")
+    project = store.get_project(CONV)
+    assert (project["project_name"], project["project_description"], project["proposal_trd_version"]) == ("Svc API", "Go REST API", 3)
+    assert store.outdated_items(store.get_workflow_state(CONV)) == []
+
+
+def test_agent_registers_the_six_workflow_tools():
     from agent_framework.openai import OpenAIChatCompletionClient
     client = OpenAIChatCompletionClient(model="test", api_key="k", azure_endpoint="https://example.openai.azure.com",
                                         api_version="2024-12-01-preview")
     agent = rsa.get_repo_setup_agent(client, CONV)
     assert [t.name for t in agent.default_options["tools"]] == [
-        "create_ado_project", "create_ado_repository", "save_repository_structure",
+        "create_ado_project", "update_ado_project", "create_ado_repository", "save_repository_structure",
         "update_repository_structure", "push_repository_structure"]
     instructions = agent.default_options["instructions"]
     for op in ["GENERATE_PROJECT_PROPOSAL", "UPDATE_PROJECT_PROPOSAL", "CREATE_PROJECT", "GENERATE_REPOSITORY_PROPOSAL",
                "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY", "GENERATE_REPOSITORY_STRUCTURE",
-               "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"]:
+               "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE", "UPDATE_ADO_PROJECT"]:
         assert op in instructions
     assert "template" not in instructions.lower()
     push_schema = {t.name: t for t in agent.default_options["tools"]}["push_repository_structure"].parameters()

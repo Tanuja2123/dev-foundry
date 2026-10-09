@@ -48,9 +48,16 @@ class _Query:
             row = copy.deepcopy(self.payload)
             row.setdefault(_PRIMARY_KEYS[self.table], str(uuid.uuid4()))
             row.setdefault("created_at", next(_clock))
+            # Column defaults from db/migrations/001 + 002
+            if self.table == "Project":
+                for column in ("prd_version", "trd_version", "trd_prd_version", "proposal_trd_version"):
+                    row.setdefault(column, 0)
             if self.table == "Repository":
                 row.setdefault("status", "PROPOSED")
                 row.setdefault("structure_version", 0)
+                row.setdefault("structure_trd_version", 0)
+                row.setdefault("pushed_structure", None)
+                row.setdefault("pushed_structure_version", None)
             for existing in rows:
                 if self.table == "Project" and existing["conv_id"] == row["conv_id"]:
                     raise Exception("duplicate key value violates unique constraint")

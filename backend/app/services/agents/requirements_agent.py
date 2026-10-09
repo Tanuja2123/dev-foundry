@@ -122,6 +122,9 @@ B. TRD STAGE (operation: "GENERATE_TRD" or "UPDATE_TRD"):
      * Preserve unaffected architecture layers and PRD context.
      * Update affected rationales and summarize changes in change_notes.
      * Return the complete updated TRD.
+     * If the requested technology is already part of the TRD (e.g. "Use PostgreSQL" when PostgreSQL is already the database),
+       do not change anything else: return the complete TRD with status "COMPLETE" and change_notes stating that the TRD already
+       uses it (and, if useful, how it is used). Never return an empty or partial TRD for such a request.
    - If critical technical constraints are genuinely missing and prevent making foundational choices, return status "CLARIFICATION_REQUIRED".
 
 ==================================================

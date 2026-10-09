@@ -3,7 +3,13 @@ from typing import Annotated, Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from agent_framework import Agent, FunctionTool, tool
 from agent_framework.openai import OpenAIChatCompletionClient
-from app.services.mcp.ado_mcp_server import create_ado_project, create_ado_repository, push_repository_files
+from app.services.mcp.ado_mcp_server import (
+    create_ado_project,
+    create_ado_repository,
+    push_repository_changes,
+    push_repository_files,
+    update_ado_project,
+)
 from app.services.mcp.ado_git_push import AdoPushError, DEFAULT_COMMIT_MESSAGE, MAX_FILES, MAX_FILE_BYTES
 from app.services import project_store as store
 from app.services.repo_structure import apply_structure_update, normalize_structure
@@ -34,6 +40,14 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
             raise store.StoreError(state["error"])
         return state
 
+    def _proposal_version(project: Dict[str, Any]) -> Dict[str, Any]:
+        """The project name/description now reflects the current TRD (only when versions are tracked)."""
+        return {"proposal_trd_version": project["trd_version"]} if "trd_version" in project else {}
+
+    def _project_ref(project: Dict[str, Any], fallback: str) -> str:
+        """Azure DevOps project id (stable across renames), falling back to the name."""
+        return project.get("ado_project_id") or fallback
+
     # Wrap ADO MCP tools for Microsoft Agent Framework
     @tool(
         name="create_ado_project",
@@ -58,9 +72,37 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
                 row = project or store.ensure_project(conversation_id)
                 store.update_project(row["project_id"], project_name=project_name,
                                      project_description=project_description, ado_project_id=result.get("id"),
-                                     ado_project_url=result.get("url"), workflow_stage=store.STAGE_REPOSITORY_REVIEW)
+                                     ado_project_url=result.get("url"), workflow_stage=store.STAGE_REPOSITORY_REVIEW,
+                                     **_proposal_version(row))
             except store.StoreError as e:
                 result["warning"] = f"Project created in Azure DevOps but not saved: {e}"
+        return result
+
+    @tool(
+        name="update_ado_project",
+        description="Rename the already created Azure DevOps project and/or update its description (e.g. after the PRD/TRD changed)."
+    )
+    def tool_update_ado_project(
+        project_name: Annotated[Optional[str], Field(description="New project name, or omit to keep the current name.")] = None,
+        project_description: Annotated[Optional[str], Field(description="New project description, or omit to keep it.")] = None,
+    ) -> Dict[str, Any]:
+        """TOOL 3 — ADO PROJECT UPDATE (the project id comes from the database, never from the model)."""
+        try:
+            project = load_state()["project"]
+        except store.StoreError as e:
+            return _error(str(e))
+        if not project or not project.get("ado_project_id"):
+            return _error("The Azure DevOps project has not been created yet; update the proposal instead.")
+        result = update_ado_project(project_id=project["ado_project_id"], project_name=project_name,
+                                    project_description=project_description)
+        if result.get("status") == "success":
+            try:
+                store.update_project(project["project_id"], project_name=result.get("name") or project.get("project_name"),
+                                     project_description=result.get("description") or project.get("project_description"),
+                                     ado_project_url=result.get("url") or project.get("ado_project_url"),
+                                     **_proposal_version(project))
+            except store.StoreError as e:
+                result["warning"] = f"Project updated in Azure DevOps but not saved: {e}"
         return result
 
     @tool(
@@ -83,7 +125,8 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
             return _error(f"Repository '{repository_name}' was already created ({repository.get('ado_repo_url')}).",
                           "ALREADY_CREATED")
 
-        result = create_ado_repository(project_id_or_name=project_id_or_name, repository_name=repository_name)
+        result = create_ado_repository(project_id_or_name=_project_ref(project, project_id_or_name),
+                                       repository_name=repository_name)
         if result.get("status") == "success":
             try:
                 row = store.propose_repository_name(project["project_id"], repository_name)
@@ -98,10 +141,16 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
         repository = load_state()["repository"]
         if not repository or not repository.get("ado_repo_id"):
             raise store.StoreError("Create the repository before saving its folder structure.")
-        if repository.get("status") == store.REPO_PUSHED:
-            raise store.StoreError(f"The structure of '{repository.get('repo_name')}' was already pushed "
-                                   f"(commit {repository.get('commit_id')}). It can no longer be changed here.")
         return repository
+
+    def _save(repository: Dict[str, Any], structure: List[Dict[str, str]]) -> Dict[str, Any]:
+        """Stores a new structure version (tagged with the TRD version it reflects) and reopens the review."""
+        project = load_state()["project"] or {}
+        row = store.save_structure(repository["repo_id"], structure, repository.get("structure_version") or 0,
+                                   trd_version=project.get("trd_version") if "trd_version" in project else None)
+        if project.get("project_id"):
+            store.update_project(project["project_id"], workflow_stage=store.STAGE_STRUCTURE_REVIEW)
+        return row
 
     def _structure_result(row: Dict[str, Any]) -> Dict[str, Any]:
         files = row.get("structure") or []
@@ -124,8 +173,7 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
         try:
             repository = _created_repository()
             structure = normalize_structure(files)
-            row = store.save_structure(repository["repo_id"], structure, repository.get("structure_version") or 0)
-            return _structure_result(row)
+            return _structure_result(_save(repository, structure))
         except AdoPushError as e:
             return _error(e.message, e.error_type)
         except store.StoreError as e:
@@ -150,8 +198,7 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
             if not upsert_files and not remove_paths:
                 return _error("No changes were provided.", "VALIDATION_ERROR")
             structure = apply_structure_update(repository["structure"], upsert_files, remove_paths)
-            row = store.save_structure(repository["repo_id"], structure, repository.get("structure_version") or 0)
-            return _structure_result(row)
+            return _structure_result(_save(repository, structure))
         except AdoPushError as e:
             return _error(e.message, e.error_type)
         except store.StoreError as e:
@@ -160,7 +207,8 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
     @tool(
         name="push_repository_structure",
         description=(
-            "Push the saved, user-approved folder structure to the repository's main branch as ONE initial commit. "
+            "Push the saved, user-approved folder structure to the repository's main branch as ONE commit: the initial "
+            "commit, or - if it was pushed before - a follow-up commit with only the differences (added/edited/deleted files). "
             "The files come from the saved structure (exactly what the user reviewed); do not pass files."
         )
     )
@@ -178,15 +226,27 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
         if not structure:
             return _error("There is no saved structure to push.")
 
-        result = push_repository_files(project_id_or_name=project.get("project_name") or project.get("ado_project_id"),
-                                       repository_name=repository["repo_name"], files=structure,
-                                       commit_message=commit_message)
+        project_ref = _project_ref(project, project.get("project_name"))
+        previously_pushed = repository.get("pushed_structure")
+        if previously_pushed is None and repository.get("status") == store.REPO_PUSHED:
+            return _error("This structure was already pushed.", "ALREADY_PUSHED")
+        if previously_pushed is not None:
+            result = push_repository_changes(project_id_or_name=project_ref, repository_name=repository["repo_name"],
+                                             base_files=previously_pushed, files=structure,
+                                             commit_message=commit_message, branch=repository.get("branch"))
+        else:
+            result = push_repository_files(project_id_or_name=project_ref, repository_name=repository["repo_name"],
+                                           files=structure, commit_message=commit_message)
         if result.get("status") == "success":
             result["structure_version"] = repository.get("structure_version")
+            result["push_type"] = "follow-up commit" if previously_pushed is not None else "initial commit"
+            fields = {"status": store.REPO_PUSHED, "commit_id": result.get("commit_id"),
+                      "commit_message": result.get("commit_message"), "branch": result.get("branch"),
+                      "pushed_at": datetime.now(timezone.utc).isoformat()}
+            if "pushed_structure" in repository:
+                fields.update(pushed_structure=structure, pushed_structure_version=repository.get("structure_version"))
             try:
-                store.update_repository(repository["repo_id"], status=store.REPO_PUSHED,
-                                        commit_id=result.get("commit_id"), commit_message=result.get("commit_message"),
-                                        branch=result.get("branch"), pushed_at=datetime.now(timezone.utc).isoformat())
+                store.update_repository(repository["repo_id"], **fields)
                 store.update_project(project["project_id"], workflow_stage=store.STAGE_COMPLETE)
             except store.StoreError as e:
                 result["warning"] = f"Structure pushed but not saved: {e}"
@@ -194,7 +254,7 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
             logger.error(f"[Repo_Setup_Agent] Structure push failed: {result.get('message')}")
         return result
 
-    return [tool_create_ado_project, tool_create_ado_repository, tool_save_repository_structure,
+    return [tool_create_ado_project, tool_update_ado_project, tool_create_ado_repository, tool_save_repository_structure,
             tool_update_repository_structure, tool_push_repository_structure]
 
 
@@ -225,22 +285,27 @@ Your responsibility is to handle Azure DevOps (ADO) project and repository setup
 - Each request ends with a "[Current Workflow State (database)]" block. It is the source of truth for what already exists:
   the approved PRD/TRD (approved_prd_json / approved_trd_json), the project proposal, whether the ADO project and repository
   were created, and the currently saved repository structure (current_structure_files_json).
-- The TRD was approved during the requirements stage. Do NOT ask to re-confirm or change the tech stack.
+- The PRD and TRD can be updated by the user at any time (by the Requirements_Agent). The state block lists "outdated"
+  items when an artifact no longer reflects the latest documents (e.g. ADO_PROJECT_OUTDATED, STRUCTURE_OUTDATED).
+  Always base names, descriptions and structures on the LATEST approved_prd_json / approved_trd_json.
 
 ==================================================
-3. TOOL BOUNDARY (EXACTLY FIVE TOOLS)
+3. TOOL BOUNDARY (EXACTLY SIX TOOLS)
 ==================================================
 1. create_ado_project(project_name, project_description): creates the ADO project.
-2. create_ado_repository(project_id_or_name, repository_name): creates an EMPTY Git repository in the ADO project.
-3. save_repository_structure(files: [{path, content}]): saves the COMPLETE proposed folder structure for review (nothing is pushed).
-4. update_repository_structure(upsert_files, remove_paths): applies only the requested changes to the saved structure.
-5. push_repository_structure(commit_message?): pushes the saved, approved structure to the main branch as ONE commit.
+2. update_ado_project(project_name?, project_description?): renames / re-describes the ALREADY CREATED ADO project.
+3. create_ado_repository(project_id_or_name, repository_name): creates an EMPTY Git repository in the ADO project.
+4. save_repository_structure(files: [{path, content}]): saves the COMPLETE proposed folder structure for review (nothing is pushed).
+5. update_repository_structure(upsert_files, remove_paths): applies only the requested changes to the saved structure.
+6. push_repository_structure(commit_message?): pushes the saved, approved structure to the main branch as ONE commit
+   (the initial commit, or a follow-up commit with only the differences if it was pushed before).
 
 Rules:
 - NEVER call create_ado_project without an explicit CREATE_PROJECT operation from the Orchestrator.
 - NEVER call create_ado_repository without an explicit CREATE_REPOSITORY operation from the Orchestrator.
 - Call save_repository_structure only during CREATE_REPOSITORY (after the repository was created successfully) or GENERATE_REPOSITORY_STRUCTURE.
 - Call update_repository_structure only during UPDATE_REPOSITORY_STRUCTURE.
+- Call update_ado_project only during UPDATE_ADO_PROJECT.
 - NEVER call push_repository_structure without an explicit PUSH_REPOSITORY_STRUCTURE operation (the user approved the shown structure).
 - If save/update returns a VALIDATION_ERROR, fix the files and call it again (at most 2 retries). Never retry a failed create or push.
 - If any tool returns status "error", report it as an error. NEVER claim success for a step whose tool returned an error.
@@ -304,15 +369,25 @@ G. GENERATE_REPOSITORY_STRUCTURE:
 - Return status "COMPLETE", workflow_stage "STRUCTURE_REVIEW", the structure summary, and next_action state "STRUCTURE_REVIEW" with allowed_operations: ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].
 
 H. UPDATE_REPOSITORY_STRUCTURE:
-- Triggered when the user requests changes to the shown structure (add, rename, move or remove files/folders).
+- Triggered when the user requests changes to the shown structure (add, rename, move or remove files/folders), or asks to update
+  the structure to reflect the latest TRD (STRUCTURE_OUTDATED). Also allowed after the structure was pushed: the changes are then
+  pushed later as a follow-up commit.
 - Use current_structure_files_json and call `update_repository_structure` with ONLY the needed changes
   (a rename/move = remove the old path + add the new file). Keep every folder non-empty.
 - Return status "COMPLETE", workflow_stage "STRUCTURE_REVIEW", the structure summary, and next_action state "STRUCTURE_REVIEW" with allowed_operations: ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].
 
+J. UPDATE_ADO_PROJECT:
+- Triggered when the already created ADO project's name and/or description should change (user request, or ADO_PROJECT_OUTDATED after PRD/TRD changes).
+- Use the name/description the user asked for; otherwise write an updated description from the latest PRD/TRD and keep the current name
+  unless the user asked to rename it. Call `update_ado_project` once.
+- If the tool succeeds: return status "COMPLETE", workflow_stage "ADO_PROJECT_UPDATED", project details (name, id, url, description),
+  and next_action with the allowed operations of the current stage.
+- If the tool returns an error: return status "ERROR", workflow_stage "ADO_PROJECT_UPDATE", error details.
+
 I. PUSH_REPOSITORY_STRUCTURE:
 - Triggered ONLY when the user explicitly approves the shown structure.
 - Call `push_repository_structure`. Pass commit_message only if the user asked for a specific one.
-- If the tool succeeds: return status "COMPLETE", workflow_stage "STRUCTURE_PUSHED", the push details exactly as returned (commit_id, commit_message, branch, files_count, commit_url), and next_action state "COMPLETE" with allowed_operations: [].
+- If the tool succeeds: return status "COMPLETE", workflow_stage "STRUCTURE_PUSHED", the push details exactly as returned (push_type, commit_id, commit_message, branch, files_count, commit_url, and changes for a follow-up commit), and next_action state "COMPLETE" with allowed_operations: [].
 - If the tool returns an error: return status "ERROR", workflow_stage "STRUCTURE_PUSH", error details, and next_action state "STRUCTURE_REVIEW" with allowed_operations: ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].
 
 STRUCTURE DESIGN RULES:
@@ -418,7 +493,9 @@ You MUST return valid JSON matching the exact schema for the operation. Do NOT i
     "commit_message": "<commit message>",
     "branch": "<branch>",
     "files_count": <number>,
-    "commit_url": "<url>"
+    "commit_url": "<url>",
+    "push_type": "<initial commit or follow-up commit>",
+    "changes": {"add": ["<path>"], "edit": ["<path>"], "delete": ["<path>"]}
   },
   "next_action": {
     "state": "COMPLETE",
@@ -426,10 +503,26 @@ You MUST return valid JSON matching the exact schema for the operation. Do NOT i
   }
 }
 
+--- For ADO PROJECT UPDATE SUCCESS (ADO_PROJECT_UPDATED) ---
+{
+  "status": "COMPLETE",
+  "workflow_stage": "ADO_PROJECT_UPDATED",
+  "project": {
+    "name": "<name>",
+    "description": "<description>",
+    "id": "<id>",
+    "url": "<url>"
+  },
+  "next_action": {
+    "state": "<current stage>",
+    "allowed_operations": [...]
+  }
+}
+
 --- For ERROR ---
 {
   "status": "ERROR",
-  "workflow_stage": "<PROJECT_CREATION, REPOSITORY_CREATION, STRUCTURE_REVIEW or STRUCTURE_PUSH>",
+  "workflow_stage": "<PROJECT_CREATION, ADO_PROJECT_UPDATE, REPOSITORY_CREATION, STRUCTURE_REVIEW or STRUCTURE_PUSH>",
   "error": {
     "message": "<concise error message>",
     "details": "<sanitized error details>"
