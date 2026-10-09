@@ -84,6 +84,67 @@ Open `http://localhost:5173` in your browser.
 
 ---
 
+# Azure DevOps Repository Setup
+
+After the PRD and TRD are approved, the Repo Setup Agent works through these steps. Each step waits for the user's explicit approval.
+
+1. **Project proposal:** the agent proposes an ADO project name and description from the PRD and TRD. The user can change them as often as needed.
+2. **Create project:** the agent creates the ADO project, waits until ADO has finished provisioning it, and saves the real project id. It then suggests a repository name.
+3. **Repository name:** the user can change the suggested name. The TRD isn't re-opened at this point.
+4. **Create repository:** the agent creates an empty repository. It then designs a folder structure from the TRD, for any tech stack, and shows it.
+5. **Structure review:** the user can request changes. Each change set produces a new structure version.
+6. **Push:** the agent pushes the approved structure to `main` as one commit.
+
+The structure shown in chat and the files pushed are guaranteed to be the same. Both come from the `Repository.structure` row in Supabase: the tree is drawn by code, and the push tool reads that row instead of taking files from the model.
+
+**Routing:** the Orchestrator returns a structured routing decision through Agent Framework's `response_format`. Code checks the decision against the operations allowed in the current stage (`backend/app/services/workflow_routing.py`).
+- **No skipped steps:** approving the PRD or TRD only confirms it. Moving on to the TRD or to repository setup needs an explicit request.
+- **Technology requests:** any message about technology updates the TRD, even if the TRD already uses that technology.
+
+**Changes at any stage:** the PRD and TRD can be updated at any time, even after the project, repository or push exist.
+- **Version tracking:** each document has a version number, and the TRD, project and structure record which version they were built from.
+- **Out-of-date items:** a PRD change marks the TRD as out of date. A TRD change marks the project proposal (or the created ADO project) and the repository structure as out of date.
+- **Updating them:** the agent offers to update each out-of-date item. Created ADO projects can be renamed or re-described. A structure that was already pushed is updated with a follow-up commit that adds, edits and deletes only what changed.
+- **Suggestion chips:** every chat reply, and every conversation load, includes `suggestions`, which are next steps worked out from the stored state. The dashboard shows them as clickable chips above the input box.
+
+- **Database:** run these migrations once, in order, in the Supabase SQL editor:
+  1. `backend/db/migrations/001_create_project_and_repository.sql` creates the `Project` table (one row per conversation, with the PRD, TRD and ADO project) and the `Repository` table (the structure, its version and the commit).
+  2. `backend/db/migrations/002_document_versions.sql` adds the version columns used to detect out-of-date items, plus the baseline used for follow-up commits.
+- **Code:**
+  - `backend/app/services/workflow_routing.py`: the routing decision, the stage checks and the suggestions.
+  - `backend/app/services/project_store.py`: database access and out-of-date detection.
+  - `backend/app/services/repo_structure.py`: validation, applying changes and drawing the tree.
+  - `backend/app/services/agents/repo_setup_agent.py`: the agent and its tools.
+  - `backend/app/services/mcp/ado_git_push.py`: the push, using the Azure DevOps Git *Pushes - Create* API.
+
+## Environment variables (root `.env`)
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `AZURE_DEVOPS_ORG_NAME` | yes | Organization name only, for example `contoso` |
+| `AZURE_DEVOPS_PAT` | yes | Personal access token with the scopes listed below |
+| `ADO_SCAFFOLD_COMMIT_MESSAGE` | no | Default commit message. The default is `chore: initial project scaffold`. |
+| `ADO_SCAFFOLD_DEFAULT_BRANCH` | no | Branch to create in the empty repository. The default is `main`. |
+
+The PAT needs **Project and Team (Read, write & manage)** to create projects and **Code (Read & write)** to create repositories and push.
+
+## Tests
+
+From `backend`, with the venv activated:
+
+```powershell
+# Unit tests (mocked ADO and Supabase, no network)
+pytest tests/test_ado_git_push.py tests/test_repo_structure.py tests/test_ado_tools.py tests/test_repo_setup_workflow.py
+
+# Live Azure DevOps tests. They create and delete repos inside a THROWAWAY project, plus one temporary project.
+$env:ADO_INTEGRATION_TESTS="1"; $env:ADO_IT_PROJECT="DevFoundry-Scaffold-IT"; pytest -m integration -s
+# Add the Supabase round-trip test (needs the migration):
+$env:SUPABASE_INTEGRATION_TESTS="1"
+
+# Full flow end to end (real Azure OpenAI, Supabase and Azure DevOps). This creates and deletes a "DevFoundry-E2E-<id>" project.
+$env:ADO_E2E_TESTS="1"; pytest -m e2e -s
+```
+
 # Build and Test
 
 **Backend tests** — from `backend/` with the virtual environment activated:

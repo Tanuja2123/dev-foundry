@@ -8,6 +8,7 @@ from app.services.conversation_service import (
     create_new_conversation,
     delete_conversation,
     get_conversation_by_id,
+    get_suggestions,
 )
 from app.core.logger import logger
 
@@ -29,7 +30,7 @@ def get_single_conversation(conversation_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation '{conversation_id}' not found",
         )
-    return conv
+    return {**conv, "suggestions": get_suggestions(conversation_id)}
 
 
 @router.post("/conversation", response_model=ConversationItem)
