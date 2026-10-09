@@ -20,3 +20,21 @@ export type ChatMessage = {
   role: ChatRole
   content: string
 }
+export type DocumentStatus = 'created' | 'not_created'
+
+export type DocumentDetails = {
+  status: DocumentStatus
+  content: string | null
+  updated_at?: string | null
+}
+
+export type ProjectOverview = {
+  conversation_id: string
+  project_name: string | null
+  description: string | null
+  created_at: string
+  prd: DocumentDetails
+  trd: DocumentDetails
+  project_link: string | null
+  repo_link: string | null
+}

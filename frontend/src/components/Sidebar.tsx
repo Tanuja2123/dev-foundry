@@ -8,6 +8,8 @@ type SidebarProps = {
   onNewProject?: () => void
   onDeleteProject?: (projectId: string) => void
   status?: string | null
+  activeView?: 'chat' | 'projects'
+  onNavigateProjects?: () => void
 }
 
 export function Sidebar({
@@ -17,6 +19,8 @@ export function Sidebar({
   onNewProject,
   onDeleteProject,
   status,
+  activeView = 'chat',
+  onNavigateProjects,
 }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState('')
 
@@ -44,6 +48,22 @@ export function Sidebar({
         >
           <span>＋</span> New Project
         </button>
+      )}
+
+      {/* Projects Section between New Project and Filter */}
+      {onNavigateProjects && (
+        <div className="sidebar-nav-section">
+          <button
+            type="button"
+            className={`sidebar-nav-item ${activeView === 'projects' ? 'active' : ''}`}
+            onClick={onNavigateProjects}
+            title="Open all projects in table format"
+          >
+            <span className="sidebar-nav-icon">📊</span>
+            <span className="sidebar-nav-label">Projects</span>
+            <span className="sidebar-nav-pill">Table</span>
+          </button>
+        </div>
       )}
 
       <div className="sidebar-search-box">

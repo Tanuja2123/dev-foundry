@@ -1,5 +1,6 @@
 import { useMsal } from '@azure/msal-react'
 import { useEffect, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
   continueChat,
   deleteConversation,
@@ -8,6 +9,7 @@ import {
 } from '../api/chat'
 import { ChatPanel } from '../components/ChatPanel'
 import { Sidebar } from '../components/Sidebar'
+import { ProjectsPage } from './ProjectsPage'
 import type { ChatMessage, Project } from '../types'
 
 function createId() {
@@ -26,6 +28,10 @@ function getInitials(name: string) {
 export function HomePage() {
   const { instance, accounts } = useMsal()
   const account = instance.getActiveAccount() ?? accounts[0]
+  const location = useLocation()
+  const navigate = useNavigate()
+  const isProjectsView = location.pathname === '/projects'
+
   const [conversations, setConversations] = useState<Project[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [listStatus, setListStatus] = useState<string | null>('Loading projects…')
@@ -128,11 +134,18 @@ export function HomePage() {
   const displayName = account?.name ?? account?.username ?? 'Signed in'
   const initials = getInitials(displayName)
 
+  function handleNavigateProjects() {
+    navigate('/projects')
+  }
+
   function selectConversation(conversationId: string) {
     setSelectedId(conversationId)
     setDraftMessages([])
     setDraftFiles([])
     setChatError(null)
+    if (location.pathname === '/projects') {
+      navigate('/')
+    }
   }
 
   function handleNewConversation() {
@@ -140,6 +153,9 @@ export function HomePage() {
     setDraftMessages([])
     setDraftFiles([])
     setChatError(null)
+    if (location.pathname === '/projects') {
+      navigate('/')
+    }
   }
 
   async function handleDeleteProject(projectId: string) {
@@ -276,11 +292,13 @@ export function HomePage() {
     <div className="app-shell">
       <Sidebar
         projects={conversations}
-        selectedProjectId={conversation?.id ?? null}
+        selectedProjectId={isProjectsView ? null : (conversation?.id ?? null)}
         onSelectProject={selectConversation}
         onNewProject={handleNewConversation}
         onDeleteProject={(id) => void handleDeleteProject(id)}
         status={listStatus}
+        activeView={isProjectsView ? 'projects' : 'chat'}
+        onNavigateProjects={handleNavigateProjects}
       />
       <div className="main">
         <header className="topbar">
@@ -289,18 +307,25 @@ export function HomePage() {
               <span>Workspaces</span>
               <span>›</span>
               <span>Requirements Engineering</span>
-              {conversation && (
+              {isProjectsView ? (
                 <>
                   <span>›</span>
-                  <span>{conversation.name}</span>
+                  <span>Projects Overview</span>
                 </>
+              ) : (
+                conversation && (
+                  <>
+                    <span>›</span>
+                    <span>{conversation.name}</span>
+                  </>
+                )
               )}
             </div>
             <div className="topbar-title-row">
-              <h1>{activeProject.name}</h1>
+              <h1>{isProjectsView ? 'Projects' : activeProject.name}</h1>
               <div className="topbar-status-chip">
                 <span className="topbar-status-dot" />
-                <span>Multi-Agent Copilot</span>
+                <span>{isProjectsView ? 'Portfolio View' : 'Multi-Agent Copilot'}</span>
               </div>
             </div>
           </div>
@@ -329,16 +354,23 @@ export function HomePage() {
           </div>
         </header>
 
-        <ChatPanel
-          project={activeProject}
-          messages={messages}
-          files={files}
-          sending={sending}
-          error={chatError}
-          onSend={(content) => void sendMessage(content)}
-          onFilesAdded={addFiles}
-          onRemoveFile={removeFile}
-        />
+        {isProjectsView ? (
+          <ProjectsPage
+            onSelectProject={selectConversation}
+            onNewProject={handleNewConversation}
+          />
+        ) : (
+          <ChatPanel
+            project={activeProject}
+            messages={messages}
+            files={files}
+            sending={sending}
+            error={chatError}
+            onSend={(content) => void sendMessage(content)}
+            onFilesAdded={addFiles}
+            onRemoveFile={removeFile}
+          />
+        )}
       </div>
     </div>
   )
