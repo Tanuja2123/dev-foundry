@@ -1,17 +1,16 @@
 import os
 import time
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 # Load root .env and local .env into environment
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../.env"))
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 load_dotenv()
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-
-from app.api.routes.conversations import router as conversation_router
-from app.core.logger import logger
+from app.api.routes.conversations import router as conversation_router  # noqa: E402
+from app.core.logger import logger  # noqa: E402
 
 
 app = FastAPI(

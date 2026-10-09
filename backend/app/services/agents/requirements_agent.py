@@ -1,7 +1,6 @@
 import os
 import shutil
 import tempfile
-from typing import Any
 from fastapi import UploadFile
 from docling.document_converter import DocumentConverter
 

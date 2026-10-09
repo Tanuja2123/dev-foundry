@@ -6,13 +6,15 @@ import { useNavigate } from 'react-router-dom'
 export function AuthCallbackPage() {
   const { instance, inProgress, accounts } = useMsal()
   const navigate = useNavigate()
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(() => {
+    const params = new URLSearchParams(window.location.search)
+    return params.get('error_description') ?? params.get('error')
+  })
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const azureError = params.get('error_description') ?? params.get('error')
     if (azureError) {
-      setError(azureError)
       return
     }
 
