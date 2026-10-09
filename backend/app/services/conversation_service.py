@@ -2,12 +2,11 @@ import json
 import os
 import time
 import uuid
-import asyncio
 from typing import Dict, List, Optional
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
-from agent_framework import Agent, AgentExecutor, Message
+from agent_framework import Agent, Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from supabase import create_client, Client
 

@@ -1,4 +1,19 @@
 import { useEffect, useMemo, useState } from 'react'
+import {
+  Check,
+  Circle,
+  Folder,
+  FileText,
+  Cpu,
+  Package,
+  Search,
+  X,
+  Cloud,
+  ExternalLink,
+  MessageSquare,
+  ChevronRight,
+  FolderOpen,
+} from 'lucide-react'
 import { fetchProjectsOverview } from '../api/projects'
 import { DocumentDrawer } from '../components/DocumentDrawer'
 import type { ProjectOverview } from '../types'
@@ -97,13 +112,6 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
       <div className="projects-header-section">
         <div className="projects-title-row">
           <div className="projects-title-left">
-            <div className="projects-breadcrumb">
-              <span>Workspaces</span>
-              <span>›</span>
-              <span>Requirements Engineering</span>
-              <span>›</span>
-              <span className="current">Projects Overview</span>
-            </div>
             <h1 className="projects-main-title">Projects</h1>
             <p className="projects-subtitle">
               Centralized portfolio overview of requirement documents, technical architectures, and cloud repositories.
@@ -114,28 +122,36 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
         {/* Metrics Bar */}
         <div className="projects-metrics-grid">
           <div className="metric-card">
-            <span className="metric-icon">📁</span>
+            <span className="metric-icon">
+              <Folder size={18} />
+            </span>
             <div className="metric-content">
               <span className="metric-value">{metrics.total}</span>
               <span className="metric-label">Total Projects</span>
             </div>
           </div>
           <div className="metric-card">
-            <span className="metric-icon">📄</span>
+            <span className="metric-icon">
+              <FileText size={18} />
+            </span>
             <div className="metric-content">
               <span className="metric-value">{metrics.prdCount}</span>
               <span className="metric-label">PRDs Created</span>
             </div>
           </div>
           <div className="metric-card">
-            <span className="metric-icon">⚙️</span>
+            <span className="metric-icon">
+              <Cpu size={18} />
+            </span>
             <div className="metric-content">
               <span className="metric-value">{metrics.trdCount}</span>
               <span className="metric-label">TRDs Created</span>
             </div>
           </div>
           <div className="metric-card">
-            <span className="metric-icon">📦</span>
+            <span className="metric-icon">
+              <Package size={18} />
+            </span>
             <div className="metric-content">
               <span className="metric-value">{metrics.repoCount}</span>
               <span className="metric-label">Repositories Linked</span>
@@ -146,7 +162,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
         {/* Filter and Search Bar */}
         <div className="projects-controls-bar">
           <div className="projects-search-input-wrapper">
-            <span className="projects-search-icon">🔍</span>
+            <Search size={15} className="projects-search-icon" />
             <input
               type="text"
               className="projects-search-input"
@@ -161,7 +177,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                 onClick={() => setSearchQuery('')}
                 title="Clear filter"
               >
-                ✕
+                <X size={13} />
               </button>
             )}
           </div>
@@ -182,7 +198,9 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
           </div>
         ) : filteredProjects.length === 0 ? (
           <div className="projects-empty-state">
-            <div className="projects-empty-icon">📂</div>
+            <div className="projects-empty-icon">
+              <FolderOpen size={36} />
+            </div>
             <h3>No matching projects found</h3>
             <p>
               {searchQuery
@@ -222,7 +240,9 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             onClick={() => onSelectProject(project.conversation_id)}
                             title={`Open workspace for ${displayName}`}
                           >
-                            <span className="project-cell-icon">📄</span>
+                            <span className="project-cell-icon">
+                              <FileText size={15} />
+                            </span>
                             <span className="project-cell-title">{displayName}</span>
                           </button>
                           <p className="project-cell-description" title={displayDesc}>
@@ -247,13 +267,17 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             }
                             title="Click to view PRD document"
                           >
-                            <span className="badge-icon">✓</span>
+                            <span className="badge-icon">
+                              <Check size={13} strokeWidth={2.5} />
+                            </span>
                             <span>Created</span>
-                            <span className="badge-arrow">›</span>
+                            <ChevronRight size={13} className="badge-arrow" />
                           </button>
                         ) : (
                           <span className="doc-status-badge not-created" title="PRD not created yet">
-                            <span className="badge-icon">○</span>
+                            <span className="badge-icon">
+                              <Circle size={10} strokeWidth={2} />
+                            </span>
                             <span>Not Created</span>
                           </span>
                         )}
@@ -275,13 +299,17 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             }
                             title="Click to view TRD document"
                           >
-                            <span className="badge-icon">✓</span>
+                            <span className="badge-icon">
+                              <Check size={13} strokeWidth={2.5} />
+                            </span>
                             <span>Created</span>
-                            <span className="badge-arrow">›</span>
+                            <ChevronRight size={13} className="badge-arrow" />
                           </button>
                         ) : (
                           <span className="doc-status-badge not-created" title="TRD not created yet">
-                            <span className="badge-icon">○</span>
+                            <span className="badge-icon">
+                              <Circle size={10} strokeWidth={2} />
+                            </span>
                             <span>Not Created</span>
                           </span>
                         )}
@@ -297,9 +325,9 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             className="external-resource-link"
                             title={`Open ${displayName} in Azure DevOps`}
                           >
-                            <span className="link-icon">☁️</span>
+                            <Cloud size={14} className="link-icon" />
                             <span>Project</span>
-                            <span className="link-ext-symbol">↗</span>
+                            <ExternalLink size={11} className="link-ext-symbol" />
                           </a>
                         ) : (
                           <span className="external-resource-empty" title="No project link available">
@@ -318,9 +346,9 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             className="external-resource-link repo"
                             title={`Open Git repository for ${displayName}`}
                           >
-                            <span className="link-icon">📦</span>
+                            <Package size={14} className="link-icon" />
                             <span>Repo</span>
-                            <span className="link-ext-symbol">↗</span>
+                            <ExternalLink size={11} className="link-ext-symbol" />
                           </a>
                         ) : (
                           <span className="external-resource-empty" title="No repository link available">
@@ -329,15 +357,16 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                         )}
                       </td>
 
-                      {/* 6. Action / Open Chat */}
+                      {/* 6. Action / Open Chat (Icon Only) */}
                       <td className="td-actions">
                         <button
                           type="button"
-                          className="project-action-btn"
+                          className="project-action-btn project-action-btn--icon"
                           onClick={() => onSelectProject(project.conversation_id)}
                           title={`Open chat workspace for ${displayName}`}
+                          aria-label={`Open chat workspace for ${displayName}`}
                         >
-                          <span>💬 Chat</span>
+                          <MessageSquare size={16} />
                         </button>
                       </td>
                     </tr>

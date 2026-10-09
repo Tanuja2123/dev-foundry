@@ -1,5 +1,25 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef, useEffect } from 'react'
+import {
+  PanelLeftClose,
+  Plus,
+  Table,
+  Search,
+  FileText,
+  Trash2,
+  LogOut,
+  User,
+  LogIn,
+} from 'lucide-react'
 import type { Project } from '../types'
+
+export type SidebarState = 'expanded' | 'collapsed' | 'hidden'
+
+type SidebarUserProfile = {
+  name: string
+  initials: string
+  onSignOut?: () => void
+  onSignIn?: () => void
+}
 
 type SidebarProps = {
   projects: Project[]
@@ -10,6 +30,11 @@ type SidebarProps = {
   status?: string | null
   activeView?: 'chat' | 'projects'
   onNavigateProjects?: () => void
+  sidebarState?: SidebarState
+  onSetSidebarState?: (state: SidebarState) => void
+  sidebarWidth?: number
+  onSetSidebarWidth?: (width: number) => void
+  user?: SidebarUserProfile | null
 }
 
 export function Sidebar({
@@ -21,8 +46,85 @@ export function Sidebar({
   status,
   activeView = 'chat',
   onNavigateProjects,
+  sidebarState = 'expanded',
+  onSetSidebarState,
+  sidebarWidth = 280,
+  onSetSidebarWidth,
+  user,
 }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState('')
+  const [isProfileOpen, setIsProfileOpen] = useState(false)
+  const [isResizing, setIsResizing] = useState(false)
+  const profileContainerRef = useRef<HTMLDivElement>(null)
+
+  const isExpanded = sidebarState !== 'hidden'
+  const isHidden = sidebarState === 'hidden'
+
+  // Close profile popup on click outside or Escape
+  useEffect(() => {
+    if (!isProfileOpen) return
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        profileContainerRef.current &&
+        !profileContainerRef.current.contains(event.target as Node)
+      ) {
+        setIsProfileOpen(false)
+      }
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setIsProfileOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handleClickOutside)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isProfileOpen])
+
+  // Drag resizer handling to dynamically set sidebar custom width
+  const handleMouseDownResize = (e: React.MouseEvent) => {
+    e.preventDefault()
+    setIsResizing(true)
+    const startX = e.clientX
+    const startWidth = sidebarWidth
+
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const deltaX = moveEvent.clientX - startX
+      const nextWidth = Math.min(Math.max(Math.round(startWidth + deltaX), 180), 520)
+      onSetSidebarWidth?.(nextWidth)
+      if (sidebarState !== 'expanded') {
+        onSetSidebarState?.('expanded')
+      }
+    }
+
+    const handleMouseUp = () => {
+      setIsResizing(false)
+      window.removeEventListener('mousemove', handleMouseMove)
+      window.removeEventListener('mouseup', handleMouseUp)
+    }
+
+    window.addEventListener('mousemove', handleMouseMove)
+    window.addEventListener('mouseup', handleMouseUp)
+  }
+
+  // Wheel resize scroller on resizer handle or width badge
+  const handleWheelResize = (e: React.WheelEvent) => {
+    if (!isExpanded) return
+    e.preventDefault()
+    const step = e.deltaY < 0 ? 12 : -12
+    const nextWidth = Math.min(Math.max(sidebarWidth + step, 180), 520)
+    onSetSidebarWidth?.(nextWidth)
+  }
+
+  const handleDoubleClickReset = () => {
+    onSetSidebarWidth?.(280)
+  }
 
   const filteredProjects = useMemo(() => {
     const q = searchQuery.trim().toLowerCase()
@@ -31,61 +133,92 @@ export function Sidebar({
   }, [projects, searchQuery])
 
   return (
-    <aside className="sidebar">
+    <aside
+      className={`sidebar sidebar-${sidebarState} ${isHidden ? 'hidden' : ''} ${isResizing ? 'is-resizing' : ''}`}
+      style={isExpanded ? { width: `${sidebarWidth}px` } : undefined}
+      aria-label="Sidebar navigation"
+      aria-hidden={isHidden}
+    >
+      {/* Top Header / Brand Row with Complete Collapser */}
       <div className="sidebar-brand-container">
         <div className="sidebar-brand">
-          <div className="ms-copilot-icon">✨</div>
           <span>DevFoundry</span>
         </div>
-        <span className="ms-badge-pill">Copilot</span>
+
+        {/* Complete Collapser Control */}
+        <div className="sidebar-state-controls">
+          <button
+            type="button"
+            className="sidebar-control-btn"
+            onClick={() => onSetSidebarState?.('hidden')}
+            title="Collapse sidebar (Ctrl+B)"
+            aria-label="Collapse sidebar completely"
+          >
+            <PanelLeftClose size={18} />
+          </button>
+        </div>
       </div>
 
+      {/* New Project Button */}
       {onNewProject && (
         <button
           type="button"
           className="new-project-button"
           onClick={onNewProject}
+          title={isExpanded ? 'New Project (Ctrl+Shift+O or Alt+N)' : 'New Project'}
+          aria-label="New Project"
+          aria-keyshortcuts="Control+Shift+O Alt+N"
         >
-          <span>＋</span> New Project
+          <Plus size={16} />
+          {isExpanded && <span>New Project</span>}
         </button>
       )}
 
-      {/* Projects Section between New Project and Filter */}
+      {/* Projects Overview Navigation Button */}
       {onNavigateProjects && (
         <div className="sidebar-nav-section">
           <button
             type="button"
             className={`sidebar-nav-item ${activeView === 'projects' ? 'active' : ''}`}
             onClick={onNavigateProjects}
-            title="Open all projects in table format"
+            title="Projects overview (Table view)"
+            aria-label="Projects overview"
           >
-            <span className="sidebar-nav-icon">📊</span>
-            <span className="sidebar-nav-label">Projects</span>
-            <span className="sidebar-nav-pill">Table</span>
+            <span className="sidebar-nav-icon">
+              <Table size={16} />
+            </span>
+            {isExpanded && <span className="sidebar-nav-label">Projects</span>}
           </button>
         </div>
       )}
 
-      <div className="sidebar-search-box">
-        <span className="sidebar-search-icon">🔍</span>
-        <input
-          type="text"
-          className="sidebar-search-input"
-          placeholder="Filter projects…"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-        />
-      </div>
+      {/* Project Search & Filter (Expanded Only) */}
+      {isExpanded && (
+        <div className="sidebar-search-box">
+          <Search size={14} className="sidebar-search-icon" />
+          <input
+            type="text"
+            className="sidebar-search-input"
+            placeholder="Filter projects…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
+      )}
 
-      <div className="sidebar-header-row">
-        <p className="sidebar-label">Projects</p>
-        <span className="sidebar-count">{filteredProjects.length}</span>
-      </div>
+      {/* Projects List Header (Expanded Only) */}
+      {isExpanded && (
+        <div className="sidebar-header-row">
+          <p className="sidebar-label">Projects</p>
+          <span className="sidebar-count">{filteredProjects.length}</span>
+        </div>
+      )}
 
-      {status && <p className="sidebar-status">{status}</p>}
+      {status && isExpanded && <p className="sidebar-status">{status}</p>}
 
+      {/* Project List */}
       <nav className="project-list" aria-label="Projects">
-        {filteredProjects.length === 0 && !status && (
+        {isExpanded && filteredProjects.length === 0 && !status && (
           <p className="sidebar-status">
             {searchQuery ? 'No matching projects.' : 'No projects yet.'}
           </p>
@@ -103,11 +236,14 @@ export function Sidebar({
                 className="project-item-button"
                 onClick={() => onSelectProject(project.id)}
                 title={project.name}
+                aria-label={project.name}
               >
-                <span className="project-item-icon">📄</span>
-                <span className="project-item-name">{project.name}</span>
+                <span className="project-item-icon">
+                  <FileText size={15} />
+                </span>
+                {isExpanded && <span className="project-item-name">{project.name}</span>}
               </button>
-              {onDeleteProject && (
+              {isExpanded && onDeleteProject && (
                 <button
                   type="button"
                   className="project-item-delete"
@@ -120,13 +256,105 @@ export function Sidebar({
                     }
                   }}
                 >
-                  🗑️
+                  <Trash2 size={13} />
                 </button>
               )}
             </div>
           )
         })}
       </nav>
+
+      {/* Bottom User / Account Section (ChatGPT Style) */}
+      <div className="sidebar-footer">
+        {user ? (
+          <div className="sidebar-user-container" ref={profileContainerRef}>
+            <button
+              type="button"
+              className={`sidebar-user-card ${isProfileOpen ? 'open' : ''}`}
+              onClick={() => setIsProfileOpen((prev) => !prev)}
+              aria-expanded={isProfileOpen}
+              aria-haspopup="menu"
+              title={`Account options for ${user.name}`}
+            >
+              <div className="sidebar-user-info">
+                <div className="sidebar-avatar-monogram">
+                  {user.initials || <User size={14} />}
+                </div>
+                {isExpanded && (
+                  <div className="sidebar-user-details">
+                    <span className="sidebar-user-name">{user.name}</span>
+                  </div>
+                )}
+              </div>
+            </button>
+
+            {/* Profile Popover / Dropdown Menu when clicked */}
+            {isProfileOpen && (
+              <div
+                className="sidebar-user-popup"
+                role="menu"
+                aria-label="User account menu"
+              >
+                <div className="sidebar-popup-user-section">
+                  <div className="sidebar-popup-avatar">
+                    {user.initials || <User size={18} />}
+                  </div>
+                  <div className="sidebar-popup-identity">
+                    {/* COMPLETE FULL USER NAME - No ellipsis truncation */}
+                    <span className="sidebar-popup-name" title={user.name}>
+                      {user.name}
+                    </span>
+                    <span className="sidebar-popup-tag">Microsoft Account</span>
+                  </div>
+                </div>
+
+                <div className="sidebar-popup-divider" />
+
+                {/* Signout button with icon and written text under user name */}
+                {user.onSignOut && (
+                  <button
+                    type="button"
+                    className="sidebar-popup-signout-btn"
+                    role="menuitem"
+                    onClick={() => {
+                      setIsProfileOpen(false)
+                      user.onSignOut?.()
+                    }}
+                  >
+                    <LogOut size={16} />
+                    <span>Sign out</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <button
+            type="button"
+            className="sidebar-signin-btn"
+            title="Sign in with Microsoft"
+          >
+            <LogIn size={16} />
+            {isExpanded && <span>Sign in</span>}
+          </button>
+        )}
+      </div>
+
+      {/* Draggable Resizer / Scroller on the right border */}
+      {isExpanded && (
+        <div
+          className={`sidebar-resizer ${isResizing ? 'is-dragging' : ''}`}
+          onMouseDown={handleMouseDownResize}
+          onWheel={handleWheelResize}
+          onDoubleClick={handleDoubleClickReset}
+          title="Drag or scroll to adjust sidebar width (Double-click to reset)"
+          role="separator"
+          aria-orientation="vertical"
+        >
+          <div className="sidebar-resizer-line" />
+          <div className="sidebar-resizer-handle" />
+        </div>
+      )}
     </aside>
   )
 }
