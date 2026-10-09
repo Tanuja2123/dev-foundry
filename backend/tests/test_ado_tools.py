@@ -66,6 +66,28 @@ def test_push_repository_files_maps_push_error(monkeypatch):
                       "message": "Branch 'main' already has commits", "details": ""}
 
 
+def test_push_repository_scaffold_keeps_pr14_contract(captured_push):
+    result = server.push_repository_scaffold("Proj", "repo", [
+        {"path": "docs/", "content": ""},                 # folder -> .gitkeep with placeholder
+        {"path": "README.md", "content": "# Repo"},
+        {"path": "/README.md", "content": "duplicate"},   # duplicate -> first one wins
+        {"path": "src/empty.py", "content": None},       # empty file -> placeholder
+        "not-a-dict",
+    ])
+    call = captured_push[0]
+    assert call["files"] == {"/docs/.gitkeep": server.SCAFFOLD_PLACEHOLDER, "/README.md": "# Repo",
+                             "/src/empty.py": "# empty.py\n"}
+    assert (call["branch"], call["allow_existing_branch"]) == ("main", True)
+    assert call["commit_message"] == "Initial commit: Project structure scaffolding"
+    assert result["status"] == "success" and result["repository"] == "repo"
+    assert result["pushed_files_count"] == 3 and "commit_id" in result
+
+
+def test_push_repository_scaffold_without_files_adds_readme(captured_push):
+    server.push_repository_scaffold("Proj", "repo", [])
+    assert list(captured_push[0]["files"]) == ["/README.md"]
+
+
 def test_push_repository_files_validation_happens_without_network(ado_env, monkeypatch):
     def no_network(*args, **kwargs):
         raise AssertionError("network must not be used")

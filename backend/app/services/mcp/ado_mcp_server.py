@@ -400,5 +400,62 @@ def update_ado_project(project_id: str, project_name: Optional[str] = None,
         }
 
 
+SCAFFOLD_PLACEHOLDER = "# Keeps this folder in Git until real files are added.\n"
+
+
+@mcp.tool(name="push_repository_scaffold", description="Push initial directory structure, starter boilerplate files, and .gitkeep placeholder files to an Azure DevOps Git repository.")
+def push_repository_scaffold(
+    project_id_or_name: str,
+    repository_name_or_id: str,
+    files: List[Dict[str, str]],
+    commit_message: str = "Initial commit: Project structure scaffolding"
+) -> Dict[str, Any]:
+    """
+    TOOL 6 — ADO REPOSITORY SCAFFOLD INITIALIZATION (contract from PR 14, kept for existing callers)
+    Pushes files to branch 'main' as one commit. Folder paths ("docs/") become .gitkeep files, empty files get a
+    short placeholder (Azure DevOps would store them empty), duplicates keep the first entry, and a README.md is
+    added when no files are given. Uses the validated push in ado_git_push (path checks, exact branch lookup, retries).
+    """
+    from app.services.mcp.ado_git_push import AdoPushError, push_files_to_repo
+
+    logger.info(f"[ADO MCP] Tool invoked: push_repository_scaffold(project='{project_id_or_name}', "
+                f"repo='{repository_name_or_id}', file_count={len(files) if files else 0})")
+
+    file_map: Dict[str, str] = {}
+    for item in files or []:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path", "")).strip().replace("\\", "/")
+        if not path:
+            continue
+        if not path.startswith("/"):
+            path = "/" + path
+        if path.endswith("/"):
+            path += ".gitkeep"
+        if path in file_map:
+            continue
+        content = "" if item.get("content") is None else str(item.get("content"))
+        if not content.strip():
+            content = SCAFFOLD_PLACEHOLDER if path.endswith(".gitkeep") else f"# {path.rsplit('/', 1)[-1]}\n"
+        file_map[path] = content
+    if not file_map:
+        file_map["/README.md"] = f"# {repository_name_or_id}\n\nProject initialized with DevFoundry.\n"
+
+    try:
+        result = push_files_to_repo(project_id_or_name, repository_name_or_id, file_map,
+                                    commit_message=commit_message, branch="main", allow_existing_branch=True)
+        result.update({"repository": repository_name_or_id, "pushed_files_count": result.get("files_count"),
+                       "url": result.get("repository_url")})
+        return result
+    except AdoPushError as e:
+        logger.error(f"[ADO MCP] Scaffold push failed: {e.error_type}: {e.message}")
+        return e.to_dict()
+    except Exception as e:
+        err_msg = sanitize_error(str(e), get_ado_config().get("pat"))
+        logger.error(f"[ADO MCP] Exception during repository scaffold push: {err_msg}")
+        return {"status": "error", "message": "Azure DevOps repository scaffold push encountered an unexpected error.",
+                "details": err_msg}
+
+
 if __name__ == "__main__":
     mcp.run()

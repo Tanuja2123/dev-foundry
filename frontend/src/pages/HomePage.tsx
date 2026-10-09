@@ -43,6 +43,19 @@ export function HomePage() {
   const [draftFiles, setDraftFiles] = useState<File[]>([])
   const [sending, setSending] = useState(false)
   const [chatError, setChatError] = useState<string | null>(null)
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    const saved = localStorage.getItem('theme')
+    return saved === 'dark' ? 'dark' : 'light'
+  })
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+  }, [theme])
+
+  function toggleTheme() {
+    setTheme((curr) => (curr === 'light' ? 'dark' : 'light'))
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -305,6 +318,15 @@ export function HomePage() {
           </div>
 
           <div className="topbar-user">
+            <button
+              type="button"
+              className="theme-toggle-btn"
+              title={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
+              onClick={toggleTheme}
+            >
+              <span>{theme === 'light' ? '🌙' : '☀️'}</span>
+              <span>{theme === 'light' ? 'Dark' : 'Light'}</span>
+            </button>
             <div className="ms-avatar-monogram" title={displayName}>
               {initials}
             </div>
