@@ -10,7 +10,7 @@ import {
 import { ChatPanel } from '../components/ChatPanel'
 import { Sidebar } from '../components/Sidebar'
 import { ProjectsPage } from './ProjectsPage'
-import type { ChatMessage, Project } from '../types'
+import type { ChatMessage, Project, Suggestion } from '../types'
 
 function createId() {
   return crypto.randomUUID()
@@ -40,6 +40,10 @@ export function HomePage() {
   >({})
   const [filesByConversation, setFilesByConversation] = useState<
     Record<string, File[]>
+  >({})
+  // Next-step suggestions computed by the backend from the stored workflow state
+  const [suggestionsByConversation, setSuggestionsByConversation] = useState<
+    Record<string, Suggestion[]>
   >({})
   const [draftMessages, setDraftMessages] = useState<ChatMessage[]>([])
   const [draftFiles, setDraftFiles] = useState<File[]>([])
@@ -100,6 +104,10 @@ export function HomePage() {
       try {
         const data = await getConversation(selectedId!)
         if (cancelled) return
+        setSuggestionsByConversation((prev) => ({
+          ...prev,
+          [selectedId!]: data.suggestions ?? [],
+        }))
         if (Array.isArray(data.content) && data.content.length > 0) {
           const loaded: ChatMessage[] = data.content.map((m) => ({
             id: createId(),
@@ -209,6 +217,10 @@ export function HomePage() {
         role: 'assistant',
         content: result.response,
       }
+      setSuggestionsByConversation((prev) => ({
+        ...prev,
+        [result.conversation_id]: result.suggestions ?? [],
+      }))
 
       if (isNew) {
         const newId = result.conversation_id
@@ -364,6 +376,7 @@ export function HomePage() {
             project={activeProject}
             messages={messages}
             files={files}
+            suggestions={conversation ? (suggestionsByConversation[conversation.id] ?? []) : []}
             sending={sending}
             error={chatError}
             onSend={(content) => void sendMessage(content)}

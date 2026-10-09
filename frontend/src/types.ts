@@ -8,9 +8,15 @@ export type Conversation = {
   title: string
 }
 
+export type Suggestion = {
+  label: string
+  prompt: string
+}
+
 export type ChatApiResponse = {
   conversation_id: string
   response: string
+  suggestions?: Suggestion[]
 }
 
 export type ChatRole = 'user' | 'assistant'

@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
+import { parseInline, parseMarkdown, type Block } from './markdownBlocks'
 
 type MarkdownRendererProps = {
   content: string
@@ -32,130 +33,102 @@ function CodeBlock({ code, language }: { code: string; language: string }) {
   )
 }
 
-function formatInline(text: string) {
-  // Process inline code first: `foo`
-  const codeParts = text.split(/(`[^`]+`)/g)
-  return codeParts.map((part, i) => {
-    if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
-      return <code key={i}>{part.slice(1, -1)}</code>
+function formatInline(text: string, keyPrefix = ''): ReactNode[] {
+  return parseInline(text).map((token, i) => {
+    const key = `${keyPrefix}${i}`
+    switch (token.type) {
+      case 'code':
+        return <code key={key}>{token.text}</code>
+      case 'link':
+        // Only http(s) URLs are turned into anchors
+        return (
+          <a key={key} href={token.href} target="_blank" rel="noopener noreferrer">
+            {formatInline(token.text, `${key}-`)}
+          </a>
+        )
+      case 'bold':
+        return <strong key={key}>{formatInline(token.text, `${key}-`)}</strong>
+      case 'italic':
+        return <em key={key}>{token.text}</em>
+      default:
+        return token.text
     }
-
-    // Process bold text: **bold**
-    const boldParts = part.split(/(\*\*[^*]+\*\*)/g)
-    return boldParts.map((subPart, j) => {
-      if (subPart.startsWith('**') && subPart.endsWith('**') && subPart.length > 4) {
-        return <strong key={`${i}-${j}`}>{subPart.slice(2, -2)}</strong>
-      }
-      return subPart
-    })
   })
+}
+
+function renderBlock(block: Block, key: number): ReactNode {
+  switch (block.type) {
+    case 'code':
+      return <CodeBlock key={key} code={block.content} language={block.language} />
+    case 'heading': {
+      const Tag = `h${block.level}` as 'h1' | 'h2' | 'h3' | 'h4'
+      return <Tag key={key}>{formatInline(block.text)}</Tag>
+    }
+    case 'hr':
+      return <hr key={key} />
+    case 'quote':
+      return (
+        <blockquote key={key}>
+          {block.lines.map((line, i) => (
+            <span key={i}>
+              {formatInline(line)}
+              {i < block.lines.length - 1 && <br />}
+            </span>
+          ))}
+        </blockquote>
+      )
+    case 'list': {
+      const items = block.items.map((item, i) => (
+        <li key={i} className={item.depth ? `md-depth-${item.depth}` : undefined}>
+          {formatInline(item.text)}
+        </li>
+      ))
+      return block.ordered ? (
+        <ol key={key} start={block.start}>
+          {items}
+        </ol>
+      ) : (
+        <ul key={key}>{items}</ul>
+      )
+    }
+    case 'table':
+      return (
+        <div key={key} className="message-table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                {block.header.map((cell, i) => (
+                  <th key={i}>{formatInline(cell)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {block.rows.map((row, r) => (
+                <tr key={r}>
+                  {row.map((cell, c) => (
+                    <td key={c}>{formatInline(cell)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )
+    default:
+      return (
+        <p key={key}>
+          {block.lines.map((line, i) => (
+            <span key={i}>
+              {formatInline(line)}
+              {i < block.lines.length - 1 && <br />}
+            </span>
+          ))}
+        </p>
+      )
+  }
 }
 
 export function MarkdownRenderer({ content }: MarkdownRendererProps) {
   if (!content) return null
-
-  // Split code blocks from text
-  const tokens: Array<
-    | { type: 'code'; language: string; content: string }
-    | { type: 'text'; content: string }
-  > = []
-
-  const codeBlockRegex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-
-  while ((match = codeBlockRegex.exec(content)) !== null) {
-    if (match.index > lastIndex) {
-      tokens.push({
-        type: 'text',
-        content: content.slice(lastIndex, match.index),
-      })
-    }
-    tokens.push({
-      type: 'code',
-      language: match[1] || '',
-      content: match[2].trimEnd(),
-    })
-    lastIndex = match.index + match[0].length
-  }
-
-  if (lastIndex < content.length) {
-    tokens.push({
-      type: 'text',
-      content: content.slice(lastIndex),
-    })
-  }
-
-  return (
-    <div className="message-body">
-      {tokens.map((token, tokenIdx) => {
-        if (token.type === 'code') {
-          return (
-            <CodeBlock
-              key={tokenIdx}
-              code={token.content}
-              language={token.language}
-            />
-          )
-        }
-
-        // Parse paragraphs and line blocks
-        const paragraphs = token.content.split(/\n\n+/)
-        return paragraphs.map((para, paraIdx) => {
-          const trimmed = para.trim()
-          if (!trimmed) return null
-
-          // Headings
-          if (trimmed.startsWith('#### ')) {
-            return <h4 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(5))}</h4>
-          }
-          if (trimmed.startsWith('### ')) {
-            return <h3 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(4))}</h3>
-          }
-          if (trimmed.startsWith('## ')) {
-            return <h2 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(3))}</h2>
-          }
-          if (trimmed.startsWith('# ')) {
-            return <h1 key={`${tokenIdx}-${paraIdx}`}>{formatInline(trimmed.slice(2))}</h1>
-          }
-
-          // Blockquote
-          if (trimmed.startsWith('> ')) {
-            return (
-              <blockquote key={`${tokenIdx}-${paraIdx}`}>
-                {formatInline(trimmed.replace(/^>\s*/gm, ''))}
-              </blockquote>
-            )
-          }
-
-          // Bullet lists
-          const lines = trimmed.split('\n')
-          const isBulletList = lines.every((l) => /^\s*([*•-]\s|\d+\.\s)/.test(l))
-          if (isBulletList && lines.length > 0) {
-            return (
-              <ul key={`${tokenIdx}-${paraIdx}`}>
-                {lines.map((line, liIdx) => (
-                  <li key={liIdx}>
-                    {formatInline(line.replace(/^\s*([*•-]\s|\d+\.\s)/, ''))}
-                  </li>
-                ))}
-              </ul>
-            )
-          }
-
-          // Standard paragraph with line breaks
-          return (
-            <p key={`${tokenIdx}-${paraIdx}`}>
-              {lines.map((line, lineIdx) => (
-                <span key={lineIdx}>
-                  {formatInline(line)}
-                  {lineIdx < lines.length - 1 && <br />}
-                </span>
-              ))}
-            </p>
-          )
-        })
-      })}
-    </div>
-  )
+  return <div className="message-body">{parseMarkdown(content).map(renderBlock)}</div>
 }

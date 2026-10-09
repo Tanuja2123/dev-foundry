@@ -1,4 +1,4 @@
-import type { ChatApiResponse, Conversation } from '../types'
+import type { ChatApiResponse, Conversation, Suggestion } from '../types'
 
 function apiBaseUrl() {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim()
@@ -27,6 +27,7 @@ export async function getConversation(conversationId: string): Promise<{
   conv_id: string
   title: string
   content?: Array<{ role: 'user' | 'assistant'; text: string }>
+  suggestions?: Suggestion[]
 }> {
   const response = await fetch(`${apiBaseUrl()}/api/conversation/${conversationId}`)
   if (!response.ok) {
