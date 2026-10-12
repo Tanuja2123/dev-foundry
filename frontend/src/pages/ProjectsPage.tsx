@@ -5,10 +5,9 @@ import {
   Folder,
   FileText,
   Cpu,
-  Package,
+  GitBranch,
   Search,
   X,
-  Cloud,
   ExternalLink,
   MessageSquare,
   ChevronRight,
@@ -150,7 +149,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
           </div>
           <div className="metric-card">
             <span className="metric-icon">
-              <Package size={18} />
+              <GitBranch size={18} />
             </span>
             <div className="metric-content">
               <span className="metric-value">{metrics.repoCount}</span>
@@ -241,7 +240,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             title={`Open workspace for ${displayName}`}
                           >
                             <span className="project-cell-icon">
-                              <FileText size={15} />
+                              <Folder size={15} />
                             </span>
                             <span className="project-cell-title">{displayName}</span>
                           </button>
@@ -325,7 +324,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             className="external-resource-link"
                             title={`Open ${displayName} in Azure DevOps`}
                           >
-                            <Cloud size={14} className="link-icon" />
+                            <Folder size={14} className="link-icon" />
                             <span>Project</span>
                             <ExternalLink size={11} className="link-ext-symbol" />
                           </a>
@@ -346,7 +345,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             className="external-resource-link repo"
                             title={`Open Git repository for ${displayName}`}
                           >
-                            <Package size={14} className="link-icon" />
+                            <GitBranch size={14} className="link-icon" />
                             <span>Repo</span>
                             <ExternalLink size={11} className="link-ext-symbol" />
                           </a>

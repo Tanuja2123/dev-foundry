@@ -228,21 +228,21 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
     # Only suggest moving forward when nothing upstream is outdated
     if not suggestions:
         if stage == store.STAGE_PRD_REVIEW:
-            suggestions.append(("Create the TRD", "The PRD looks good. Please create the Technical Requirements Document (TRD)."))
+            suggestions.append(("Create the TRD", "The PRD looks comprehensive and approved. Please generate the detailed Technical Requirements Document (TRD) covering technology stack, system architecture, and API design."))
         elif stage == store.STAGE_TRD_REVIEW:
-            suggestions.append(("Proceed to repository setup", "The TRD looks good. Let's proceed with repository setup."))
+            suggestions.append(("Proceed to repository setup", "The TRD architecture and technology stack are approved. Let's proceed with repository setup and propose the Azure DevOps project name and description."))
         elif stage == store.STAGE_PROJECT_REVIEW:
-            suggestions.append(("Create the project", "Looks good, create the Azure DevOps project."))
+            suggestions.append(("Create the project", "The proposed Azure DevOps project name and description look good. Please go ahead and create the Azure DevOps project."))
         elif stage == store.STAGE_REPOSITORY_REVIEW:
             if repository.get("repo_name"):
-                suggestions.append(("Create the repository", "Approved, create the repository."))
+                suggestions.append(("Create the repository", "The proposed repository name is approved. Please create the Git repository in Azure DevOps."))
             else:
-                suggestions.append(("Suggest a repository name", "Please suggest a repository name."))
+                suggestions.append(("Suggest a repository name", "Please analyze the project requirements and recommend suitable repository names."))
     if store.STRUCTURE_CHANGES_NOT_PUSHED in outdated and store.STRUCTURE_OUTDATED not in outdated:
-        suggestions.append(("Push the changes", "Looks good, push the structure changes as a new commit."))
+        suggestions.append(("Push the changes", "The folder structure changes look good. Please push these structure updates as a new commit to Azure DevOps."))
     elif stage == store.STAGE_STRUCTURE_REVIEW and repository.get("pushed_structure") is None and not suggestions:
         if not repository.get("structure"):
-            suggestions.append(("Propose folder structure", "Please propose the repository folder structure."))
+            suggestions.append(("Propose folder structure", "Please propose the complete skeleton folder structure for the repository based on the approved TRD architecture."))
         else:
-            suggestions.append(("Push to main", "Looks good, push the structure to the main branch."))
+            suggestions.append(("Push to main", "The proposed repository folder structure is approved. Please push the initial structure to the main branch in Azure DevOps."))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]

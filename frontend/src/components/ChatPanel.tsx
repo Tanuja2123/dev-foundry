@@ -2,7 +2,6 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import {
   ArrowUp,
   Paperclip,
-  Sparkles,
   User,
   X,
   ArrowDown,
@@ -41,9 +40,6 @@ function PendingResponse() {
   return (
     <article className="bubble bubble-assistant bubble-pending" role="status" aria-live="polite">
       <div className="bubble-header">
-        <div className="bubble-avatar-icon bubble-avatar-assistant">
-          <Sparkles size={14} />
-        </div>
         <span className="bubble-role-name">DevFoundry Copilot</span>
       </div>
       <div className="pending-body">
@@ -143,6 +139,13 @@ export function ChatPanel({
     }, 60)
   }
 
+  function handleApplySuggestion(prompt: string) {
+    setDraft(prompt)
+    setTimeout(() => {
+      textareaRef.current?.focus()
+    }, 10)
+  }
+
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -152,8 +155,8 @@ export function ChatPanel({
 
   return (
     <section className="chat-panel">
-      <div className="chat-scroll-area">
-        <div className="chat-messages" ref={messagesRef} onScroll={updateJumpToLatest}>
+      <div className="chat-scroll-area" ref={messagesRef} onScroll={updateJumpToLatest}>
+        <div className="chat-messages">
         {messages.length === 0 ? (
           <div className="copilot-hero">
             <h2>DevFoundry Copilot</h2>
@@ -173,13 +176,11 @@ export function ChatPanel({
                 className={`bubble bubble-${isUser ? 'user' : 'assistant'}`}
               >
                 <div className="bubble-header">
-                  <div
-                    className={`bubble-avatar-icon ${
-                      isUser ? 'bubble-avatar-user' : 'bubble-avatar-assistant'
-                    }`}
-                  >
-                    {isUser ? <User size={13} /> : <Sparkles size={13} />}
-                  </div>
+                  {isUser && (
+                    <div className="bubble-avatar-icon bubble-avatar-user">
+                      <User size={13} />
+                    </div>
+                  )}
                   <span className="bubble-role-name">
                     {isUser ? 'You' : 'DevFoundry Copilot'}
                   </span>
@@ -233,7 +234,7 @@ export function ChatPanel({
                   type="button"
                   className="suggestion-chip"
                   title={suggestion.prompt}
-                  onClick={() => submit(suggestion.prompt)}
+                  onClick={() => handleApplySuggestion(suggestion.prompt)}
                 >
                   {suggestion.label}
                 </button>
@@ -311,10 +312,6 @@ export function ChatPanel({
             </button>
           </div>
         </div>
-
-        <p className="composer-disclaimer">
-          DevFoundry Copilot synthesizes multi-agent recommendations. Verify critical architecture specifications.
-        </p>
       </div>
     </section>
   )
