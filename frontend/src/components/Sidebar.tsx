@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react'
+import { Sparkles, Plus, Search, FileText, Trash2 } from 'lucide-react'
 import type { Project } from '../types'
 
 type SidebarProps = {
@@ -30,7 +31,7 @@ export function Sidebar({
     <aside className="sidebar">
       <div className="sidebar-brand-container">
         <div className="sidebar-brand">
-          <div className="ms-copilot-icon">✨</div>
+          <div className="ms-copilot-icon"><Sparkles size={18} /></div>
           <span>DevFoundry</span>
         </div>
         <span className="ms-badge-pill">Copilot</span>
@@ -42,12 +43,12 @@ export function Sidebar({
           className="new-project-button"
           onClick={onNewProject}
         >
-          <span>＋</span> New Project
+          <Plus size={16} style={{ marginRight: '4px' }} /> New Project
         </button>
       )}
 
       <div className="sidebar-search-box">
-        <span className="sidebar-search-icon">🔍</span>
+        <span className="sidebar-search-icon" style={{ display: 'flex', alignItems: 'center' }}><Search size={14} /></span>
         <input
           type="text"
           className="sidebar-search-input"
@@ -84,7 +85,7 @@ export function Sidebar({
                 onClick={() => onSelectProject(project.id)}
                 title={project.name}
               >
-                <span className="project-item-icon">📄</span>
+                <span className="project-item-icon" style={{ display: 'flex', alignItems: 'center' }}><FileText size={16} /></span>
                 <span className="project-item-name">{project.name}</span>
               </button>
               {onDeleteProject && (
@@ -100,7 +101,7 @@ export function Sidebar({
                     }
                   }}
                 >
-                  🗑️
+                  <Trash2 size={16} />
                 </button>
               )}
             </div>

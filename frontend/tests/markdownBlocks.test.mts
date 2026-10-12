@@ -48,10 +48,58 @@ test('previous behaviour kept: blank-line separated paragraphs, headings, lists'
   assert.equal(parseMarkdown('3. three\n4. four')[0].start, 3)
 })
 
-test('nested bullets join the parent list with depth', () => {
+test('nested bullets become a sub-list of their parent item', () => {
   const [list] = parseMarkdown('- **Framework:**\n  - React\n- **Language:** TypeScript')
   assert.equal(list.type, 'list')
-  assert.deepEqual(list.items.map((i: { depth: number }) => i.depth), [0, 1, 0])
+  assert.equal(list.items.length, 2)
+  assert.equal(list.items[0].children[0].items[0].text, 'React')
+  assert.equal(list.items[1].children.length, 0)
+})
+
+test('screenshot: numbered questions with option bullets keep numbering 1, 2, 3, 4', () => {
+  const md = [
+    'Please help clarify the following:',
+    '',
+    '1. **What is the main purpose?** (For example: compliance, payroll)',
+    '2. **Who are the primary user groups?**',
+    '   - Employees',
+    '   - Managers',
+    '   - HR personnel',
+    '   - System Administrators',
+    '   - Other (please specify)',
+    '3. **What are the three most important things users must be able to do?**',
+    '4. **What is the primary platform?**',
+    '   - Web application',
+    '   - Mobile app',
+    '',
+    'You can answer in one message.',
+  ].join('\n')
+  const blocks = parseMarkdown(md)
+  assert.deepEqual(blocks.map((b: { type: string }) => b.type), ['paragraph', 'list', 'paragraph'])
+  const list = blocks[1]
+  assert.equal(list.ordered, true)
+  assert.equal(list.items.length, 4)                                  // 4 questions, not 11 items
+  assert.equal(list.items[1].children[0].items.length, 5)            // options nested under question 2
+  assert.equal(list.items[1].children[0].ordered, false)
+  assert.equal(list.items[3].children[0].items.length, 2)
+  assert.equal(list.items[2].children.length, 0)
+})
+
+test('loose numbered list with blank lines and nested options stays one list', () => {
+  const [list] = parseMarkdown('1. First\n\n   - a\n   - b\n\n2. Second\n\n3. Third')
+  assert.equal(list.items.length, 3)
+  assert.equal(list.items[0].children[0].items.length, 2)
+})
+
+test('a paragraph between numbered items keeps the original number', () => {
+  const blocks = parseMarkdown('1. One\nSome text\n2. Two')
+  assert.deepEqual(blocks.map((b: { type: string }) => b.type), ['list', 'paragraph', 'list'])
+  assert.equal(blocks[2].start, 2)
+})
+
+test('indented continuation text joins the current item', () => {
+  const [list] = parseMarkdown('1. Question\n   (for example: X)')
+  assert.equal(list.items[0].text, 'Question (for example: X)')
 })
 
 test('fenced code block (structure tree) is kept verbatim', () => {

@@ -1,5 +1,6 @@
 import { useMsal } from '@azure/msal-react'
 import { useEffect, useState } from 'react'
+import { Sun, Moon } from 'lucide-react'
 import {
   continueChat,
   deleteConversation,
@@ -69,7 +70,8 @@ export function HomePage() {
           name: item.title,
         }))
         setConversations(mapped)
-        setSelectedId((current) => current ?? mapped[0]?.id ?? null)
+        // No project is auto-selected: after signing in (or reloading) the app opens a new chat,
+        // and earlier projects stay available in the sidebar.
         setListStatus(mapped.length === 0 ? 'No projects yet.' : null)
       } catch (reason) {
         if (cancelled) return
@@ -297,17 +299,7 @@ export function HomePage() {
       <div className="main">
         <header className="topbar">
           <div className="topbar-left">
-            <div className="topbar-breadcrumb">
-              <span>Workspaces</span>
-              <span>›</span>
-              <span>Requirements Engineering</span>
-              {conversation && (
-                <>
-                  <span>›</span>
-                  <span>{conversation.name}</span>
-                </>
-              )}
-            </div>
+
             <div className="topbar-title-row">
               <h1>{activeProject.name}</h1>
               <div className="topbar-status-chip">
@@ -324,7 +316,9 @@ export function HomePage() {
               title={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
               onClick={toggleTheme}
             >
-              <span>{theme === 'light' ? '🌙' : '☀️'}</span>
+              <span style={{ display: 'flex', alignItems: 'center' }}>
+                {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+              </span>
               <span>{theme === 'light' ? 'Dark' : 'Light'}</span>
             </button>
             <div className="ms-avatar-monogram" title={displayName}>

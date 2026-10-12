@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { Sparkles, User, AlertTriangle, Lightbulb, FileText, X, Paperclip, Send, BrainCircuit, Target, BookOpen } from 'lucide-react'
 import { ACCEPTED_REQUIREMENT_FILES } from '../constants'
 import type { ChatMessage, Project, Suggestion } from '../types'
 import { MarkdownRenderer } from './MarkdownRenderer'
@@ -29,7 +30,7 @@ function PendingResponse() {
   return (
     <article className="bubble bubble-assistant bubble-pending" role="status" aria-live="polite">
       <div className="bubble-header">
-        <div className="bubble-avatar-icon bubble-avatar-assistant">✨</div>
+        <div className="bubble-avatar-icon bubble-avatar-assistant" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Sparkles size={16} /></div>
         <span className="bubble-role-name">DevFoundry Copilot</span>
       </div>
       <div className="pending-body">
@@ -59,24 +60,28 @@ type ChatPanelProps = {
 
 const PROMPT_STARTERS = [
   {
-    title: '📄 Analyze Uploaded Spec',
-    desc: 'Extract key user stories, objective, and requirements from an attached PRD or doc.',
+    icon: <FileText size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
+    title: 'Analyze Uploaded Spec',
+    desc: 'Extract key user stories, objective, and requirements from an attached document.',
     prompt: 'Please analyze the attached specification and generate structured product requirements.',
   },
   {
-    title: '🏗️ Technical Architecture (TRD)',
-    desc: 'Recommend technology stacks (Frontend, Backend, Database) and infrastructure.',
-    prompt: 'Would you recommend a comprehensive Technical Requirements Document (TRD) for this project?',
+    icon: <BrainCircuit size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
+    title: 'Brainstorm New Project',
+    desc: 'Discuss your app idea, core features, and target audience.',
+    prompt: 'I have an idea for a new app. Can you help me brainstorm the core features and target audience?',
   },
   {
-    title: '🎯 Clarify User Flows & Goals',
-    desc: 'Identify gaps, edge cases, and define end-to-end user journeys.',
+    icon: <Target size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
+    title: 'Define User Journeys',
+    desc: 'Map out step-by-step user flows and identify edge cases.',
     prompt: 'Help me define the core objectives, problem statement, and step-by-step user flows.',
   },
   {
-    title: '⚡ Modernize Tech Stack',
-    desc: 'Evaluate framework tradeoffs: FastAPI, React, Node, PostgreSQL, and cloud services.',
-    prompt: 'What are the recommended technology choices for high scalability and rapid development?',
+    icon: <BookOpen size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
+    title: 'Draft Requirements (PRD)',
+    desc: 'Create a structured Product Requirements Document step-by-step.',
+    prompt: 'Guide me through defining the requirements for a new Product Requirements Document (PRD).',
   },
 ]
 
@@ -156,11 +161,10 @@ export function ChatPanel({
         <div className="chat-messages" ref={messagesRef} onScroll={updateJumpToLatest}>
         {messages.length === 0 ? (
           <div className="copilot-hero">
-            <div className="copilot-sparkle-badge">✨</div>
+            <div className="copilot-sparkle-badge" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Sparkles size={32} /></div>
             <h2>DevFoundry Copilot</h2>
             <p>
-              AI-Powered Requirements Engineering & Technical Architecture Orchestrator.
-              Turn ideas and specifications into production-grade PRDs and TRDs.
+              Your AI Requirements Engineer. Let's discuss your ideas and turn them into structured, production-ready specifications.
             </p>
 
             <div className="copilot-starter-grid">
@@ -171,7 +175,10 @@ export function ChatPanel({
                   className="copilot-starter-card"
                   onClick={() => setDraft(starter.prompt)}
                 >
-                  <span className="copilot-starter-title">{starter.title}</span>
+                  <span className="copilot-starter-title" style={{ display: 'flex', alignItems: 'center' }}>
+                    {starter.icon}
+                    {starter.title}
+                  </span>
                   <span className="copilot-starter-desc">{starter.desc}</span>
                 </button>
               ))}
@@ -190,8 +197,9 @@ export function ChatPanel({
                     className={`bubble-avatar-icon ${
                       isUser ? 'bubble-avatar-user' : 'bubble-avatar-assistant'
                     }`}
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                   >
-                    {isUser ? '👤' : '✨'}
+                    {isUser ? <User size={16} /> : <Sparkles size={16} />}
                   </div>
                   <span className="bubble-role-name">
                     {isUser ? 'You' : 'DevFoundry Copilot'}
@@ -227,7 +235,7 @@ export function ChatPanel({
 
       {error && (
         <div className="chat-error">
-          <span>⚠️</span>
+          <span style={{ display: 'flex', alignItems: 'center' }}><AlertTriangle size={16} /></span>
           <span>{error}</span>
         </div>
       )}
@@ -235,7 +243,7 @@ export function ChatPanel({
       <div className="composer-container">
         {suggestions.length > 0 && !sending && (
           <div className="suggestion-bar" aria-label="Suggested next steps">
-            <span className="suggestion-bar-label">💡 Suggested next steps</span>
+            <span className="suggestion-bar-label" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}><Lightbulb size={16} /> Suggested next steps</span>
             <div className="suggestion-chips">
               {suggestions.map((suggestion) => (
                 <button
@@ -257,14 +265,15 @@ export function ChatPanel({
             <ul className="file-chips">
               {files.map((file) => (
                 <li key={file.name} className="file-chip">
-                  <span className="file-chip-icon">📄</span>
+                  <span className="file-chip-icon" style={{ display: 'flex', alignItems: 'center' }}><FileText size={14} /></span>
                   <span>{file.name}</span>
                   <button
                     type="button"
                     aria-label={`Remove ${file.name}`}
                     onClick={() => onRemoveFile(file.name)}
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                   >
-                    ✕
+                    <X size={14} />
                   </button>
                 </li>
               ))}
@@ -301,8 +310,9 @@ export function ChatPanel({
                 className="upload-button"
                 title="Attach specification file (.pdf, .docx, .txt)"
                 onClick={() => fileInputRef.current?.click()}
+                style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
               >
-                <span>📎</span> Attach Spec
+                <Paperclip size={16} /> Attach Spec
               </button>
 
               <button
@@ -310,13 +320,14 @@ export function ChatPanel({
                 className="send-button"
                 disabled={!canSend}
                 onClick={() => submit()}
+                style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
               >
                 {sending ? (
                   <>
                     <span className="send-spinner" aria-hidden="true" /> Working…
                   </>
                 ) : (
-                  '➤ Send'
+                  <><Send size={16} /> Send</>
                 )}
               </button>
             </div>

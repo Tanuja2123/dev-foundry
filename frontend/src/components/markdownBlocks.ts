@@ -1,14 +1,16 @@
 // Line-based Markdown block parser for chat messages.
 // Every line is classified on its own, so headings, dividers and lists render correctly even when the
-// model puts them on adjacent lines without blank lines in between.
+// model puts them on adjacent lines without blank lines in between. Indented list items become real
+// nested lists inside their parent item (so "1." question + "- option" bullets keep the numbering 1, 2, 3).
 
-export type ListItem = { text: string; depth: number }
+export type ListBlock = { type: 'list'; ordered: boolean; start: number; items: ListItem[] }
+export type ListItem = { text: string; children: ListBlock[] }
 
 export type Block =
   | { type: 'code'; language: string; content: string }
   | { type: 'heading'; level: 1 | 2 | 3 | 4; text: string }
   | { type: 'hr' }
-  | { type: 'list'; ordered: boolean; start: number; items: ListItem[] }
+  | ListBlock
   | { type: 'quote'; lines: string[] }
   | { type: 'table'; header: string[]; rows: string[][] }
   | { type: 'paragraph'; lines: string[] }
@@ -27,18 +29,52 @@ function splitRow(line: string): string[] {
   return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
 }
 
+function indentOf(spaces: string): number {
+  return spaces.replace(/\t/g, '    ').length
+}
+
 export function parseMarkdown(content: string): Block[] {
   const lines = (content ?? '').replace(/\r\n?/g, '\n').split('\n')
   const blocks: Block[] = []
   let paragraph: string[] = []
+  // Open lists, outermost first, with the indentation of their items
+  let listStack: { list: ListBlock; indent: number }[] = []
 
   function flushParagraph() {
     if (paragraph.length) blocks.push({ type: 'paragraph', lines: paragraph })
     paragraph = []
   }
 
-  function lastBlock(): Block | undefined {
-    return blocks[blocks.length - 1]
+  function closeLists() {
+    listStack = []
+  }
+
+  function addListItem(indent: number, ordered: boolean, start: number, text: string) {
+    const item: ListItem = { text, children: [] }
+    while (listStack.length && listStack[listStack.length - 1].indent > indent) listStack.pop()
+    const top = listStack[listStack.length - 1]
+
+    if (top && top.indent === indent && top.list.ordered === ordered) {
+      top.list.items.push(item)
+      return
+    }
+    const list: ListBlock = { type: 'list', ordered, start, items: [item] }
+    if (top && top.indent < indent) {
+      // Deeper indentation: a nested list inside the current item
+      top.list.items[top.list.items.length - 1].children.push(list)
+      listStack.push({ list, indent })
+      return
+    }
+    if (top && top.indent === indent && listStack.length > 1) {
+      // Same level but a different list kind: a sibling list inside the same parent item
+      listStack.pop()
+      const parent = listStack[listStack.length - 1]
+      parent.list.items[parent.list.items.length - 1].children.push(list)
+      listStack.push({ list, indent })
+      return
+    }
+    blocks.push(list)
+    listStack = [{ list, indent }]
   }
 
   for (let i = 0; i < lines.length; i++) {
@@ -48,6 +84,7 @@ export function parseMarkdown(content: string): Block[] {
     const fence = line.match(FENCE)
     if (fence) {
       flushParagraph()
+      closeLists()
       const code: string[] = []
       i++
       while (i < lines.length && !FENCE.test(lines[i])) {
@@ -59,12 +96,13 @@ export function parseMarkdown(content: string): Block[] {
     }
 
     if (!line.trim()) {
-      flushParagraph()
+      flushParagraph() // lists stay open across blank lines ("loose" lists)
       continue
     }
 
     if (RULE.test(line)) {
       flushParagraph()
+      closeLists()
       blocks.push({ type: 'hr' })
       continue
     }
@@ -72,6 +110,7 @@ export function parseMarkdown(content: string): Block[] {
     const heading = line.match(HEADING)
     if (heading) {
       flushParagraph()
+      closeLists()
       const level = Math.min(heading[1].length, 4) as 1 | 2 | 3 | 4
       blocks.push({ type: 'heading', level, text: heading[2] })
       continue
@@ -80,6 +119,7 @@ export function parseMarkdown(content: string): Block[] {
     // Table: header row followed by a separator row
     if (TABLE_ROW.test(line) && i + 1 < lines.length && TABLE_SEPARATOR.test(lines[i + 1])) {
       flushParagraph()
+      closeLists()
       const header = splitRow(line)
       const rows: string[][] = []
       i += 2
@@ -94,25 +134,30 @@ export function parseMarkdown(content: string): Block[] {
 
     const bullet = line.match(BULLET)
     const ordered = bullet ? null : line.match(ORDERED)
-    if (bullet || ordered) {
+    if (bullet) {
       flushParagraph()
-      const indent = (bullet ? bullet[1] : ordered![1]).replace(/\t/g, '    ').length
-      const item: ListItem = { text: bullet ? bullet[2] : ordered![3], depth: Math.min(Math.floor(indent / 2), 4) }
-      const isOrdered = Boolean(ordered)
-      const previous = lastBlock()
-      // Nested items join the list above them; top-level items join a list of the same kind
-      if (previous && previous.type === 'list' && (item.depth > 0 || previous.ordered === isOrdered)) {
-        previous.items.push(item)
-      } else {
-        blocks.push({ type: 'list', ordered: isOrdered, start: ordered ? Number(ordered[2]) : 1, items: [item] })
-      }
+      addListItem(indentOf(bullet[1]), false, 1, bullet[2])
       continue
     }
+    if (ordered) {
+      flushParagraph()
+      addListItem(indentOf(ordered[1]), true, Number(ordered[2]), ordered[3])
+      continue
+    }
+
+    // Indented continuation of the current list item (no blank line before it)
+    if (!paragraph.length && listStack.length && /^\s{2,}\S/.test(line) && i > 0 && lines[i - 1].trim()) {
+      const list = listStack[listStack.length - 1].list
+      list.items[list.items.length - 1].text += ' ' + line.trim()
+      continue
+    }
+
+    closeLists()
 
     const quote = line.match(QUOTE)
     if (quote) {
       flushParagraph()
-      const previous = lastBlock()
+      const previous = blocks[blocks.length - 1]
       if (previous && previous.type === 'quote') previous.lines.push(quote[1])
       else blocks.push({ type: 'quote', lines: [quote[1]] })
       continue
@@ -124,13 +169,6 @@ export function parseMarkdown(content: string): Block[] {
       paragraph.push(trailingRule[1])
       flushParagraph()
       blocks.push({ type: 'hr' })
-      continue
-    }
-
-    // Indented continuation of a list item
-    const previous = lastBlock()
-    if (!paragraph.length && previous && previous.type === 'list' && /^\s{2,}\S/.test(line) && i > 0 && lines[i - 1].trim()) {
-      previous.items[previous.items.length - 1].text += ' ' + line.trim()
       continue
     }
 

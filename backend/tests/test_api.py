@@ -1,8 +1,29 @@
+"""
+API tests against the real Supabase project (conversations are created and deleted again).
+Authentication is replaced by a fixed test user; token validation itself is covered in test_auth_and_ownership.py.
+"""
+import pytest
 from fastapi.testclient import TestClient
 
+from app.core.auth import CurrentUser, get_current_user
 from app.main import app
+from app.services.user_store import record_user
+
+TEST_USER = CurrentUser(user_id="pytest-api-user", tenant_id="pytest", username="pytest@devfoundry.local",
+                        display_name="API test user", email="pytest@devfoundry.local")
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def signed_in_test_user():
+    def current_user() -> CurrentUser:
+        record_user(TEST_USER)  # the AppUser row must exist (Conversation.user_id references it)
+        return TEST_USER
+
+    app.dependency_overrides[get_current_user] = current_user
+    yield
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_cors_allows_frontend_origin() -> None:
@@ -22,9 +43,9 @@ def test_get_conversations() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert isinstance(payload, list)
-    assert len(payload) >= 1
-    assert "conversation_id" in payload[0]
-    assert "title" in payload[0]
+    for item in payload:
+        assert "conversation_id" in item
+        assert "title" in item
 
 
 def test_create_and_delete_conversation() -> None:
@@ -34,6 +55,9 @@ def test_create_and_delete_conversation() -> None:
     created = create_res.json()
     conv_id = created["conversation_id"]
     assert conv_id
+
+    # The new conversation is listed for its owner
+    assert conv_id in [c["conversation_id"] for c in client.get("/api/conversation").json()]
 
     # Test GET /api/conversation/{id}
     get_res = client.get(f"/api/conversation/{conv_id}")
@@ -58,3 +82,8 @@ def test_chat_endpoint_with_invalid_conversation() -> None:
     response = client.post("/api/chat", data=payload)
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
+
+
+def test_requests_without_sign_in_are_rejected() -> None:
+    app.dependency_overrides.pop(get_current_user, None)
+    assert client.get("/api/conversation").status_code == 401
