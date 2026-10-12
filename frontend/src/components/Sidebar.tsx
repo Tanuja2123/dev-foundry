@@ -292,25 +292,42 @@ export function Sidebar({
       <div className="sidebar-footer">
         {user ? (
           <div className="sidebar-user-container" ref={profileContainerRef}>
-            <button
-              type="button"
-              className={`sidebar-user-card ${isProfileOpen ? 'open' : ''}`}
-              onClick={() => setIsProfileOpen((prev) => !prev)}
-              aria-expanded={isProfileOpen}
-              aria-haspopup="menu"
-              title={`Account options for ${user.name}`}
-            >
-              <div className="sidebar-user-info">
-                <div className="sidebar-avatar-monogram">
-                  {user.initials || <User size={14} />}
-                </div>
-                {isExpanded && (
-                  <div className="sidebar-user-details">
-                    <span className="sidebar-user-name">{user.name}</span>
+            <div className="sidebar-user-row">
+              <button
+                type="button"
+                className={`sidebar-user-card ${isProfileOpen ? 'open' : ''}`}
+                onClick={() => setIsProfileOpen((prev) => !prev)}
+                aria-expanded={isProfileOpen}
+                aria-haspopup="menu"
+                title={`Account options for ${user.name}`}
+              >
+                <div className="sidebar-user-info">
+                  <div className="sidebar-avatar-monogram">
+                    {user.initials || <User size={14} />}
                   </div>
-                )}
-              </div>
-            </button>
+                  {isExpanded && (
+                    <div className="sidebar-user-details">
+                      <span className="sidebar-user-name">{user.name}</span>
+                    </div>
+                  )}
+                </div>
+              </button>
+
+              {isExpanded && user.onSignOut && (
+                <button
+                  type="button"
+                  className="sidebar-user-signout-btn"
+                  title="Sign out"
+                  aria-label="Sign out"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    user.onSignOut?.()
+                  }}
+                >
+                  <LogOut size={16} />
+                </button>
+              )}
+            </div>
 
             {/* Profile Popover / Dropdown Menu when clicked */}
             {isProfileOpen && (

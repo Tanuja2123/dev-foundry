@@ -396,7 +396,7 @@ export function HomePage() {
                   <PanelLeftOpen size={18} />
                 </button>
               )}
-              <h1>{isProjectsView ? 'Projects' : activeProject.name}</h1>
+              {!isProjectsView && <h1>{activeProject.name}</h1>}
             </div>
           </div>
 
