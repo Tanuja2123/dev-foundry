@@ -1,8 +1,22 @@
+import { getIdToken } from '../auth/token'
 import type { ChatApiResponse, Conversation, Suggestion } from '../types'
 
 function apiBaseUrl() {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim()
   return (configured || 'http://localhost:8000').replace(/\/$/, '')
+}
+
+/**
+ * fetch() with the signed-in user's token. On 401 the token is renewed once and the request retried.
+ */
+async function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  async function send(forceRefresh: boolean) {
+    const headers = new Headers(init.headers)
+    headers.set('Authorization', `Bearer ${await getIdToken(forceRefresh)}`)
+    return fetch(url, { ...init, headers })
+  }
+  const response = await send(false)
+  return response.status === 401 ? send(true) : response
 }
 
 async function readError(response: Response, fallback: string) {
@@ -16,7 +30,7 @@ async function readError(response: Response, fallback: string) {
 }
 
 export async function listConversations(): Promise<Conversation[]> {
-  const response = await fetch(`${apiBaseUrl()}/api/conversation`)
+  const response = await authFetch(`${apiBaseUrl()}/api/conversation`)
   if (!response.ok) {
     throw new Error(await readError(response, 'Could not load conversations'))
   }
@@ -29,7 +43,7 @@ export async function getConversation(conversationId: string): Promise<{
   content?: Array<{ role: 'user' | 'assistant'; text: string }>
   suggestions?: Suggestion[]
 }> {
-  const response = await fetch(`${apiBaseUrl()}/api/conversation/${conversationId}`)
+  const response = await authFetch(`${apiBaseUrl()}/api/conversation/${conversationId}`)
   if (!response.ok) {
     throw new Error(await readError(response, 'Could not load conversation'))
   }
@@ -38,7 +52,7 @@ export async function getConversation(conversationId: string): Promise<{
 
 
 export async function createConversation(): Promise<Conversation> {
-  const response = await fetch(`${apiBaseUrl()}/api/conversation`, {
+  const response = await authFetch(`${apiBaseUrl()}/api/conversation`, {
     method: 'POST',
   })
   if (!response.ok) {
@@ -61,7 +75,7 @@ export async function continueChat(
     formData.append('file', file)
   }
 
-  const response = await fetch(`${apiBaseUrl()}/api/chat`, {
+  const response = await authFetch(`${apiBaseUrl()}/api/chat`, {
     method: 'POST',
     body: formData,
   })
@@ -72,7 +86,7 @@ export async function continueChat(
 }
 
 export async function deleteConversation(conversationId: string): Promise<void> {
-  const response = await fetch(`${apiBaseUrl()}/api/conversation/${conversationId}`, {
+  const response = await authFetch(`${apiBaseUrl()}/api/conversation/${conversationId}`, {
     method: 'DELETE',
   })
   if (!response.ok) {

@@ -20,22 +20,49 @@ from app.services.workflow_routing import (RoutingDecision, blocked_reply, effec
                                            apply_intent_rules)
 from app.core.logger import logger
 
-# Load variables from .env file
+from app.services.llm_client import create_fallback_client
+
+# Load variables from .env file (checks repo root, backend folder, and default)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../.env"))
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 load_dotenv() # also try default location
 
+_warned_key_role = False
+
+def supabase_key_role(key: str) -> str:
+    """'service_role', 'anon' or 'unknown' (supports legacy JWT keys and the newer sb_secret_/sb_publishable_ keys)."""
+    if key.startswith("sb_secret_"):
+        return "service_role"
+    if key.startswith("sb_publishable_"):
+        return "anon"
+    try:
+        import base64
+        payload = key.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload)).get("role") or "unknown"
+    except Exception:
+        return "unknown"
+
 def get_supabase_client() -> Client:
+    """Backend-only Supabase client. Use the service-role key: the tables are closed to the anon key (migration 003)."""
+    global _warned_key_role
     url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
     if not url or not key:
         logger.error("[Supabase] Credentials missing in environment (.env).")
         raise ValueError("Supabase credentials not found in environment.")
+    if not _warned_key_role and supabase_key_role(key) != "service_role":
+        _warned_key_role = True
+        logger.warning("[Supabase] The configured key is not a service-role key. After migration 003 the tables are "
+                       "closed to the anon key; set SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY) to the service-role key.")
     return create_client(url, key)
 
-def get_conversations() -> List[ConversationItem]:
+def get_conversations(user_id: str) -> List[ConversationItem]:
+    """Conversations owned by the signed-in user, newest first."""
     supabase = get_supabase_client()
     try:
-        response = supabase.table("Conversation").select("*").order("created_at", desc=True).execute()
+        response = (supabase.table("Conversation").select("*").eq("user_id", user_id)
+                    .order("created_at", desc=True).execute())
         items = []
         for row in response.data:
             conv_id = row.get("conv_id")
@@ -48,12 +75,12 @@ def get_conversations() -> List[ConversationItem]:
         logger.error(f"[Supabase] Error fetching conversations: {str(e)}")
         raise
 
-def create_new_conversation(title: str = "New Project") -> ConversationItem:
+def create_new_conversation(user_id: str, title: str = "New Project") -> ConversationItem:
     supabase = get_supabase_client()
     new_id = str(uuid.uuid4())
     data = {
         "conv_id": new_id,
-        "user_id": "default_user", 
+        "user_id": user_id,
         "content": [],
         "title": title
     }
@@ -65,15 +92,14 @@ def create_new_conversation(title: str = "New Project") -> ConversationItem:
         logger.error(f"[Supabase] Failed to create new conversation: {str(e)}")
         raise
 
-def delete_conversation(conversation_id: str) -> bool:
-    try:
-        uuid.UUID(str(conversation_id))
-    except (ValueError, TypeError):
+def delete_conversation(conversation_id: str, user_id: str) -> bool:
+    """Deletes the conversation if the user owns it (its Project/Repository rows cascade). False if not found/owned."""
+    if not get_conversation_by_id(conversation_id, user_id):
         return False
 
     supabase = get_supabase_client()
     try:
-        supabase.table("Conversation").delete().eq("conv_id", conversation_id).execute()
+        supabase.table("Conversation").delete().eq("conv_id", conversation_id).eq("user_id", user_id).execute()
         logger.info(f"[Supabase] Deleted conversation '{conversation_id}'")
         return True
     except Exception as e:
@@ -81,7 +107,8 @@ def delete_conversation(conversation_id: str) -> bool:
         raise
 
 
-def get_conversation_by_id(conversation_id: str) -> Optional[Dict]:
+def get_conversation_by_id(conversation_id: str, user_id: str) -> Optional[Dict]:
+    """The conversation if it exists AND belongs to the user; None otherwise (callers answer 404 either way)."""
     try:
         uuid.UUID(str(conversation_id))
     except (ValueError, TypeError):
@@ -89,7 +116,8 @@ def get_conversation_by_id(conversation_id: str) -> Optional[Dict]:
 
     supabase = get_supabase_client()
     try:
-        response = supabase.table("Conversation").select("*").eq("conv_id", conversation_id).execute()
+        response = (supabase.table("Conversation").select("*").eq("conv_id", conversation_id)
+                    .eq("user_id", user_id).execute())
         if response.data:
             return response.data[0]
         return None
@@ -99,24 +127,10 @@ def get_conversation_by_id(conversation_id: str) -> Optional[Dict]:
 
 
 
-# Agent Framework Client configuration
+# Agent Framework Client configuration (Tiered Fallback: Azure OpenAI -> Groq -> MAQ AI SLM)
 
 def get_agent_framework_client() -> OpenAIChatCompletionClient:
-    api_key = os.getenv("AZURE_OPENAI_APIKEY")
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_version = os.getenv("AZURE_OPENAI_VERSION", "2024-12-01-preview")
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
-    
-    if not api_key or not endpoint:
-        logger.error("[Azure OpenAI] Credentials missing in environment.")
-        raise ValueError("Azure OpenAI credentials not found in environment.")
-        
-    return OpenAIChatCompletionClient(
-        model=deployment,
-        api_key=api_key,
-        azure_endpoint=endpoint,
-        api_version=api_version,
-    )
+    return create_fallback_client()
 
 # Workflow state persistence (Project / Repository tables)
 
@@ -135,6 +149,14 @@ def parse_agent_json(text: str) -> Optional[Dict]:
         return data if isinstance(data, dict) else None
     except json.JSONDecodeError:
         return None
+
+def missing_readiness_items(raw_output: str) -> List[str]:
+    """R1-R5 items the Requirements_Agent itself marked "missing" in a PRD it nevertheless returned as COMPLETE."""
+    data = parse_agent_json(raw_output) or {}
+    readiness = data.get("readiness")
+    if data.get("status") != "COMPLETE" or not isinstance(readiness, dict):
+        return []
+    return sorted(key for key, value in readiness.items() if str(value).strip().lower() == "missing")
 
 def persist_requirements_output(conversation_id: Optional[str], raw_output: str) -> None:
     """Stores a completed PRD/TRD in the Project row of the conversation."""
@@ -231,7 +253,8 @@ async def generate_chat_response(user_query: str, history: List[Dict], conversat
     """Uses Microsoft Agent Framework to generate a response with conversation history."""
     try:
         client = get_agent_framework_client()
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+        deployment = getattr(client, "current_model", None) or getattr(client, "model", None) or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+        provider_name = getattr(client, "current_provider_name", "Primary")
 
         main_agent_prompt = """
 You are DevFoundry, an AI-powered software development orchestration assistant.
@@ -281,7 +304,9 @@ ROUTING RULES:
    - project name/description (PROJECT_PROPOSAL_OUTDATED, before creation) -> UPDATE_PROJECT_PROPOSAL;
      (ADO_PROJECT_OUTDATED, after creation, or any rename request) -> UPDATE_ADO_PROJECT.
    - repository structure (STRUCTURE_OUTDATED) -> UPDATE_REPOSITORY_STRUCTURE; pushing the updated structure again -> PUSH_REPOSITORY_STRUCTURE.
-4. A project description, an uploaded document, or answers to clarifying questions -> GENERATE_PRD (no PRD yet) or UPDATE_PRD.
+4. A project description, an uploaded document, answers to clarifying questions, or a request to proceed with assumptions
+   ("make reasonable assumptions", "just generate it") -> GENERATE_PRD (no PRD yet) or UPDATE_PRD. Even a vague one-line
+   description goes to GENERATE_PRD: the Requirements_Agent decides whether it needs to ask questions first.
 5. Project / repository / structure steps:
    - PROJECT_REVIEW: name/description changes -> UPDATE_PROJECT_PROPOSAL; explicit approval to create -> CREATE_PROJECT.
    - REPOSITORY_REVIEW: different repository name -> UPDATE_REPOSITORY_PROPOSAL; explicit approval to create -> CREATE_REPOSITORY;
@@ -332,7 +357,7 @@ DECISION FIELDS:
         message_list.append(new_msg)
 
         # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
-        logger.info(f"[Orchestrator] Running Orchestrator Agent (Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
+        logger.info(f"[Orchestrator] Running Orchestrator Agent (Provider: {provider_name}, Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
         orchestrator_messages = list(message_list[:-1]) + [Message(role="user", contents=[user_query + state_note])]
         orchestrator_response = await orchestrator.run(messages=orchestrator_messages,
@@ -381,6 +406,20 @@ DECISION FIELDS:
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
+
+            # Readiness guard: a new PRD is only accepted when the agent's own readiness check has no missing item
+            missing = missing_readiness_items(child_raw_json) if operation == "GENERATE_PRD" else []
+            if missing:
+                logger.warning(f"[Readiness Guard] PRD written although {', '.join(missing)} missing; asking again")
+                retry_messages = req_messages + [
+                    Message(role="assistant", contents=[child_raw_json]),
+                    Message(role="user", contents=[
+                        f"[Readiness guard] Your readiness check marks {', '.join(missing)} as missing, so the PRD must not be "
+                        "written yet. Return CLARIFICATION_REQUIRED asking only for the missing REQUIRED items."]),
+                ]
+                child_response = await requirements_agent.run(messages=retry_messages)
+                child_raw_json = child_response.messages[-1].text if child_response.messages else child_raw_json
+
             persist_requirements_output(conversation_id, child_raw_json)
             follow_ups = follow_up_note(conversation_id)
 
@@ -394,23 +433,27 @@ The Requirements_Agent has produced the following structured output:
 Your task:
 Convert this output into a friendly, structured, and professional response for the user:
 
-CASE 1: If status is "CLARIFICATION_REQUIRED" or "NEEDS_INPUT":
-- Briefly acknowledge the information gathered so far.
-- Ask the clarifying follow-up question(s) specified in "questions" or "next_question".
-- If "choices" are provided, present them clearly as selectable options/bullet points.
+CASE 1: If status is "CLARIFICATION_REQUIRED":
+- Start with one sentence explaining that a few details are needed before the document can be written, then summarize
+  "known_so_far" in one short sentence.
+- Present the questions as a numbered list in the given order: the question in **bold**; when it has "choices", list them as
+  bullets indented under the question. Do not show the "reason" field verbatim; you may use it to phrase the question clearly.
+- End with: "You can answer in one message (for example "1: ..., 2: ..."), or say **"make reasonable assumptions"** and I'll
+  draft the document with the assumptions clearly listed."
 
 CASE 2: If status is "COMPLETE" and workflow_stage is "PRD" (or contains structured_project_response):
 - Start with ONE introductory sentence before the first heading, e.g. "Here is the **Product Requirements Document (PRD)**
   based on your project description:" (say "based on the uploaded document" if the requirements came from an attached file).
   For an updated PRD (change_notes present) say "Here is the **updated Product Requirements Document (PRD)**:" and then
   summarize what changed in one short "**What changed:**" paragraph based on change_notes.
-- Present the complete structured PRD specification using clear Markdown headings:
-  * **Objective**
-  * **Problem Statement**
-  * **Goals** (bulleted list)
-  * **User Experience**
-  * **User Flow** (step-by-step numbered list)
-- Acknowledge that the functional requirements are complete.
+- Present the complete PRD with a Markdown heading per section, in this order (skip a section only if it is missing):
+  * **Objective**, **Problem Statement** (paragraphs)
+  * **Target Users**, **Goals** (bulleted lists)
+  * **Functional Requirements** (bulleted list, "**FR-001:** The system shall ...")
+  * **User Experience** (paragraph), **User Flow** (numbered list)
+  * **Non-Goals**, **Constraints** (bulleted lists; write "None stated" when empty)
+  * **Assumptions** (bulleted list; only when not empty, introduced with "These were assumed - please confirm or correct them:")
+  * **Open Questions** (bulleted list; only when not empty, introduced with "Still open - you can answer these anytime:")
 - Naturally offer the next logical workflow step by concluding with:
   "**Would you like me to create a Technical Requirements Document (TRD) as well?**"
 
@@ -421,7 +464,8 @@ CASE 3: If status is "COMPLETE" and workflow_stage is "TRD" (or contains technic
   * **Frontend Technology Stack** (Framework, Supporting Technologies, Tools & Libraries, Rationale)
   * **Backend Technology Stack** (Language, Framework, API Technologies, Supporting Technologies, Rationale)
   * **Database Technology Stack** (Database, Database Type, Supporting Technologies, Rationale)
-  * **Integration & Infrastructure** (if present)
+  * **Integration & Infrastructure** (External Integrations, File Storage, Messaging, Deployment, CI/CD & Observability, Rationale)
+  * **Security** (Authentication & Authorization, Data Protection, Application Security, Compliance, Rationale)
 - Under each heading use ONE flat bullet per field, e.g. "- **Framework:** React" and "- **Supporting Technologies:** Redux Toolkit, React Router".
   Do not nest lists. Put the rationale in its own short paragraph starting with "**Rationale:**".
 - If change_notes is present, start with a short "**What changed:**" paragraph based on change_notes (including when nothing needed to change).
@@ -550,6 +594,12 @@ Put a blank line before and after every heading, divider (---) and list; never p
         return title_prefix + response_text
 
     except Exception as e:
+        if "content_filter" in str(e) or type(e).__name__ == "OpenAIContentFilterException":
+            # Azure OpenAI content safety (incl. prompt-injection / jailbreak detection) rejected the input
+            logger.warning(f"[Agent Pipeline] Blocked by the Azure OpenAI content filter: {type(e).__name__}")
+            return ("⚠️ This message (or an attached document) was blocked by the AI content-safety filter, usually because it "
+                    "contains text that looks like instructions to the AI (a possible prompt injection). Please remove that text "
+                    "and try again. Nothing was changed.")
         logger.error(f"[Agent Pipeline] Error: {str(e)}")
         return f"Error communicating with Agent Framework: {str(e)}"
 
@@ -563,17 +613,19 @@ def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
         logger.error(f"[Suggestions] Could not compute suggestions: {e}")
         return []
 
-async def process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None) -> ChatResponse:
+async def process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None,
+                               *, user_id: str) -> ChatResponse:
     overall_start = time.time()
 
     # If conversation_id is not provided, create a new conversation for this initial message
     if not conversation_id or str(conversation_id).strip().lower() in ("null", "none", ""):
         logger.info("[Conversation] No conversation_id provided; creating new conversation row for initial message.")
-        new_conv = create_new_conversation(title="New Project")
+        new_conv = create_new_conversation(user_id, title="New Project")
         conversation_id = new_conv.conversation_id
         conv = {"conv_id": conversation_id, "title": "New Project", "content": []}
     else:
-        conv = get_conversation_by_id(conversation_id)
+        # Only the owner can continue a conversation; anyone else gets "not found"
+        conv = get_conversation_by_id(conversation_id, user_id)
         if not conv:
             logger.warning(f"[Supabase] Conversation '{conversation_id}' not found in DB.")
             raise ValueError(f"Conversation '{conversation_id}' not found.")

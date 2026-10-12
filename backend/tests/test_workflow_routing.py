@@ -229,3 +229,19 @@ def test_get_suggestions_is_safe_without_tables(monkeypatch):
     monkeypatch.setattr(store, "client_factory", lambda: FakeSupabase(missing_tables={"Project", "Repository"}))
     assert cs.get_suggestions(CONV) == []
     assert cs.get_suggestions(None) == []
+
+
+# ---------------------------------------------------------------------------
+# PRD readiness guard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("output, expected", [
+    ({"status": "COMPLETE", "readiness": {"R1": "provided", "R2": "missing", "R3": "provided", "R4": "missing", "R5": "provided"}},
+     ["R2", "R4"]),
+    ({"status": "COMPLETE", "readiness": {"R1": "provided", "R2": "provided", "R3": "provided", "R4": "assumed", "R5": "declined"}}, []),
+    ({"status": "CLARIFICATION_REQUIRED", "readiness": {"R1": "missing"}}, []),   # asking is the right reaction
+    ({"status": "COMPLETE", "readiness": None}, []),                              # UPDATE_PRD / older outputs
+    ({"status": "COMPLETE"}, []),
+])
+def test_missing_readiness_items(output, expected):
+    assert cs.missing_readiness_items(json.dumps(output)) == expected
