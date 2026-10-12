@@ -10,7 +10,6 @@ It creates a "DevFoundry-E2E-<id>" ADO project and deletes it at the end (ADO_E2
 and deletes its Project/Repository rows. No "Conversation" row is needed (generate_chat_response is called directly).
 """
 import asyncio
-import json
 import os
 import sys
 

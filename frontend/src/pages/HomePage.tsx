@@ -1,6 +1,8 @@
 import { useMsal } from '@azure/msal-react'
-import { useEffect, useState } from 'react'
-import { Sun, Moon } from 'lucide-react'
+import { useCallback, useEffect, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { PanelLeftOpen, Moon, Sun } from 'lucide-react'
+
 import {
   continueChat,
   deleteConversation,
@@ -8,7 +10,8 @@ import {
   listConversations,
 } from '../api/chat'
 import { ChatPanel } from '../components/ChatPanel'
-import { Sidebar } from '../components/Sidebar'
+import { Sidebar, type SidebarState } from '../components/Sidebar'
+import { ProjectsPage } from './ProjectsPage'
 import type { ChatMessage, Project, Suggestion } from '../types'
 
 function createId() {
@@ -27,6 +30,10 @@ function getInitials(name: string) {
 export function HomePage() {
   const { instance, accounts } = useMsal()
   const account = instance.getActiveAccount() ?? accounts[0]
+  const location = useLocation()
+  const navigate = useNavigate()
+  const isProjectsView = location.pathname === '/projects'
+
   const [conversations, setConversations] = useState<Project[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [listStatus, setListStatus] = useState<string | null>('Loading projects…')
@@ -44,10 +51,27 @@ export function HomePage() {
   const [draftFiles, setDraftFiles] = useState<File[]>([])
   const [sending, setSending] = useState(false)
   const [chatError, setChatError] = useState<string | null>(null)
+  const [sidebarState, setSidebarState] = useState<SidebarState>(() => {
+    const saved = localStorage.getItem('sidebarState') as SidebarState | null
+    return saved === 'hidden' ? 'hidden' : 'expanded'
+  })
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('sidebarWidth')
+    const parsed = saved ? parseInt(saved, 10) : NaN
+    return !isNaN(parsed) && parsed >= 180 && parsed <= 520 ? parsed : 280
+  })
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('theme')
     return saved === 'dark' ? 'dark' : 'light'
   })
+
+  useEffect(() => {
+    localStorage.setItem('sidebarState', sidebarState)
+  }, [sidebarState])
+
+  useEffect(() => {
+    localStorage.setItem('sidebarWidth', String(sidebarWidth))
+  }, [sidebarWidth])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -138,19 +162,65 @@ export function HomePage() {
   const displayName = account?.name ?? account?.username ?? 'Signed in'
   const initials = getInitials(displayName)
 
+  function handleNavigateProjects() {
+    navigate('/projects')
+  }
+
   function selectConversation(conversationId: string) {
     setSelectedId(conversationId)
     setDraftMessages([])
     setDraftFiles([])
     setChatError(null)
+    if (location.pathname === '/projects') {
+      navigate('/')
+    }
   }
 
-  function handleNewConversation() {
+  const handleNewConversation = useCallback(() => {
     setSelectedId(null)
     setDraftMessages([])
     setDraftFiles([])
     setChatError(null)
-  }
+    if (location.pathname === '/projects') {
+      navigate('/')
+    }
+    setTimeout(() => {
+      document.querySelector<HTMLTextAreaElement>('.composer-row textarea')?.focus()
+    }, 60)
+  }, [location.pathname, navigate])
+
+  // Global keyboard accessibility shortcuts:
+  // - Toggle Sidebar: Ctrl+B / Ctrl+\ / Ctrl+Shift+S
+  // - Start New Project: Ctrl+Shift+O / Alt+N / Ctrl+Alt+N
+  useEffect(() => {
+    function onGlobalKeyDown(e: globalThis.KeyboardEvent) {
+      const isMod = e.ctrlKey || e.metaKey
+
+      // Toggle sidebar between expanded and hidden states
+      if (
+        (isMod && (e.key === 'b' || e.key === 'B')) ||
+        (isMod && e.key === '\\') ||
+        (isMod && e.shiftKey && (e.key === 's' || e.key === 'S'))
+      ) {
+        e.preventDefault()
+        setSidebarState((curr) => (curr === 'hidden' ? 'expanded' : 'hidden'))
+        return
+      }
+
+      // Start new project
+      if (
+        (isMod && e.shiftKey && (e.key === 'o' || e.key === 'O')) ||
+        (e.altKey && (e.key === 'n' || e.key === 'N')) ||
+        (isMod && e.altKey && (e.key === 'n' || e.key === 'N'))
+      ) {
+        e.preventDefault()
+        handleNewConversation()
+      }
+    }
+
+    window.addEventListener('keydown', onGlobalKeyDown)
+    return () => window.removeEventListener('keydown', onGlobalKeyDown)
+  }, [handleNewConversation])
 
   async function handleDeleteProject(projectId: string) {
     try {
@@ -287,65 +357,78 @@ export function HomePage() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell sidebar-state-${sidebarState}`}>
       <Sidebar
         projects={conversations}
-        selectedProjectId={conversation?.id ?? null}
+        selectedProjectId={isProjectsView ? null : (conversation?.id ?? null)}
         onSelectProject={selectConversation}
         onNewProject={handleNewConversation}
         onDeleteProject={(id) => void handleDeleteProject(id)}
         status={listStatus}
+        activeView={isProjectsView ? 'projects' : 'chat'}
+        onNavigateProjects={handleNavigateProjects}
+        sidebarState={sidebarState}
+        onSetSidebarState={setSidebarState}
+        sidebarWidth={sidebarWidth}
+        onSetSidebarWidth={setSidebarWidth}
+        user={{
+          name: displayName,
+          initials,
+          onSignOut: () => instance.logoutRedirect(),
+        }}
       />
       <div className="main">
         <header className="topbar">
           <div className="topbar-left">
 
             <div className="topbar-title-row">
-              <h1>{activeProject.name}</h1>
-              <div className="topbar-status-chip">
-                <span className="topbar-status-dot" />
-                <span>Multi-Agent Copilot</span>
-              </div>
+              {sidebarState === 'hidden' && (
+                <button
+                  type="button"
+                  className="sidebar-reopen-btn"
+                  onClick={() => setSidebarState('expanded')}
+                  title="Open sidebar (Ctrl+B)"
+                  aria-label="Open sidebar"
+                  aria-keyshortcuts="Control+B"
+                >
+                  <PanelLeftOpen size={18} />
+                </button>
+              )}
+              <h1>{isProjectsView ? 'Projects' : activeProject.name}</h1>
             </div>
           </div>
 
-          <div className="topbar-user">
+          <div className="topbar-right">
             <button
               type="button"
-              className="theme-toggle-btn"
+              className="theme-toggle-btn theme-toggle-btn--icon"
               title={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
               onClick={toggleTheme}
+              aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} theme`}
             >
-              <span style={{ display: 'flex', alignItems: 'center' }}>
-                {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
-              </span>
-              <span>{theme === 'light' ? 'Dark' : 'Light'}</span>
-            </button>
-            <div className="ms-avatar-monogram" title={displayName}>
-              {initials}
-            </div>
-            <span className="topbar-username">{displayName}</span>
-            <button
-              type="button"
-              className="ms-btn-ghost"
-              onClick={() => instance.logoutRedirect()}
-            >
-              Sign out
+              {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
             </button>
           </div>
         </header>
 
-        <ChatPanel
-          project={activeProject}
-          messages={messages}
-          files={files}
-          suggestions={conversation ? (suggestionsByConversation[conversation.id] ?? []) : []}
-          sending={sending}
-          error={chatError}
-          onSend={(content) => void sendMessage(content)}
-          onFilesAdded={addFiles}
-          onRemoveFile={removeFile}
-        />
+        {isProjectsView ? (
+          <ProjectsPage
+            onSelectProject={selectConversation}
+            onNewProject={handleNewConversation}
+          />
+        ) : (
+          <ChatPanel
+            project={activeProject}
+            messages={messages}
+            files={files}
+            suggestions={conversation ? (suggestionsByConversation[conversation.id] ?? []) : []}
+            sending={sending}
+            error={chatError}
+            onSend={(content) => void sendMessage(content)}
+            onFilesAdded={addFiles}
+            onRemoveFile={removeFile}
+          />
+        )}
       </div>
     </div>
   )

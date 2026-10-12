@@ -1,11 +1,22 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
-import { Sparkles, User, AlertTriangle, Lightbulb, FileText, X, Paperclip, Send, BrainCircuit, Target, BookOpen } from 'lucide-react'
+import {
+  ArrowUp,
+  Paperclip,
+  Sparkles,
+  User,
+  X,
+  ArrowDown,
+  AlertCircle,
+  Loader2,
+  FileText,
+  Lightbulb,
+} from 'lucide-react'
 import { ACCEPTED_REQUIREMENT_FILES } from '../constants'
 import type { ChatMessage, Project, Suggestion } from '../types'
 import { MarkdownRenderer } from './MarkdownRenderer'
 
 // The input grows with its content up to this height, then scrolls.
-const COMPOSER_MAX_HEIGHT = 200
+const COMPOSER_MAX_HEIGHT = 280
 // Show the "Jump to latest" button once the user is this far (px) above the bottom of the chat.
 const JUMP_TO_LATEST_THRESHOLD = 240
 
@@ -30,7 +41,9 @@ function PendingResponse() {
   return (
     <article className="bubble bubble-assistant bubble-pending" role="status" aria-live="polite">
       <div className="bubble-header">
-        <div className="bubble-avatar-icon bubble-avatar-assistant" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Sparkles size={16} /></div>
+        <div className="bubble-avatar-icon bubble-avatar-assistant">
+          <Sparkles size={14} />
+        </div>
         <span className="bubble-role-name">DevFoundry Copilot</span>
       </div>
       <div className="pending-body">
@@ -58,32 +71,6 @@ type ChatPanelProps = {
   onRemoveFile: (name: string) => void
 }
 
-const PROMPT_STARTERS = [
-  {
-    icon: <FileText size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
-    title: 'Analyze Uploaded Spec',
-    desc: 'Extract key user stories, objective, and requirements from an attached document.',
-    prompt: 'Please analyze the attached specification and generate structured product requirements.',
-  },
-  {
-    icon: <BrainCircuit size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
-    title: 'Brainstorm New Project',
-    desc: 'Discuss your app idea, core features, and target audience.',
-    prompt: 'I have an idea for a new app. Can you help me brainstorm the core features and target audience?',
-  },
-  {
-    icon: <Target size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
-    title: 'Define User Journeys',
-    desc: 'Map out step-by-step user flows and identify edge cases.',
-    prompt: 'Help me define the core objectives, problem statement, and step-by-step user flows.',
-  },
-  {
-    icon: <BookOpen size={18} className="copilot-starter-icon" style={{ marginRight: '8px' }} />,
-    title: 'Draft Requirements (PRD)',
-    desc: 'Create a structured Product Requirements Document step-by-step.',
-    prompt: 'Guide me through defining the requirements for a new Product Requirements Document (PRD).',
-  },
-]
 
 export function ChatPanel({
   project,
@@ -124,14 +111,19 @@ export function ChatPanel({
     const textarea = textareaRef.current
     if (!textarea) return
     textarea.style.height = 'auto'
-    const height = Math.min(textarea.scrollHeight, COMPOSER_MAX_HEIGHT)
-    textarea.style.height = `${height}px`
+    const nextHeight = Math.min(Math.max(textarea.scrollHeight, 44), COMPOSER_MAX_HEIGHT)
+    textarea.style.height = `${nextHeight}px`
     textarea.style.overflowY = textarea.scrollHeight > COMPOSER_MAX_HEIGHT ? 'auto' : 'hidden'
   }, [draft])
 
-  // Keep the newest message (or the pending indicator) in view
+  // Keep the newest message (or the pending indicator) in view with smooth scroll
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    const scrollToBottom = () => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    }
+    scrollToBottom()
+    const timer = setTimeout(scrollToBottom, 120)
+    return () => clearTimeout(timer)
   }, [messages.length, sending])
 
   // Return focus to the input once the response arrives
@@ -146,6 +138,9 @@ export function ChatPanel({
     onSend(content || 'Please analyze the uploaded document.')
     // A suggestion click sends its own text and keeps whatever the user was typing
     if (customText === undefined) setDraft('')
+    setTimeout(() => {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+    }, 60)
   }
 
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -161,28 +156,13 @@ export function ChatPanel({
         <div className="chat-messages" ref={messagesRef} onScroll={updateJumpToLatest}>
         {messages.length === 0 ? (
           <div className="copilot-hero">
-            <div className="copilot-sparkle-badge" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}><Sparkles size={32} /></div>
             <h2>DevFoundry Copilot</h2>
             <p>
-              Your AI Requirements Engineer. Let's discuss your ideas and turn them into structured, production-ready specifications.
+              AI-Powered Requirements Engineering & Technical Architecture Orchestrator.
+              Turn ideas and specifications into production-grade PRDs and TRDs.
             </p>
 
-            <div className="copilot-starter-grid">
-              {PROMPT_STARTERS.map((starter) => (
-                <button
-                  key={starter.title}
-                  type="button"
-                  className="copilot-starter-card"
-                  onClick={() => setDraft(starter.prompt)}
-                >
-                  <span className="copilot-starter-title" style={{ display: 'flex', alignItems: 'center' }}>
-                    {starter.icon}
-                    {starter.title}
-                  </span>
-                  <span className="copilot-starter-desc">{starter.desc}</span>
-                </button>
-              ))}
-            </div>
+
           </div>
         ) : (
           messages.map((message) => {
@@ -197,9 +177,8 @@ export function ChatPanel({
                     className={`bubble-avatar-icon ${
                       isUser ? 'bubble-avatar-user' : 'bubble-avatar-assistant'
                     }`}
-                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                   >
-                    {isUser ? <User size={16} /> : <Sparkles size={16} />}
+                    {isUser ? <User size={13} /> : <Sparkles size={13} />}
                   </div>
                   <span className="bubble-role-name">
                     {isUser ? 'You' : 'DevFoundry Copilot'}
@@ -228,14 +207,15 @@ export function ChatPanel({
             onClick={jumpToLatest}
             aria-label="Jump to the latest message"
           >
-            ↓ Jump to latest
+            <ArrowDown size={14} />
+            <span>Latest</span>
           </button>
         )}
       </div>
 
       {error && (
         <div className="chat-error">
-          <span style={{ display: 'flex', alignItems: 'center' }}><AlertTriangle size={16} /></span>
+          <AlertCircle size={16} />
           <span>{error}</span>
         </div>
       )}
@@ -243,7 +223,9 @@ export function ChatPanel({
       <div className="composer-container">
         {suggestions.length > 0 && !sending && (
           <div className="suggestion-bar" aria-label="Suggested next steps">
-            <span className="suggestion-bar-label" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}><Lightbulb size={16} /> Suggested next steps</span>
+            <span className="suggestion-bar-label">
+              <Lightbulb size={13} className="suggestion-bulb-icon" /> Suggested next steps
+            </span>
             <div className="suggestion-chips">
               {suggestions.map((suggestion) => (
                 <button
@@ -265,15 +247,14 @@ export function ChatPanel({
             <ul className="file-chips">
               {files.map((file) => (
                 <li key={file.name} className="file-chip">
-                  <span className="file-chip-icon" style={{ display: 'flex', alignItems: 'center' }}><FileText size={14} /></span>
+                  <FileText size={14} className="file-chip-icon" />
                   <span>{file.name}</span>
                   <button
                     type="button"
                     aria-label={`Remove ${file.name}`}
                     onClick={() => onRemoveFile(file.name)}
-                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}
                   >
-                    <X size={14} />
+                    <X size={12} />
                   </button>
                 </li>
               ))}
@@ -295,42 +276,39 @@ export function ChatPanel({
               }}
             />
 
+            <button
+              type="button"
+              className="composer-icon-button attach-icon-btn"
+              title="Attach specification file (.pdf, .docx, .txt)"
+              aria-label="Attach specification file"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Paperclip size={18} />
+            </button>
+
             <textarea
               ref={textareaRef}
               rows={1}
               value={draft}
-              placeholder={`Ask DevFoundry Copilot about ${project.name}…`}
+              placeholder={project.name ? `Ask DevFoundry Copilot about ${project.name}…` : 'Message DevFoundry Copilot…'}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={onKeyDown}
             />
 
-            <div className="composer-actions">
-              <button
-                type="button"
-                className="upload-button"
-                title="Attach specification file (.pdf, .docx, .txt)"
-                onClick={() => fileInputRef.current?.click()}
-                style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
-              >
-                <Paperclip size={16} /> Attach Spec
-              </button>
-
-              <button
-                type="button"
-                className="send-button"
-                disabled={!canSend}
-                onClick={() => submit()}
-                style={{ display: 'flex', alignItems: 'center', gap: '4px' }}
-              >
-                {sending ? (
-                  <>
-                    <span className="send-spinner" aria-hidden="true" /> Working…
-                  </>
-                ) : (
-                  <><Send size={16} /> Send</>
-                )}
-              </button>
-            </div>
+            <button
+              type="button"
+              className="composer-icon-button send-icon-btn"
+              disabled={!canSend}
+              onClick={() => submit()}
+              title="Send message"
+              aria-label="Send message"
+            >
+              {sending ? (
+                <Loader2 size={16} className="send-spinner-icon" />
+              ) : (
+                <ArrowUp size={18} />
+              )}
+            </button>
           </div>
         </div>
 

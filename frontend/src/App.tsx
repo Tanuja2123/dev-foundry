@@ -119,6 +119,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/auth-callback" element={<AuthCallbackPage />} />
+      <Route path="/projects" element={<SignedInApp />} />
       <Route path="*" element={<SignedInApp />} />
     </Routes>
   )
