@@ -109,6 +109,12 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
     if stage == store.STAGE_REQUIREMENTS and not has_prd:
         return ["GENERATE_PRD", "UPDATE_PRD"]
     operations = list(ALLOWED_OPERATIONS.get(stage, ()))
+    # If the repository exists in STRUCTURE_REVIEW but structure has not been saved yet,
+    # allow CREATE_REPOSITORY to idempotently complete structure creation
+    if stage == store.STAGE_STRUCTURE_REVIEW and state:
+        repo = state.get("repository") or {}
+        if not repo.get("structure") and "CREATE_REPOSITORY" not in operations:
+            operations.append("CREATE_REPOSITORY")
     # The PRD and TRD can be updated at any time; downstream artifacts are then flagged as outdated.
     if has_prd and "UPDATE_PRD" not in operations:
         operations.append("UPDATE_PRD")
@@ -162,13 +168,13 @@ def apply_intent_rules(decision: RoutingDecision, stage: Optional[str],
     if (decision.action == "delegate" and decision.operation in _DOCUMENT_TRANSITIONS
             and decision.user_intent in ("approve_only", "question")):
         return RoutingDecision(reasoning=f"{decision.operation} needs an explicit request (intent: {decision.user_intent})",
-                               user_intent=decision.user_intent, action="respond",
-                               reply=_DOCUMENT_TRANSITIONS[decision.operation])
+                                user_intent=decision.user_intent, action="respond",
+                                reply=_DOCUMENT_TRANSITIONS[decision.operation])
     if (decision.action == "respond" and decision.user_intent == "change_request" and decision.mentions_technology
             and "UPDATE_TRD" in allowed_operations(stage, state) and _documents(state)[1]):
         return RoutingDecision(reasoning="technology change request -> TRD update", user_intent="change_request",
-                               mentions_technology=True, action="delegate", agent="Requirements_Agent",
-                               operation="UPDATE_TRD")
+                                mentions_technology=True, action="delegate", agent="Requirements_Agent",
+                                operation="UPDATE_TRD")
     return decision
 
 
@@ -235,5 +241,8 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
     if store.STRUCTURE_CHANGES_NOT_PUSHED in outdated and store.STRUCTURE_OUTDATED not in outdated:
         suggestions.append(("Push the changes", "Looks good, push the structure changes as a new commit."))
     elif stage == store.STAGE_STRUCTURE_REVIEW and repository.get("pushed_structure") is None and not suggestions:
-        suggestions.append(("Push to main", "Looks good, push the structure to the main branch."))
+        if not repository.get("structure"):
+            suggestions.append(("Propose folder structure", "Please propose the repository folder structure."))
+        else:
+            suggestions.append(("Push to main", "Looks good, push the structure to the main branch."))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]

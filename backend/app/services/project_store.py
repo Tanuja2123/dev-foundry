@@ -188,7 +188,9 @@ def get_workflow_state(conv_id: str) -> Dict[str, Any]:
 
 
 def describe_workflow_state(state: Dict[str, Any], include_requirements: bool = False,
-                            include_structure: bool = False) -> str:
+                            include_structure: bool = False,
+                            include_prd: Optional[bool] = None,
+                            include_trd: Optional[bool] = None) -> str:
     """Compact, LLM-readable summary of the stored workflow state (injected into agent input, never persisted)."""
     import json
 
@@ -226,9 +228,12 @@ def describe_workflow_state(state: Dict[str, Any], include_requirements: bool = 
     outdated = outdated_items(state)
     lines.append("outdated: " + ("; ".join(f"{item} ({OUTDATED_DESCRIPTIONS[item]})" for item in outdated) or "none"))
 
-    if include_requirements and project.get("prd"):
+    should_include_prd = include_requirements if include_prd is None else include_prd
+    should_include_trd = include_requirements if include_trd is None else include_trd
+
+    if should_include_prd and project.get("prd"):
         lines.append("approved_prd_json: " + json.dumps(project["prd"], ensure_ascii=False))
-    if include_requirements and project.get("trd"):
+    if should_include_trd and project.get("trd"):
         lines.append("approved_trd_json: " + json.dumps(project["trd"], ensure_ascii=False))
     if include_structure and repository and repository.get("structure"):
         lines.append("current_structure_files_json: " + json.dumps(repository["structure"], ensure_ascii=False))

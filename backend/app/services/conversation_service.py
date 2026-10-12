@@ -305,6 +305,29 @@ def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
         return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
     return text.rstrip() + "\n\n" + tree_markdown
 
+def compact_history_message(role: str, text: str, max_chars: int = 350) -> Optional[str]:
+    """
+    Compacts past conversation messages to prevent exceeding LLM token and rate limits
+    (e.g. Groq 8000 TPM limit) while preserving essential conversational context.
+    Filters out transient framework error messages so they don't pollute subsequent turns.
+    """
+    if not text:
+        return None
+
+    # Filter out infrastructure error logs from LLM context
+    if "Error communicating with Agent Framework:" in text or "All LLM providers failed:" in text:
+        return None
+
+    if len(text) <= max_chars:
+        return text
+
+    half = max_chars // 2
+    return (
+        f"{text[:half].rstrip()}\n\n"
+        f"[... content truncated for brevity; refer to workflow state ...]\n\n"
+        f"{text[-half:].lstrip()}"
+    )
+
 async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
     """Uses Microsoft Agent Framework to generate a response with conversation history."""
     try:
@@ -402,12 +425,14 @@ DECISION FIELDS:
         stage = effective_stage(workflow_state)
         state_note = "\n\n" + routing_context(workflow_state)
 
-        # Convert history into Agent Framework Messages
+        # Convert history into Agent Framework Messages with compacting & error filtering
         message_list = []
         for msg in history:
             role = msg.get("role", "user")
             text = msg.get("text", "")
-            message_list.append(Message(role=role, contents=[text]))
+            compact_text = compact_history_message(role, text)
+            if compact_text:
+                message_list.append(Message(role=role, contents=[compact_text]))
 
         new_msg = Message(role="user", contents=[user_query])
         message_list.append(new_msg)
@@ -415,9 +440,13 @@ DECISION FIELDS:
         # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
         logger.info(f"[Orchestrator] Running Orchestrator Agent (Provider: {provider_name}, Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
-        orchestrator_messages = list(message_list[:-1]) + [Message(role="user", contents=[user_query + state_note])]
-        orchestrator_response = await orchestrator.run(messages=orchestrator_messages,
-                                                       options={"response_format": RoutingDecision})
+        # Sliding window for Orchestrator: up to 8 recent history messages + latest query with state
+        recent_orch_history = message_list[-9:-1] if len(message_list) > 1 else []
+        orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
+        orchestrator_response = await orchestrator.run(
+            messages=orchestrator_messages,
+            options={"response_format": RoutingDecision, "max_tokens": 800}
+        )
         orch_duration = round((time.time() - orch_start) * 1000, 1)
         decision = parse_routing_decision(orchestrator_response)
         logger.info(f"[Orchestrator] Completed in {orch_duration}ms -> {decision.action} "
@@ -448,12 +477,15 @@ DECISION FIELDS:
 
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None and workflow_state.get("project"):
-                workflow_context_note += "\n\n" + store.describe_workflow_state(workflow_state, include_requirements=True)
+                include_trd = operation in ("GENERATE_TRD", "UPDATE_TRD")
+                workflow_context_note += "\n\n" + store.describe_workflow_state(
+                    workflow_state, include_prd=True, include_trd=include_trd
+                )
 
-            # Prepare message list for Requirements_Agent with clear workflow context
-            req_messages = list(message_list[:-1])
+            # Prepare message list for Requirements_Agent with clear workflow context (sliding window of up to 6 recent messages)
+            recent_req_history = message_list[-7:-1] if len(message_list) > 1 else []
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
-            req_messages.append(context_user_msg)
+            req_messages = recent_req_history + [context_user_msg]
 
             # Invoke Requirements Child Agent
             logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
@@ -537,7 +569,10 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synthesis_result = await synthesizer_agent.run(
+                messages=[Message(role="user", contents=["Please present this update to the user."])],
+                options={"max_tokens": 1000}
+            )
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
@@ -545,20 +580,22 @@ Put a blank line before and after every heading, divider (---) and list; never p
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
 
+            # Repo_Setup_Agent only needs TRD architecture and folder structure (not the bulky PRD)
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None:
                 workflow_context_note += "\n\n" + store.describe_workflow_state(
-                    workflow_state, include_requirements=True, include_structure=True)
+                    workflow_state, include_prd=False, include_trd=True, include_structure=True
+                )
 
-            # Prepare message list for Repo_Setup_Agent with clear workflow context
-            repo_messages = list(message_list[:-1])
+            # Prepare message list for Repo_Setup_Agent with clear workflow context (sliding window of up to 4 recent messages)
+            recent_repo_history = message_list[-5:-1] if len(message_list) > 1 else []
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
-            repo_messages.append(context_user_msg)
+            repo_messages = recent_repo_history + [context_user_msg]
 
             # Invoke Repo Setup Child Agent
             logger.info(f"[Repo_Setup_Agent] Processing request with operation: {operation}...")
             child_start = time.time()
-            child_response = await repo_setup_agent.run(messages=repo_messages)
+            child_response = await repo_setup_agent.run(messages=repo_messages, options={"max_tokens": 1200})
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
@@ -638,7 +675,10 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synthesis_result = await synthesizer_agent.run(
+                messages=[Message(role="user", contents=["Please present this update to the user."])],
+                options={"max_tokens": 1000}
+            )
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             response_text = insert_structure_tree(response_text, structure_tree)
