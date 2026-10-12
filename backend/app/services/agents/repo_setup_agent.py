@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from agent_framework import Agent, FunctionTool, tool
 from agent_framework.openai import OpenAIChatCompletionClient
 from app.services.mcp.ado_mcp_server import (
@@ -17,8 +17,12 @@ from app.core.logger import logger
 
 
 class RepositoryFile(BaseModel):
+    model_config = ConfigDict(extra="allow")
     path: str = Field(description="File path from the repository root, e.g. /backend/app/__init__.py")
-    content: str = Field(description="Short, non-empty placeholder content. No application logic.")
+
+    @property
+    def content(self) -> Optional[str]:
+        return (self.model_extra or {}).get("content")
 
 
 def _error(message: str, error_type: str = "STATE_ERROR", details: str = "") -> Dict[str, Any]:
@@ -63,8 +67,7 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
         except store.StoreError as e:
             return _error(str(e))
         if project and project.get("ado_project_id"):
-            return _error(f"An Azure DevOps project was already created for this conversation: "
-                          f"'{project.get('project_name')}' ({project.get('ado_project_url')}).", "ALREADY_CREATED")
+            return _error("An Azure DevOps project was already created for this conversation.", "ALREADY_CREATED")
 
         result = create_ado_project(project_name=project_name, project_description=project_description)
         if result.get("status") == "success" and conversation_id:
@@ -121,9 +124,8 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
         project, repository = state["project"], state["repository"]
         if not project or not project.get("ado_project_id"):
             return _error("Create the Azure DevOps project before creating a repository.")
-        if repository and repository.get("ado_repo_id") and repository.get("repo_name") == repository_name:
-            return _error(f"Repository '{repository_name}' was already created ({repository.get('ado_repo_url')}).",
-                          "ALREADY_CREATED")
+        if repository and repository.get("ado_repo_id"):
+            return _error("A repository was already created for this project.", "ALREADY_CREATED")
 
         result = create_ado_repository(project_id_or_name=_project_ref(project, project_id_or_name),
                                        repository_name=repository_name)
@@ -161,18 +163,22 @@ def build_repo_setup_tools(conversation_id: Optional[str]) -> List[FunctionTool]
     @tool(
         name="save_repository_structure",
         description=(
-            "Save the COMPLETE proposed folder structure (skeleton files only) of the created repository for user review. "
-            "Replaces any previously saved structure. Nothing is pushed. Every folder must contain at least one file. "
-            f"Limits: {MAX_FILES} files, {MAX_FILE_BYTES} bytes per file."
+            "Save the skeleton folder structure of the created repository for user review. "
+            "Pass 12-25 essential skeleton file paths from the repository root (e.g. [{'path': '/README.md'}, {'path': '/src/index.ts'}])."
         )
     )
     def tool_save_repository_structure(
-        files: Annotated[List[RepositoryFile], Field(description="Every file of the structure. Use non-empty .gitkeep, __init__.py or README.md files to keep folders.")],
+        files: Annotated[List[RepositoryFile], Field(description="List of skeleton files (12-25 files) with their 'path' fields.")],
     ) -> Dict[str, Any]:
         """TOOL 3 — SAVE REPOSITORY STRUCTURE (validated, stored in the Repository table)."""
         try:
             repository = _created_repository()
-            structure = normalize_structure(files)
+            structure_items = []
+            for f in files:
+                p = f.path if hasattr(f, "path") else f.get("path")
+                c = getattr(f, "content", None) or (f.get("content") if isinstance(f, dict) else None) or f"# Placeholder for {p}\n"
+                structure_items.append({"path": p, "content": c})
+            structure = normalize_structure(structure_items)
             return _structure_result(_save(repository, structure))
         except AdoPushError as e:
             return _error(e.message, e.error_type)
@@ -295,7 +301,7 @@ Your responsibility is to handle Azure DevOps (ADO) project and repository setup
 1. create_ado_project(project_name, project_description): creates the ADO project.
 2. update_ado_project(project_name?, project_description?): renames / re-describes the ALREADY CREATED ADO project.
 3. create_ado_repository(project_id_or_name, repository_name): creates an EMPTY Git repository in the ADO project.
-4. save_repository_structure(files: [{path, content}]): saves the COMPLETE proposed folder structure for review (nothing is pushed).
+4. save_repository_structure(files: [{path}]): saves the COMPLETE proposed folder structure for review (nothing is pushed).
 5. update_repository_structure(upsert_files, remove_paths): applies only the requested changes to the saved structure.
 6. push_repository_structure(commit_message?): pushes the saved, approved structure to the main branch as ONE commit
    (the initial commit, or a follow-up commit with only the differences if it was pushed before).
@@ -392,10 +398,11 @@ I. PUSH_REPOSITORY_STRUCTURE:
 
 STRUCTURE DESIGN RULES:
 - Base the structure strictly on the approved TRD technology stack (any language/framework). Follow that stack's conventional layout.
-- Skeleton only: sample folders and placeholder files with short, non-empty content. NO application logic.
+- Skeleton only: sample folders and placeholder files. NEVER write real code, verbose configs, or multi-line files.
+- In save_repository_structure, provide only the "path" for each file (e.g. [{"path": "/README.md"}]). Do not provide code or file content.
 - Git does not track empty folders: every folder must contain at least one non-empty file (e.g. .gitkeep, __init__.py, README.md).
 - Include a root README.md (project name + short description) and a .gitignore suited to the stack.
-- Paths start with "/" and use forward slashes. Keep it focused (typically 15-60 files, never more than 200).
+- Paths start with "/" and use forward slashes. Keep it focused (typically 12-25 files, never more than 30).
 
 ==================================================
 5. OUTPUT CONTRACT (STRICT JSON ONLY)

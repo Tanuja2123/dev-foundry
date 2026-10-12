@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Copy, Check, X, FileText } from 'lucide-react'
 import { MarkdownRenderer } from './MarkdownRenderer'
 
 type DocumentDrawerProps = {
@@ -74,7 +75,7 @@ export function DocumentDrawer({
           <div className="drawer-header-left">
             <div className="drawer-badge-row">
               <span className={`drawer-type-badge ${isPrd ? 'prd' : 'trd'}`}>
-                {isPrd ? '📄 PRD' : '⚙️ TRD'}
+                {docType}
               </span>
               <span className="drawer-project-name" title={projectName}>
                 {projectName}
@@ -96,7 +97,17 @@ export function DocumentDrawer({
                 onClick={() => void handleCopy()}
                 title="Copy markdown content to clipboard"
               >
-                {copied ? '✓ Copied' : '📋 Copy'}
+                {copied ? (
+                  <>
+                    <Check size={14} />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy size={14} />
+                    <span>Copy</span>
+                  </>
+                )}
               </button>
             )}
             <button
@@ -106,7 +117,7 @@ export function DocumentDrawer({
               title="Close drawer (Esc)"
               aria-label="Close document drawer"
             >
-              ✕
+              <X size={16} />
             </button>
           </div>
         </div>
@@ -119,7 +130,9 @@ export function DocumentDrawer({
             </div>
           ) : (
             <div className="drawer-empty-state">
-              <div className="drawer-empty-icon">📭</div>
+              <div className="drawer-empty-icon">
+                <FileText size={36} />
+              </div>
               <h3>Document Not Available</h3>
               <p>This document has not been generated for this project yet.</p>
             </div>

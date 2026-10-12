@@ -92,6 +92,7 @@ export function HomePage() {
         const mapped = items.map((item) => ({
           id: item.conversation_id,
           name: item.title,
+          stage: item.stage,
         }))
         setConversations(mapped)
         // No project is auto-selected: after signing in (or reloading) the app opens a new chat,
@@ -291,6 +292,7 @@ export function HomePage() {
         const newProject: Project = {
           id: newId,
           name: projectTitle,
+          stage: 'requirements',
         }
         setConversations((prev) => [newProject, ...prev])
         setSelectedId(newId)
@@ -394,7 +396,7 @@ export function HomePage() {
                   <PanelLeftOpen size={18} />
                 </button>
               )}
-              <h1>{isProjectsView ? 'Projects' : activeProject.name}</h1>
+              {!isProjectsView && <h1>{activeProject.name}</h1>}
             </div>
           </div>
 

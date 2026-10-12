@@ -3,7 +3,7 @@ import json
 import os
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
@@ -73,23 +73,77 @@ def get_supabase_client() -> Client:
     logger.info("[Supabase] Initialized shared singleton client with connection pooling.")
     return _supabase_client
 
+def _resolve_project_stage(project_row: Optional[Dict[str, Any]]) -> str:
+    """Derives a normalized stage key from Project table columns."""
+    if not project_row:
+        return "requirements"
+
+    stage = project_row.get("workflow_stage") or ""
+    repo_url = project_row.get("repo_url")
+    ado_project_id = project_row.get("ado_project_id")
+    has_trd = bool(project_row.get("trd"))
+    has_prd = bool(project_row.get("prd"))
+
+    if stage == "COMPLETE":
+        return "completed"
+    if repo_url or stage in ["STRUCTURE_REVIEW", "REPOSITORY_REVIEW"]:
+        return "repo_created"
+    if ado_project_id or stage == "PROJECT_REVIEW":
+        return "project_created"
+    if has_trd or stage == "TRD_REVIEW":
+        return "trd_created"
+    if has_prd or stage == "PRD_REVIEW":
+        return "prd_created"
+    return "requirements"
+
+_in_memory_conversations: Dict[str, Dict[str, Any]] = {}
+
 def get_conversations(user_id: str) -> List[ConversationItem]:
     """Conversations owned by the signed-in user, newest first."""
     supabase = get_supabase_client()
     try:
         response = (supabase.table("Conversation").select("*").eq("user_id", user_id)
                     .order("created_at", desc=True).execute())
+        conv_rows = response.data or []
+
+        # Batch lookup stage information from Project table
+        projects_by_conv: Dict[str, dict] = {}
+        conv_ids = [r["conv_id"] for r in conv_rows if r.get("conv_id")]
+        if conv_ids:
+            try:
+                proj_res = (
+                    supabase.table("Project")
+                    .select("conv_id, workflow_stage, prd, trd, ado_project_id, repo_url")
+                    .in_("conv_id", conv_ids)
+                    .execute()
+                )
+                for p_row in (proj_res.data or []):
+                    c_id = p_row.get("conv_id")
+                    if c_id:
+                        projects_by_conv[c_id] = p_row
+            except Exception as pe:
+                logger.warning(f"[Supabase] Could not batch-fetch project stages: {pe}")
+
         items = []
-        for row in response.data:
+        for row in conv_rows:
             conv_id = row.get("conv_id")
             title = row.get("title", "New Project")
             if conv_id:
-                items.append(ConversationItem(conversation_id=conv_id, title=title))
-        logger.info(f"[Supabase] Retrieved {len(items)} conversations from DB.")
+                stage = _resolve_project_stage(projects_by_conv.get(conv_id))
+                items.append(ConversationItem(conversation_id=conv_id, title=title, stage=stage))
+        logger.info(f"[Supabase] Retrieved {len(items)} conversations for user '{user_id}' from DB.")
         return items
     except Exception as e:
-        logger.error(f"[Supabase] Error fetching conversations: {str(e)}")
-        raise
+        logger.warning(f"[Supabase] Error fetching conversations: {str(e)}; falling back to local memory store.")
+        items = []
+        for c_id, row in _in_memory_conversations.items():
+            if row.get("user_id") == user_id:
+                items.append(ConversationItem(
+                    conversation_id=c_id,
+                    title=row.get("title", "New Project"),
+                    stage="requirements",
+                ))
+        return items
 
 def create_new_conversation(user_id: str, title: str = "New Project") -> ConversationItem:
     supabase = get_supabase_client()
@@ -103,7 +157,8 @@ def create_new_conversation(user_id: str, title: str = "New Project") -> Convers
     try:
         supabase.table("Conversation").insert(data).execute()
         logger.info(f"[Supabase] Created new conversation '{new_id}' (Title: '{title}')")
-        return ConversationItem(conversation_id=new_id, title=title)
+        _in_memory_conversations[new_id] = data
+        return ConversationItem(conversation_id=new_id, title=title, stage="requirements")
     except Exception as e:
         logger.error(f"[Supabase] Failed to create new conversation: {str(e)}")
         raise
@@ -113,6 +168,7 @@ def delete_conversation(conversation_id: str, user_id: str) -> bool:
     if not get_conversation_by_id(conversation_id, user_id):
         return False
 
+    _in_memory_conversations.pop(conversation_id, None)
     supabase = get_supabase_client()
     try:
         supabase.table("Conversation").delete().eq("conv_id", conversation_id).eq("user_id", user_id).execute()
@@ -318,6 +374,29 @@ def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
         return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
     return text.rstrip() + "\n\n" + tree_markdown
 
+def compact_history_message(role: str, text: str, max_chars: int = 350) -> Optional[str]:
+    """
+    Compacts past conversation messages to prevent exceeding LLM token and rate limits
+    (e.g. Groq 8000 TPM limit) while preserving essential conversational context.
+    Filters out transient framework error messages so they don't pollute subsequent turns.
+    """
+    if not text:
+        return None
+
+    # Filter out infrastructure error logs from LLM context
+    if "Error communicating with Agent Framework:" in text or "All LLM providers failed:" in text:
+        return None
+
+    if len(text) <= max_chars:
+        return text
+
+    half = max_chars // 2
+    return (
+        f"{text[:half].rstrip()}\n\n"
+        f"[... content truncated for brevity; refer to workflow state ...]\n\n"
+        f"{text[-half:].lstrip()}"
+    )
+
 async def _execute_agent_pipeline(
     client: OpenAIChatCompletionClient,
     deployment: str,
@@ -421,12 +500,14 @@ DECISION FIELDS:
         stage = effective_stage(workflow_state)
         state_note = "\n\n" + routing_context(workflow_state)
 
-        # Convert history into Agent Framework Messages
+        # Convert history into Agent Framework Messages with compacting & error filtering
         message_list = []
         for msg in history:
             role = msg.get("role", "user")
             text = msg.get("text", "")
-            message_list.append(Message(role=role, contents=[text]))
+            compact_text = compact_history_message(role, text)
+            if compact_text:
+                message_list.append(Message(role=role, contents=[compact_text]))
 
         new_msg = Message(role="user", contents=[user_query])
         message_list.append(new_msg)
@@ -434,9 +515,13 @@ DECISION FIELDS:
         # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
         logger.info(f"[Orchestrator] Running Orchestrator Agent (Provider: {provider_name}, Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
-        orchestrator_messages = list(message_list[:-1]) + [Message(role="user", contents=[user_query + state_note])]
-        orchestrator_response = await orchestrator.run(messages=orchestrator_messages,
-                                                       options={"response_format": RoutingDecision})
+        # Sliding window for Orchestrator: up to 8 recent history messages + latest query with state
+        recent_orch_history = message_list[-9:-1] if len(message_list) > 1 else []
+        orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
+        orchestrator_response = await orchestrator.run(
+            messages=orchestrator_messages,
+            options={"response_format": RoutingDecision, "max_tokens": 800}
+        )
         orch_duration = round((time.time() - orch_start) * 1000, 1)
         decision = parse_routing_decision(orchestrator_response)
         logger.info(f"[Orchestrator] Completed in {orch_duration}ms -> {decision.action} "
@@ -467,12 +552,15 @@ DECISION FIELDS:
 
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None and workflow_state.get("project"):
-                workflow_context_note += "\n\n" + store.describe_workflow_state(workflow_state, include_requirements=True)
+                include_trd = operation in ("GENERATE_TRD", "UPDATE_TRD")
+                workflow_context_note += "\n\n" + store.describe_workflow_state(
+                    workflow_state, include_prd=True, include_trd=include_trd
+                )
 
-            # Prepare message list for Requirements_Agent with clear workflow context
-            req_messages = list(message_list[:-1])
+            # Prepare message list for Requirements_Agent with clear workflow context (sliding window of up to 6 recent messages)
+            recent_req_history = message_list[-7:-1] if len(message_list) > 1 else []
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
-            req_messages.append(context_user_msg)
+            req_messages = recent_req_history + [context_user_msg]
 
             # 1. Requirements Agent Input Guardrail Check
             req_input_check = await check_requirements_agent_input(context_user_msg.text)
@@ -592,7 +680,10 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synthesis_result = await synthesizer_agent.run(
+                messages=[Message(role="user", contents=["Please present this update to the user."])],
+                options={"max_tokens": 1000}
+            )
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
@@ -600,20 +691,22 @@ Put a blank line before and after every heading, divider (---) and list; never p
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
 
+            # Repo_Setup_Agent only needs TRD architecture and folder structure (not the bulky PRD)
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None:
                 workflow_context_note += "\n\n" + store.describe_workflow_state(
-                    workflow_state, include_requirements=True, include_structure=True)
+                    workflow_state, include_prd=False, include_trd=True, include_structure=True
+                )
 
-            # Prepare message list for Repo_Setup_Agent with clear workflow context
-            repo_messages = list(message_list[:-1])
+            # Prepare message list for Repo_Setup_Agent with clear workflow context (sliding window of up to 4 recent messages)
+            recent_repo_history = message_list[-5:-1] if len(message_list) > 1 else []
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
-            repo_messages.append(context_user_msg)
+            repo_messages = recent_repo_history + [context_user_msg]
 
             # Invoke Repo Setup Child Agent
             logger.info(f"[Repo_Setup_Agent] Processing request with operation: {operation}...")
             child_start = time.time()
-            child_response = await repo_setup_agent.run(messages=repo_messages)
+            child_response = await repo_setup_agent.run(messages=repo_messages, options={"max_tokens": 1200})
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
@@ -693,7 +786,10 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synthesis_result = await synthesizer_agent.run(
+                messages=[Message(role="user", contents=["Please present this update to the user."])],
+                options={"max_tokens": 1000}
+            )
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             response_text = insert_structure_tree(response_text, structure_tree)

@@ -66,6 +66,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
     """
 
     COOLDOWN_SECONDS = 180  # After 3 minutes, give an unhealthy provider another chance
+    FIREWALL_COOLDOWN_SECONDS = 1800  # 30 minutes cooldown for firewall/network blocked providers (e.g. 403)
 
     def __init__(self, providers: List[ProviderSpec]):
         if not providers:
@@ -109,9 +110,14 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
         cooldown_indices = []
 
         for idx, provider in enumerate(self.providers):
+            cooldown = (
+                self.FIREWALL_COOLDOWN_SECONDS
+                if (provider.last_error and ("403" in provider.last_error or "Virtual Network" in provider.last_error))
+                else self.COOLDOWN_SECONDS
+            )
             if provider.is_healthy:
                 healthy_indices.append(idx)
-            elif (now - provider.last_failure_time) > self.COOLDOWN_SECONDS:
+            elif (now - provider.last_failure_time) > cooldown:
                 cooldown_indices.append(idx)
 
         # If any providers are healthy or out of cooldown, try them in hierarchy order
@@ -145,9 +151,24 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                 effective_options = dict(options) if options is not None else {}
                 effective_options["model"] = provider.model
 
+                # Protect TPM limits: Groq on-demand calculates TPM quota as (prompt_tokens + max_tokens).
+                # Limit 8000 TPM means prompt_tokens + max_tokens MUST be <= 8000.
+                if provider.provider_id == "groq":
+                    total_chars = sum(len(str(getattr(m, "contents", m))) for m in messages)
+                    est_prompt_tokens = (total_chars // 3) + 1200
+                    safe_max = max(500, 7800 - est_prompt_tokens)
+                    req_max = effective_options.get("max_tokens") or effective_options.get("max_completion_tokens") or 1500
+                    effective_options["max_tokens"] = min(req_max, safe_max)
+                else:
+                    if "max_tokens" not in effective_options and "max_completion_tokens" not in effective_options:
+                        effective_options["max_tokens"] = 3500
+
                 logger.info(
-                    f"[LLM Dispatch] Routing request to '{provider.name}' (Model: {provider.model})..."
+                    f"[LLM Dispatch] Routing request to '{provider.name}' (Model: {provider.model}, MaxTokens: {effective_options.get('max_tokens')})..."
                 )
+
+                # Timeout protection per provider to fail fast before Cloudflare's 120s timeout
+                provider_timeout = 75.0
 
                 try:
                     res = provider.client.get_response(
@@ -161,7 +182,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                         middleware=middleware,
                     )
                     if asyncio.iscoroutine(res):
-                        res = await res
+                        res = await asyncio.wait_for(res, timeout=provider_timeout)
 
                     provider.mark_success()
                     self.active_provider_index = idx
@@ -169,7 +190,10 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                     return res
 
                 except Exception as exc:
-                    err_summary = f"{type(exc).__name__}: {str(exc)}"
+                    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                        err_summary = f"TimeoutError: Request exceeded {provider_timeout}s timeout"
+                    else:
+                        err_summary = f"{type(exc).__name__}: {str(exc)}"
                     provider.mark_failed(exc)
                     errors.append(f"[{provider.name}]: {err_summary}")
                     logger.warning(
