@@ -10,6 +10,7 @@ class Suggestion(BaseModel):
 class ConversationItem(BaseModel):
     conversation_id: str = Field(..., description="Unique identifier for the conversation")
     title: str = Field(..., description="Short title shown in the UI")
+    stage: Optional[str] = Field(None, description="Current workflow stage of the project")
 
 
 class ChatRequest(BaseModel):
