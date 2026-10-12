@@ -27,17 +27,17 @@ Then fill in `.env`:
 | `VITE_AZURE_TENANT_ID` | Entra tenant ID | Yes (for sign-in) |
 | `VITE_AZURE_REDIRECT_URI` | `http://localhost:5173/auth-callback` | Yes |
 | `VITE_API_BASE_URL` | `http://localhost:8000` | Yes |
-| `SUPABASE_URL` | Supabase project URL | Optional — falls back to in-memory store |
-| `SUPABASE_KEY` | Supabase service role key | Optional — falls back to in-memory store |
-| `AZURE_OPENAI_APIKEY` | Azure OpenAI API key | Optional — falls back to demo responses |
-| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | Optional — falls back to demo responses |
+| `SUPABASE_URL` | Supabase project URL | Yes |
+| `SUPABASE_KEY` | Supabase **service-role** key (backend only). Required: after migration 003 the tables reject the anon key | Yes |
+| `SUPABASE_SERVICE_ROLE_KEY` | Optional, used instead of `SUPABASE_KEY` when set | Optional |
+| `AZURE_AD_TENANT_ID` / `AZURE_AD_CLIENT_ID` | Tenant and client id used to validate sign-in tokens. They default to the `VITE_AZURE_*` values | Optional |
+| `AZURE_OPENAI_APIKEY` | Azure OpenAI API key | Yes (chat replies fail without it) |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | Yes (chat replies fail without it) |
 | `AZURE_OPENAI_VERSION` | API version (default: `2024-12-01-preview`) | Optional |
 | `AZURE_OPENAI_DEPLOYMENT` | Deployment name (default: `gpt-4`) | Optional |
 | `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
 | `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project/code read & write scopes | Yes (for ADO project & repo creation) |
 
-> **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  
-> **Without Azure OpenAI credentials**, `/api/chat` returns a placeholder demo response.
 
 Register `http://localhost:5173/auth-callback` as a **Single-page application** redirect URI on the Entra app registration.
 
@@ -83,6 +83,21 @@ Open `http://localhost:5173` in your browser.
 `POST /api/chat` returns 404 when `conversation_id` does not exist.
 
 ---
+
+# Sign-in, Ownership and Database Security
+
+- **Sign-in on every API call:** the frontend sends the user's Microsoft Entra ID token (MSAL) as `Authorization: Bearer <token>` on every `/api/*` call.
+- **Token validation:** the backend (`backend/app/core/auth.py`) validates it: signature against the tenant's keys, issuer, audience (the app's client id) and expiry. It identifies the user by the immutable Entra object id (`oid`).
+- **Ownership:** each conversation belongs to the user who created it. The API lists only your own conversations, and another user's conversation returns **404**. `/health` stays public.
+- **User table:** signed-in users are recorded in the `AppUser` table (`user_id` = `oid`, `username`, `display_name`, `email`, `last_seen_at`).
+- **Table links:** `Project.conv_id` references `Conversation`, so deleting a conversation deletes its `Project` and `Repository` rows. Nothing is deleted in Azure DevOps.
+- **Database access:** the tables are closed to Supabase's anon/authenticated keys. Only the backend, using the **service-role key**, can read and write them.
+
+Database migrations, run in this order in the Supabase SQL editor:
+1. `backend/db/migrations/001_create_project_and_repository.sql`
+2. `backend/db/migrations/002_document_versions.sql`
+3. `backend/db/migrations/003_users_and_ownership.sql`: the `AppUser` table, the Conversation → Project link and the database hardening. **Switch the backend to the service-role key first.**
+4. `backend/db/migrations/004_assign_existing_conversations.sql`: assigns the old `default_user` conversations to one account and makes the owner mandatory. Set your email in the file and run it **after signing in once**.
 
 # Azure DevOps Repository Setup
 

@@ -1424,11 +1424,14 @@ code {
   color: var(--ms-text);
 }
 
-/* Nested list items (depth from indentation) */
-.message-body li.md-depth-1 { margin-left: 20px; list-style-type: circle; }
-.message-body li.md-depth-2 { margin-left: 40px; list-style-type: square; }
-.message-body li.md-depth-3,
-.message-body li.md-depth-4 { margin-left: 60px; list-style-type: square; }
+/* Nested lists (rendered inside their parent item) */
+.message-body li > ul,
+.message-body li > ol {
+  margin: 6px 0 4px 18px;
+}
+
+.message-body li > ul { list-style-type: circle; }
+.message-body li li > ul { list-style-type: square; }
 
 .message-body strong {
   color: var(--ms-text);

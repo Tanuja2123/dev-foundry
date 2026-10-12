@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from 'react'
-import { parseInline, parseMarkdown, type Block } from './markdownBlocks'
+import { parseInline, parseMarkdown, type Block, type ListBlock } from './markdownBlocks'
 
 type MarkdownRendererProps = {
   content: string
@@ -56,6 +56,23 @@ function formatInline(text: string, keyPrefix = ''): ReactNode[] {
   })
 }
 
+// Nested lists render inside their parent <li>, so sub-bullets never affect the parent's numbering
+function renderList(list: ListBlock, key: number): ReactNode {
+  const items = list.items.map((item, i) => (
+    <li key={i}>
+      {formatInline(item.text)}
+      {item.children.map((child, c) => renderList(child, c))}
+    </li>
+  ))
+  return list.ordered ? (
+    <ol key={key} start={list.start}>
+      {items}
+    </ol>
+  ) : (
+    <ul key={key}>{items}</ul>
+  )
+}
+
 function renderBlock(block: Block, key: number): ReactNode {
   switch (block.type) {
     case 'code':
@@ -77,20 +94,8 @@ function renderBlock(block: Block, key: number): ReactNode {
           ))}
         </blockquote>
       )
-    case 'list': {
-      const items = block.items.map((item, i) => (
-        <li key={i} className={item.depth ? `md-depth-${item.depth}` : undefined}>
-          {formatInline(item.text)}
-        </li>
-      ))
-      return block.ordered ? (
-        <ol key={key} start={block.start}>
-          {items}
-        </ol>
-      ) : (
-        <ul key={key}>{items}</ul>
-      )
-    }
+    case 'list':
+      return renderList(block, key)
     case 'table':
       return (
         <div key={key} className="message-table-wrapper">

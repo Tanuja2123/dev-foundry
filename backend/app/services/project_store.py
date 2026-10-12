@@ -70,12 +70,13 @@ def get_project(conv_id: str) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-def ensure_project(conv_id: str, user_id: str = "default_user") -> Dict[str, Any]:
+def ensure_project(conv_id: str) -> Dict[str, Any]:
+    """The conversation's Project row (created on first use). The owner is the conversation's user_id."""
     project = get_project(conv_id)
     if project:
         return project
     rows = _execute(client_factory().table(PROJECT_TABLE).insert({
-        "conv_id": conv_id, "user_id": user_id, "workflow_stage": STAGE_REQUIREMENTS,
+        "conv_id": conv_id, "workflow_stage": STAGE_REQUIREMENTS,
     }), "create project")
     logger.info(f"[ProjectStore] Created Project row for conversation '{conv_id}'")
     return rows[0]

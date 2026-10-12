@@ -5,7 +5,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
-_PRIMARY_KEYS = {"Project": "project_id", "Repository": "repo_id"}
+_PRIMARY_KEYS = {"Project": "project_id", "Repository": "repo_id", "Conversation": "conv_id", "AppUser": "user_id"}
 _clock = itertools.count(1)
 
 
@@ -28,6 +28,14 @@ class _Query:
         self.op, self.payload = "update", fields
         return self
 
+    def delete(self):
+        self.op = "delete"
+        return self
+
+    def upsert(self, row: Dict[str, Any], on_conflict: str = ""):
+        self.op, self.payload, self.on_conflict = "upsert", row, on_conflict
+        return self
+
     def eq(self, column, value):
         self.filters.append((column, value))
         return self
@@ -44,6 +52,13 @@ class _Query:
         if self.table in self.db.missing_tables:
             raise Exception({"code": "PGRST205", "message": f"Could not find the table 'public.{self.table}' in the schema cache"})
         rows = self.db.tables.setdefault(self.table, [])
+        if self.op == "upsert":
+            key = self.on_conflict or _PRIMARY_KEYS[self.table]
+            for existing in rows:
+                if existing.get(key) == self.payload.get(key):
+                    existing.update(copy.deepcopy(self.payload))
+                    return SimpleNamespace(data=[copy.deepcopy(existing)])
+            self.op = "insert"
         if self.op == "insert":
             row = copy.deepcopy(self.payload)
             row.setdefault(_PRIMARY_KEYS[self.table], str(uuid.uuid4()))
@@ -65,6 +80,9 @@ class _Query:
             return SimpleNamespace(data=[copy.deepcopy(row)])
 
         matched = [r for r in rows if all(r.get(c) == v for c, v in self.filters)]
+        if self.op == "delete":
+            self.db.tables[self.table] = [r for r in rows if r not in matched]
+            return SimpleNamespace(data=copy.deepcopy(matched))
         if self.op == "update":
             for r in matched:
                 r.update(copy.deepcopy(self.payload))

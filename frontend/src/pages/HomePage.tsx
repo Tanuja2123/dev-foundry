@@ -2,6 +2,7 @@ import { useMsal } from '@azure/msal-react'
 import { useCallback, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { PanelLeftOpen, Moon, Sun } from 'lucide-react'
+
 import {
   continueChat,
   deleteConversation,
@@ -94,7 +95,8 @@ export function HomePage() {
           stage: item.stage,
         }))
         setConversations(mapped)
-        setSelectedId((current) => current ?? mapped[0]?.id ?? null)
+        // No project is auto-selected: after signing in (or reloading) the app opens a new chat,
+        // and earlier projects stay available in the sidebar.
         setListStatus(mapped.length === 0 ? 'No projects yet.' : null)
       } catch (reason) {
         if (cancelled) return
@@ -380,6 +382,7 @@ export function HomePage() {
       <div className="main">
         <header className="topbar">
           <div className="topbar-left">
+
             <div className="topbar-title-row">
               {sidebarState === 'hidden' && (
                 <button
