@@ -21,6 +21,15 @@ type SidebarUserProfile = {
   onSignIn?: () => void
 }
 
+const STAGE_CONFIG: Record<string, { label: string; className: string }> = {
+  completed: { label: 'Completed', className: 'stage--completed' },
+  repo_created: { label: 'Repo Created', className: 'stage--repo' },
+  project_created: { label: 'Project Created', className: 'stage--project' },
+  trd_created: { label: 'TRD Created', className: 'stage--trd' },
+  prd_created: { label: 'PRD Created', className: 'stage--prd' },
+  requirements: { label: 'Requirements', className: 'stage--requirements' },
+}
+
 type SidebarProps = {
   projects: Project[]
   selectedProjectId: string | null
@@ -226,6 +235,11 @@ export function Sidebar({
 
         {filteredProjects.map((project) => {
           const isActive = project.id === selectedProjectId
+          const stageConfig = project.stage ? STAGE_CONFIG[project.stage] ?? {
+            label: project.stage.replace(/_/g, ' '),
+            className: 'stage--requirements',
+          } : null
+
           return (
             <div
               key={project.id}
@@ -235,13 +249,23 @@ export function Sidebar({
                 type="button"
                 className="project-item-button"
                 onClick={() => onSelectProject(project.id)}
-                title={project.name}
+                title={`${project.name}${stageConfig ? ` · ${stageConfig.label}` : ''}`}
                 aria-label={project.name}
               >
                 <span className="project-item-icon">
                   <FileText size={15} />
                 </span>
-                {isExpanded && <span className="project-item-name">{project.name}</span>}
+                {isExpanded && (
+                  <div className="project-item-content">
+                    <span className="project-item-name">{project.name}</span>
+                    {stageConfig && (
+                      <span className={`sidebar-stage-badge ${stageConfig.className}`}>
+                        <span className="sidebar-stage-dot" />
+                        {stageConfig.label}
+                      </span>
+                    )}
+                  </div>
+                )}
               </button>
               {isExpanded && onDeleteProject && (
                 <button

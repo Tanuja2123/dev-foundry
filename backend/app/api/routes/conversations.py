@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, status, UploadFile, File, Form
 from typing import Optional
 
 from app.schemas.conversation import ChatResponse, ConversationItem
+from app.schemas.project import ProjectOverview
 from app.services.conversation_service import (
     get_conversations,
     process_chat_request,
@@ -10,6 +11,7 @@ from app.services.conversation_service import (
     get_conversation_by_id,
     get_suggestions,
 )
+from app.services.projects_service import get_projects_overview
 from app.core.logger import logger
 
 router = APIRouter(prefix="/api", tags=["conversation"])
@@ -75,3 +77,9 @@ async def create_chat(
     except Exception as exc:
         logger.error(f"[Route] Error processing chat: {str(exc)}")
         raise
+
+
+@router.get("/projects", response_model=list[ProjectOverview])
+def list_projects() -> list[ProjectOverview]:
+    logger.info("[Route] GET /api/projects called")
+    return get_projects_overview()
