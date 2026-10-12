@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -6,6 +7,7 @@ from typing import Dict, List, Optional
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
+from openai import OpenAI
 from agent_framework import Agent, Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from supabase import create_client, Client
@@ -21,6 +23,13 @@ from app.services.workflow_routing import (RoutingDecision, blocked_reply, effec
 from app.core.logger import logger
 
 from app.services.llm_client import create_fallback_client
+from app.services.guardrails_layer import (
+    check_input_guardrail,
+    check_output_guardrail,
+    check_requirements_agent_input,
+    check_requirements_agent_output,
+    is_guardrails_enabled,
+)
 
 # Load variables from .env file (checks repo root, backend folder, and default)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../.env"))
@@ -28,6 +37,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 load_dotenv() # also try default location
 
 _warned_key_role = False
+_supabase_client: Optional[Client] = None
 
 def supabase_key_role(key: str) -> str:
     """'service_role', 'anon' or 'unknown' (supports legacy JWT keys and the newer sb_secret_/sb_publishable_ keys)."""
@@ -45,7 +55,10 @@ def supabase_key_role(key: str) -> str:
 
 def get_supabase_client() -> Client:
     """Backend-only Supabase client. Use the service-role key: the tables are closed to the anon key (migration 003)."""
-    global _warned_key_role
+    global _supabase_client, _warned_key_role
+    if _supabase_client is not None:
+        return _supabase_client
+
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
     if not url or not key:
@@ -55,7 +68,10 @@ def get_supabase_client() -> Client:
         _warned_key_role = True
         logger.warning("[Supabase] The configured key is not a service-role key. After migration 003 the tables are "
                        "closed to the anon key; set SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY) to the service-role key.")
-    return create_client(url, key)
+
+    _supabase_client = create_client(url, key)
+    logger.info("[Supabase] Initialized shared singleton client with connection pooling.")
+    return _supabase_client
 
 def get_conversations(user_id: str) -> List[ConversationItem]:
     """Conversations owned by the signed-in user, newest first."""
@@ -126,11 +142,64 @@ def get_conversation_by_id(conversation_id: str, user_id: str) -> Optional[Dict]
         raise
 
 
+# LLM and Agent Framework Client configuration (Azure OpenAI with Local SLM Fallback)
 
 # Agent Framework Client configuration (Tiered Fallback: Azure OpenAI -> Groq -> MAQ AI SLM)
 
-def get_agent_framework_client() -> OpenAIChatCompletionClient:
-    return create_fallback_client()
+def get_agent_framework_client(fallback: bool = False) -> OpenAIChatCompletionClient:
+    """Returns Agent Framework client, prioritizing the tiered fallback client."""
+    if fallback:
+        return get_local_slm_client()
+    try:
+        return create_fallback_client()
+    except Exception as e:
+        logger.warning(f"[LLM Client] Failed to create tiered fallback client ({e}). Using direct client.")
+        try:
+            return get_azure_openai_client()
+        except Exception:
+            return get_local_slm_client()
+
+def get_azure_openai_client() -> OpenAIChatCompletionClient:
+    """Configures primary Azure OpenAI client for Microsoft Agent Framework."""
+    api_key = os.getenv("AZURE_OPENAI_APIKEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_version = os.getenv("AZURE_OPENAI_VERSION", "2024-12-01-preview")
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+    
+    if not api_key or not endpoint:
+        logger.error("[Azure OpenAI] Credentials missing in environment.")
+        raise ValueError("Azure OpenAI credentials not found in environment.")
+        
+    return OpenAIChatCompletionClient(
+        model=deployment,
+        api_key=api_key,
+        azure_endpoint=endpoint,
+        api_version=api_version,
+    )
+
+def get_local_slm_config() -> Dict[str, str]:
+    """Retrieves Local SLM fallback configuration from environment."""
+    api_key = os.getenv("LOCAL_SLM_API_KEY") or os.getenv("LOCAL_SLM_APIKEY")
+    base_url = os.getenv("LOCAL_SLM_BASE_URL", "https://llm.maqsoftware.net/v1")
+    model = os.getenv("LOCAL_SLM_MODEL", "qwen-3.8-27b")
+    return {
+        "api_key": api_key or "",
+        "base_url": base_url,
+        "model": model,
+    }
+
+def get_local_slm_client() -> OpenAIChatCompletionClient:
+    """Configures fallback Local SLM client for Microsoft Agent Framework."""
+    config = get_local_slm_config()
+    if not config["api_key"]:
+        logger.error("[Local SLM] LOCAL_SLM_API_KEY missing in environment.")
+        raise ValueError("Local SLM credentials not found in environment (LOCAL_SLM_API_KEY missing).")
+        
+    return OpenAIChatCompletionClient(
+        model=config["model"],
+        api_key=config["api_key"],
+        base_url=config["base_url"],
+    )
 
 # Workflow state persistence (Project / Repository tables)
 
@@ -249,11 +318,17 @@ def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
         return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
     return text.rstrip() + "\n\n" + tree_markdown
 
-async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
-    """Uses Microsoft Agent Framework to generate a response with conversation history."""
+async def _execute_agent_pipeline(
+    client: OpenAIChatCompletionClient,
+    deployment: str,
+    user_query: str,
+    history: List[Dict],
+    conversation_id: Optional[str] = None,
+) -> str:
+    """Executes the Microsoft Agent Framework multi-agent pipeline with the given client."""
     try:
-        client = get_agent_framework_client()
-        deployment = getattr(client, "current_model", None) or getattr(client, "model", None) or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+        client = client or get_agent_framework_client()
+        deployment = getattr(client, "current_model", None) or getattr(client, "model", None) or deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
         provider_name = getattr(client, "current_provider_name", "Primary")
 
         main_agent_prompt = """
@@ -399,13 +474,49 @@ DECISION FIELDS:
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
             req_messages.append(context_user_msg)
 
-            # Invoke Requirements Child Agent
-            logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
-            child_start = time.time()
-            child_response = await requirements_agent.run(messages=req_messages)
-            child_duration = round((time.time() - child_start) * 1000, 1)
-            child_raw_json = child_response.messages[-1].text if child_response.messages else ""
-            logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
+            # 1. Requirements Agent Input Guardrail Check
+            req_input_check = await check_requirements_agent_input(context_user_msg.text)
+            if not req_input_check.allowed:
+                logger.warning(
+                    f"[Requirements_Agent Guardrail Block] Input blocked by '{req_input_check.guardrail_name}': {req_input_check.blocked_reason}"
+                )
+                child_raw_json = json.dumps({
+                    "workflow_stage": "PRD",
+                    "status": "CLARIFICATION_REQUIRED",
+                    "clarification_questions": [{
+                        "question": f"The requirements request could not be processed due to a security policy violation ({req_input_check.guardrail_name}). Please adjust your request.",
+                        "choices": [],
+                        "reason": req_input_check.blocked_reason or "Guardrail violation"
+                    }],
+                    "known_so_far": "Request flagged by requirements security guardrail.",
+                    "readiness_check": {}
+                })
+            else:
+                # Invoke Requirements Child Agent
+                logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
+                child_start = time.time()
+                child_response = await requirements_agent.run(messages=req_messages)
+                child_duration = round((time.time() - child_start) * 1000, 1)
+                child_raw_json = child_response.messages[-1].text if child_response.messages else ""
+                logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
+
+                # 2. Requirements Agent Output Guardrail Check
+                req_output_check = await check_requirements_agent_output(child_raw_json)
+                if not req_output_check.allowed:
+                    logger.warning(
+                        f"[Requirements_Agent Guardrail Block] Output blocked by '{req_output_check.guardrail_name}': {req_output_check.blocked_reason}"
+                    )
+                    child_raw_json = json.dumps({
+                        "workflow_stage": "PRD",
+                        "status": "CLARIFICATION_REQUIRED",
+                        "clarification_questions": [{
+                            "question": "The generated requirements document could not be validated by internal safety checks. Would you like to refine the specification?",
+                            "choices": [],
+                            "reason": req_output_check.blocked_reason or "Output guardrail violation"
+                        }],
+                        "known_so_far": "Requirements generation interrupted by guardrail.",
+                        "readiness_check": {}
+                    })
 
             # Readiness guard: a new PRD is only accepted when the agent's own readiness check has no missing item
             missing = missing_readiness_items(child_raw_json) if operation == "GENERATE_PRD" else []
@@ -601,7 +712,105 @@ Put a blank line before and after every heading, divider (---) and list; never p
                     "contains text that looks like instructions to the AI (a possible prompt injection). Please remove that text "
                     "and try again. Nothing was changed.")
         logger.error(f"[Agent Pipeline] Error: {str(e)}")
-        return f"Error communicating with Agent Framework: {str(e)}"
+        raise
+
+async def generate_direct_slm_chat_response(
+    user_query: str,
+    history: List[Dict],
+    conversation_id: Optional[str] = None,
+) -> str:
+    """Fallback chat completion using direct OpenAI client pointing to Local SLM."""
+    config = get_local_slm_config()
+    api_key = config["api_key"]
+    base_url = config["base_url"]
+    model = config["model"]
+
+    if not api_key:
+        raise ValueError("Local SLM API key is not configured (LOCAL_SLM_API_KEY).")
+
+    logger.info(f"[Local SLM Direct] Generating chat response with model '{model}' at '{base_url}'...")
+
+    client = OpenAI(
+        base_url=base_url,
+        api_key=api_key,
+    )
+
+    system_prompt = (
+        "You are DevFoundry, an AI-powered software development orchestration assistant.\n"
+        "You assist users with planning software requirements (PRD), technical requirements (TRD), "
+        "and repository planning. Be concise, friendly, structured, and helpful."
+    )
+    workflow_state = store.get_workflow_state(conversation_id) if conversation_id else None
+    if workflow_state:
+        state_desc = store.describe_workflow_state(workflow_state, include_requirements=True)
+        if state_desc:
+            system_prompt += f"\n\n[Current Project & Requirements State]:\n{state_desc}"
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in history:
+        role = msg.get("role", "user")
+        text = msg.get("text", "")
+        if role in ("user", "assistant", "system") and text:
+            messages.append({"role": role, "content": text})
+
+    messages.append({"role": "user", "content": user_query})
+
+    def _sync_create():
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
+
+    resp = await asyncio.to_thread(_sync_create)
+    return resp.choices[0].message.content or ""
+
+async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
+    """
+    Attempts to generate a response via Azure OpenAI and Microsoft Agent Framework (primary).
+    If Azure OpenAI encounters any errors (missing credentials, auth error, firewall/network, quota, etc.),
+    automatically falls back to the Local SLM configuration.
+    """
+    azure_error: Optional[Exception] = None
+
+    # 1. Primary: Azure OpenAI via Agent Framework
+    try:
+        azure_client = get_azure_openai_client()
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+        return await _execute_agent_pipeline(azure_client, deployment, user_query, history, conversation_id)
+    except Exception as e:
+        azure_error = e
+        logger.warning(f"[Azure OpenAI] Primary execution failed ({str(e)}). Switching to Local SLM fallback...")
+
+    # 2. Local SLM configuration verification
+    local_config = get_local_slm_config()
+    if not local_config["api_key"]:
+        err_msg = (
+            f"Azure OpenAI error: {str(azure_error)}. "
+            "Local SLM fallback is not configured. Please set LOCAL_SLM_API_KEY in your .env file."
+        )
+        logger.error(f"[Fallback Failed] {err_msg}")
+        return err_msg
+
+    # 3. Attempt Agent Framework with Local SLM
+    try:
+        local_client = get_local_slm_client()
+        logger.info(f"[Local SLM] Attempting Agent Framework with model '{local_config['model']}'...")
+        return await _execute_agent_pipeline(local_client, local_config["model"], user_query, history, conversation_id)
+    except Exception as local_af_error:
+        logger.warning(
+            f"[Local SLM] Agent Framework execution with Local SLM failed ({str(local_af_error)}). "
+            "Falling back to direct OpenAI chat completion..."
+        )
+
+    # 4. Fallback to direct Local SLM chat completion
+    try:
+        return await generate_direct_slm_chat_response(user_query, history, conversation_id)
+    except Exception as direct_error:
+        err_msg = (
+            f"Azure OpenAI failed ({str(azure_error)}) and Local SLM fallback failed ({str(direct_error)})."
+        )
+        logger.error(f"[Fallback Failed] {err_msg}")
+        return err_msg
 
 def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
     """Next-step suggestions (label + prompt) for the chips above the chat input."""
@@ -640,8 +849,44 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
         if file_info:
             user_query = user_query + f"\n\n[Attached File Content]:\n{file_info}"
 
+    # 1. Orchestrator Input Guardrail Boundary
+    input_check = await check_input_guardrail(user_query)
+    if not input_check.allowed:
+        logger.warning(
+            f"[Orchestrator Guardrail Block] User input blocked by '{input_check.guardrail_name}': {input_check.blocked_reason}"
+        )
+        friendly_error = (
+            f"Your request could not be processed because it violates our safety policy "
+            f"({input_check.guardrail_name}). Please adjust your message and try again."
+        )
+        content_array.append({"role": "user", "text": user_query})
+        content_array.append({"role": "assistant", "text": friendly_error})
+        supabase = get_supabase_client()
+        try:
+            supabase.table("Conversation").update({"content": content_array}).eq("conv_id", conversation_id).execute()
+        except Exception as e:
+            logger.error(f"[Supabase] Failed to save conversation history on guardrail block: {e}")
+        return ChatResponse(
+            conversation_id=conversation_id,
+            response=friendly_error,
+            suggestions=get_suggestions(conversation_id),
+        )
+
     # Generate response via multi-agent pipeline
     response_text = await generate_chat_response(user_query, content_array, conversation_id)
+
+    # 2. Orchestrator Output Guardrail Boundary (redacts PII / blocks restricted URLs)
+    output_check = await check_output_guardrail(response_text)
+    if not output_check.allowed:
+        logger.warning(
+            f"[Orchestrator Guardrail Block] Synthesized response blocked by '{output_check.guardrail_name}': {output_check.blocked_reason}"
+        )
+        response_text = (
+            "I apologize, but the generated response was blocked by our security and safety filters. "
+            "Please try rephrasing your request."
+        )
+    elif output_check.response_text:
+        response_text = output_check.response_text
     
     # Extract dynamically generated title on first message
     if response_text.startswith("TITLE:"):
