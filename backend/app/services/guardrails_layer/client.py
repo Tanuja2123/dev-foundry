@@ -3,7 +3,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from openai import AsyncOpenAI
 from guardrails import (
@@ -159,14 +159,78 @@ def _get_slm_context() -> _SLMContext:
     return _SLMContext(guardrail_llm=client)
 
 
+# Security Priority Hierarchy
+# Tier 1 (100): Adversarial attacks (Jailbreak, Prompt Injection, System Prompt Leakage)
+# Tier 2 (50):  Harmful / Inappropriate Content (NSFW Text, NSFW, Moderation)
+# Tier 3 (10):  Scope & Topic Mismatches (Off Topic Prompts)
+GUARDRAIL_PRIORITY: Dict[str, int] = {
+    "Jailbreak": 100,
+    "Prompt Injection Detection": 100,
+    "Prompt Injection": 100,
+    "System Prompt Leakage": 100,
+    "NSFW Text": 50,
+    "NSFW": 50,
+    "Moderation": 50,
+    "Off Topic Prompts": 10,
+}
+
+
+def get_guardrail_priority(name: str) -> int:
+    return GUARDRAIL_PRIORITY.get(name, 0)
+
+
+def select_prioritized_tripwire(tripwires: List[GuardrailResult]) -> GuardrailResult:
+    """
+    Selects the most critical guardrail violation according to the security hierarchy:
+    Adversarial Attacks (Jailbreak / Prompt Injection) > Harmful Content (NSFW) > Scope (Off-Topic).
+    If two guardrails share the same priority tier, the one with higher confidence score is chosen.
+    """
+    def _rank(item: GuardrailResult) -> Tuple[int, float]:
+        name = (item.info or {}).get("guardrail_name", "")
+        priority = get_guardrail_priority(name)
+        confidence = (item.info or {}).get("confidence", 0.0)
+        try:
+            conf_val = float(confidence)
+        except (ValueError, TypeError):
+            conf_val = 0.0
+        return (priority, conf_val)
+
+    return max(tripwires, key=_rank)
+
+
+def _format_tripwire_summary(guardrail_result: GuardrailResult, all_tripwires: Optional[List[GuardrailResult]] = None) -> GuardrailResultSummary:
+    info = guardrail_result.info if guardrail_result else {}
+    guardrail_name = info.get("guardrail_name") or "Input Guardrail"
+    blocked_reason = (
+        info.get("reason")
+        or (info.get("blocked_reasons")[0] if info.get("blocked_reasons") else None)
+        or f"Input violated guardrail '{guardrail_name}'"
+    )
+    all_names = [r.info.get("guardrail_name") for r in (all_tripwires or [guardrail_result]) if r.info]
+    logger.warning(
+        f"[Guardrails Audit] INPUT TRIPWIRE TRIGGERED: guardrail='{guardrail_name}' | "
+        f"all_triggered={all_names} | reason='{blocked_reason}' | info={info}"
+    )
+    return GuardrailResultSummary(
+        allowed=False,
+        response_text=None,
+        blocked_reason=str(blocked_reason),
+        guardrail_name=guardrail_name,
+        info=info,
+    )
+
+
 async def check_input_guardrail(
     text: str,
     config_path: Optional[Union[str, Path]] = None,
 ) -> GuardrailResultSummary:
     """
     Validates user input against the Orchestrator Input Guardrails:
-    - Off-Topic Prompts
+    - Jailbreak (adversarial attacks, instruction overrides)
     - Prompt Injection Detection
+    - NSFW Text (harassment, profanity, violence)
+    - Off-Topic Prompts
+    Applies security hierarchy when multiple tripwires trigger concurrently.
     """
     if not is_guardrails_enabled():
         return GuardrailResultSummary(allowed=True, response_text=text)
@@ -192,31 +256,19 @@ async def check_input_guardrail(
             media_type="text/plain",
             guardrails=guardrails_instances,
             raise_guardrail_errors=True,
-            suppress_tripwire=False,
+            suppress_tripwire=True,
         )
+
+        tripwires = [r for r in results if r.tripwire_triggered]
+        if tripwires:
+            selected = select_prioritized_tripwire(tripwires)
+            return _format_tripwire_summary(selected, all_tripwires=tripwires)
 
         return GuardrailResultSummary(allowed=True, response_text=text)
 
     except GuardrailTripwireTriggered as exc:
         guardrail_result = getattr(exc, "guardrail_result", None)
-        info = guardrail_result.info if guardrail_result else {}
-        guardrail_name = info.get("guardrail_name") or "Input Guardrail"
-        blocked_reason = (
-            info.get("reason")
-            or (info.get("blocked_reasons")[0] if info.get("blocked_reasons") else None)
-            or f"Input violated guardrail '{guardrail_name}'"
-        )
-        logger.warning(
-            f"[Guardrails Audit] INPUT TRIPWIRE TRIGGERED: guardrail='{guardrail_name}' | "
-            f"reason='{blocked_reason}' | info={info}"
-        )
-        return GuardrailResultSummary(
-            allowed=False,
-            response_text=None,
-            blocked_reason=str(blocked_reason),
-            guardrail_name=guardrail_name,
-            info=info,
-        )
+        return _format_tripwire_summary(guardrail_result)
     except Exception as exc:
         logger.error(f"[Guardrails Audit] Input validation error (fail-closed): {exc}")
         return GuardrailResultSummary(
