@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from pydantic import BaseModel
 from typing import Optional
 
 from app.core.auth import CurrentUser, get_current_user
@@ -12,7 +13,7 @@ from app.services.conversation_service import (
     get_conversation_by_id,
     get_suggestions,
 )
-from app.services.projects_service import get_projects_overview
+from app.services.projects_service import get_projects_overview, update_project_name
 from app.core.logger import logger
 
 # Every route requires a signed-in user (Microsoft Entra ID token) and only sees that user's conversations.
@@ -70,11 +71,12 @@ async def create_chat(
     file: Optional[UploadFile] = File(None, description="Optional PDF or Word file"),
     user: CurrentUser = Depends(get_current_user),
 ) -> ChatResponse:
+    clean_conv_id = None if (not conversation_id or str(conversation_id).strip().lower() in ("null", "none", "")) else conversation_id.strip()
     file_info = f" with file '{file.filename}'" if file else ""
-    logger.info(f"[Route] POST /api/chat received for conversation '{conversation_id}'{file_info}")
+    logger.info(f"[Route] POST /api/chat received for conversation '{clean_conv_id}'{file_info}")
     logger.info(f"[User Query]: \"{user_query[:100]}{'...' if len(user_query) > 100 else ''}\"")
     try:
-        return await process_chat_request(conversation_id, user_query, file, user_id=user.user_id)
+        return await process_chat_request(clean_conv_id, user_query, file, user_id=user.user_id)
     except ValueError as exc:
         logger.warning(f"[Route] Conversation not found or invalid input: {str(exc)}")
         raise HTTPException(
@@ -87,6 +89,28 @@ async def create_chat(
 
 
 @router.get("/projects", response_model=list[ProjectOverview])
-def list_projects() -> list[ProjectOverview]:
-    logger.info("[Route] GET /api/projects called")
-    return get_projects_overview()
+def list_projects(user: CurrentUser = Depends(get_current_user)) -> list[ProjectOverview]:
+    logger.info(f"[Route] GET /api/projects called by user '{user.user_id}'")
+    return get_projects_overview(user.user_id)
+
+
+class RenameProjectRequest(BaseModel):
+    project_name: str
+
+
+@router.patch("/projects/{conversation_id}", response_model=ProjectOverview)
+def rename_project(
+    conversation_id: str,
+    payload: RenameProjectRequest,
+    user: CurrentUser = Depends(get_current_user),
+) -> ProjectOverview:
+    logger.info(f"[Route] PATCH /api/projects/{conversation_id} called by user '{user.user_id}' with name '{payload.project_name}'")
+    try:
+        return update_project_name(conversation_id, payload.project_name, user.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"[Route] Error renaming project: {exc}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
