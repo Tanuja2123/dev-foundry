@@ -10,6 +10,7 @@ import {
   User,
   LogIn,
 } from 'lucide-react'
+import { ConfirmModal } from './ConfirmModal'
 import type { Project } from '../types'
 
 export type SidebarState = 'expanded' | 'collapsed' | 'hidden'
@@ -64,6 +65,7 @@ export function Sidebar({
   const [searchQuery, setSearchQuery] = useState('')
   const [isProfileOpen, setIsProfileOpen] = useState(false)
   const [isResizing, setIsResizing] = useState(false)
+  const [pendingDeleteProject, setPendingDeleteProject] = useState<Project | null>(null)
   const profileContainerRef = useRef<HTMLDivElement>(null)
 
   const isExpanded = sidebarState !== 'hidden'
@@ -275,9 +277,7 @@ export function Sidebar({
                   aria-label={`Delete ${project.name}`}
                   onClick={(e) => {
                     e.stopPropagation()
-                    if (window.confirm(`Delete "${project.name}"?`)) {
-                      onDeleteProject(project.id)
-                    }
+                    setPendingDeleteProject(project)
                   }}
                 >
                   <Trash2 size={13} />
@@ -396,6 +396,22 @@ export function Sidebar({
           <div className="sidebar-resizer-handle" />
         </div>
       )}
+
+      {/* Re-verify Delete Confirmation Modal */}
+      <ConfirmModal
+        isOpen={Boolean(pendingDeleteProject)}
+        title="Delete Conversation"
+        message={`Do you want to delete "${pendingDeleteProject?.name || 'this conversation'}"? This will permanently delete the conversation and its requirement documents. This action cannot be undone.`}
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          if (pendingDeleteProject) {
+            onDeleteProject?.(pendingDeleteProject.id)
+            setPendingDeleteProject(null)
+          }
+        }}
+        onCancel={() => setPendingDeleteProject(null)}
+      />
     </aside>
   )
 }

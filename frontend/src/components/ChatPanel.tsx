@@ -6,7 +6,7 @@ import {
   X,
   ArrowDown,
   AlertCircle,
-  Loader2,
+  Square,
   FileText,
   Lightbulb,
 } from 'lucide-react'
@@ -63,6 +63,7 @@ type ChatPanelProps = {
   sending: boolean
   error: string | null
   onSend: (content: string) => void
+  onStop?: () => void
   onFilesAdded: (files: FileList) => void
   onRemoveFile: (name: string) => void
 }
@@ -76,6 +77,7 @@ export function ChatPanel({
   sending,
   error,
   onSend,
+  onStop,
   onFilesAdded,
   onRemoveFile,
 }: ChatPanelProps) {
@@ -298,14 +300,20 @@ export function ChatPanel({
 
             <button
               type="button"
-              className="composer-icon-button send-icon-btn"
-              disabled={!canSend}
-              onClick={() => submit()}
-              title="Send message"
-              aria-label="Send message"
+              className={`composer-icon-button ${sending ? 'stop-icon-btn' : 'send-icon-btn'}`}
+              disabled={!sending && !canSend}
+              onClick={() => {
+                if (sending) {
+                  onStop?.()
+                } else {
+                  submit()
+                }
+              }}
+              title={sending ? 'Stop generating' : 'Send message'}
+              aria-label={sending ? 'Stop generating' : 'Send message'}
             >
               {sending ? (
-                <Loader2 size={16} className="send-spinner-icon" />
+                <Square size={13} fill="currentColor" strokeWidth={0} />
               ) : (
                 <ArrowUp size={18} />
               )}

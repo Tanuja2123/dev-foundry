@@ -86,9 +86,10 @@ Open `http://localhost:5173` in your browser.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Returns `{ "status": "ok" }` |
-| GET | `/api/conversation` | Lists all conversations (`conversation_id`, `title`) |
+| GET | `/api/conversation` | Lists all conversations owned by the user (`conversation_id`, `title`) |
 | POST | `/api/conversation` | Creates a new conversation; returns `{ "conversation_id", "title" }` |
 | POST | `/api/chat` | Accepts JSON `{ "conversation_id", "user_query" }` or multipart form-data with an optional `file` field; returns `{ "conversation_id", "response" }` |
+| GET | `/api/projects` | Lists all projects owned by the signed-in user (`conversation_id`, `project_name`, `prd`, `trd`, etc.) |
 
 `POST /api/chat` returns 404 when `conversation_id` does not exist.
 
@@ -99,6 +100,7 @@ Open `http://localhost:5173` in your browser.
 - **Sign-in on every API call:** the frontend sends the user's Microsoft Entra ID token (MSAL) as `Authorization: Bearer <token>` on every `/api/*` call.
 - **Token validation:** the backend (`backend/app/core/auth.py`) validates it: signature against the tenant's keys, issuer, audience (the app's client id) and expiry. It identifies the user by the immutable Entra object id (`oid`).
 - **Ownership:** each conversation belongs to the user who created it. The API lists only your own conversations, and another user's conversation returns **404**. `/health` stays public.
+- **Project ownership:** projects are linked to conversations via `conv_id`. `GET /api/projects` returns only the projects associated with the signed-in user's conversations.
 - **User table:** signed-in users are recorded in the `AppUser` table (`user_id` = `oid`, `username`, `display_name`, `email`, `last_seen_at`).
 - **Table links:** `Project.conv_id` references `Conversation`, so deleting a conversation deletes its `Project` and `Repository` rows. Nothing is deleted in Azure DevOps.
 - **Database access:** the tables are closed to Supabase's anon/authenticated keys. Only the backend, using the **service-role key**, can read and write them.
