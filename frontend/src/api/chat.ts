@@ -65,12 +65,11 @@ export async function continueChat(
   conversationId: string | null | undefined,
   userQuery: string,
   file?: File | null,
+  signal?: AbortSignal,
 ): Promise<ChatApiResponse> {
   const formData = new FormData()
-  if (conversationId) {
-    formData.append('conversation_id', conversationId)
-  }
   formData.append('user_query', userQuery)
+  formData.append('conversation_id', conversationId && conversationId.trim() !== '' ? conversationId : 'null')
   if (file) {
     formData.append('file', file)
   }
@@ -78,6 +77,7 @@ export async function continueChat(
   const response = await authFetch(`${apiBaseUrl()}/api/chat`, {
     method: 'POST',
     body: formData,
+    signal,
   })
   if (!response.ok) {
     throw new Error(await readError(response, 'Chat request failed'))

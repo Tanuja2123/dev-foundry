@@ -1,8 +1,9 @@
+import asyncio
 import json
 import os
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
@@ -23,6 +24,14 @@ from app.services.workflow_routing import (RoutingDecision, blocked_reply, effec
 from app.core.logger import logger
 
 from app.services.llm_client import AllProvidersFailedError, create_fallback_client
+from app.services.llm_client import create_fallback_client
+from app.services.guardrails_layer import (
+    check_input_guardrail,
+    check_output_guardrail,
+    check_requirements_agent_input,
+    check_requirements_agent_output,
+    is_guardrails_enabled,
+)
 
 # Load variables from .env file (checks repo root, backend folder, and default)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../../.env"))
@@ -30,6 +39,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 load_dotenv() # also try default location
 
 _warned_key_role = False
+_supabase_client: Optional[Client] = None
 
 def supabase_key_role(key: str) -> str:
     """'service_role', 'anon' or 'unknown' (supports legacy JWT keys and the newer sb_secret_/sb_publishable_ keys)."""
@@ -47,7 +57,10 @@ def supabase_key_role(key: str) -> str:
 
 def get_supabase_client() -> Client:
     """Backend-only Supabase client. Use the service-role key: the tables are closed to the anon key (migration 003)."""
-    global _warned_key_role
+    global _supabase_client, _warned_key_role
+    if _supabase_client is not None:
+        return _supabase_client
+
     url = os.getenv("SUPABASE_URL")
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
     if not url or not key:
@@ -57,7 +70,35 @@ def get_supabase_client() -> Client:
         _warned_key_role = True
         logger.warning("[Supabase] The configured key is not a service-role key. After migration 003 the tables are "
                        "closed to the anon key; set SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_KEY) to the service-role key.")
-    return create_client(url, key)
+
+    _supabase_client = create_client(url, key)
+    logger.info("[Supabase] Initialized shared singleton client with connection pooling.")
+    return _supabase_client
+
+def _resolve_project_stage(project_row: Optional[Dict[str, Any]]) -> str:
+    """Derives a normalized stage key from Project table columns."""
+    if not project_row:
+        return "requirements"
+
+    stage = project_row.get("workflow_stage") or ""
+    repo_url = project_row.get("repo_url")
+    ado_project_id = project_row.get("ado_project_id")
+    has_trd = bool(project_row.get("trd"))
+    has_prd = bool(project_row.get("prd"))
+
+    if stage == "COMPLETE":
+        return "completed"
+    if repo_url or stage in ["STRUCTURE_REVIEW", "REPOSITORY_REVIEW"]:
+        return "repo_created"
+    if ado_project_id or stage == "PROJECT_REVIEW":
+        return "project_created"
+    if has_trd or stage == "TRD_REVIEW":
+        return "trd_created"
+    if has_prd or stage == "PRD_REVIEW":
+        return "prd_created"
+    return "requirements"
+
+_in_memory_conversations: Dict[str, Dict[str, Any]] = {}
 
 def get_conversations(user_id: str) -> List[ConversationItem]:
     """Conversations owned by the signed-in user, newest first."""
@@ -65,17 +106,46 @@ def get_conversations(user_id: str) -> List[ConversationItem]:
     try:
         response = (supabase.table("Conversation").select("*").eq("user_id", user_id)
                     .order("created_at", desc=True).execute())
+        conv_rows = response.data or []
+
+        # Batch lookup stage information from Project table
+        projects_by_conv: Dict[str, dict] = {}
+        conv_ids = [r["conv_id"] for r in conv_rows if r.get("conv_id")]
+        if conv_ids:
+            try:
+                proj_res = (
+                    supabase.table("Project")
+                    .select("conv_id, workflow_stage, prd, trd, ado_project_id, repo_url")
+                    .in_("conv_id", conv_ids)
+                    .execute()
+                )
+                for p_row in (proj_res.data or []):
+                    c_id = p_row.get("conv_id")
+                    if c_id:
+                        projects_by_conv[c_id] = p_row
+            except Exception as pe:
+                logger.warning(f"[Supabase] Could not batch-fetch project stages: {pe}")
+
         items = []
-        for row in response.data:
+        for row in conv_rows:
             conv_id = row.get("conv_id")
             title = row.get("title", "New Project")
             if conv_id:
-                items.append(ConversationItem(conversation_id=conv_id, title=title))
-        logger.info(f"[Supabase] Retrieved {len(items)} conversations from DB.")
+                stage = _resolve_project_stage(projects_by_conv.get(conv_id))
+                items.append(ConversationItem(conversation_id=conv_id, title=title, stage=stage))
+        logger.info(f"[Supabase] Retrieved {len(items)} conversations for user '{user_id}' from DB.")
         return items
     except Exception as e:
-        logger.error(f"[Supabase] Error fetching conversations: {str(e)}")
-        raise
+        logger.warning(f"[Supabase] Error fetching conversations: {str(e)}; falling back to local memory store.")
+        items = []
+        for c_id, row in _in_memory_conversations.items():
+            if row.get("user_id") == user_id:
+                items.append(ConversationItem(
+                    conversation_id=c_id,
+                    title=row.get("title", "New Project"),
+                    stage="requirements",
+                ))
+        return items
 
 def create_new_conversation(user_id: str, title: str = "New Project") -> ConversationItem:
     supabase = get_supabase_client()
@@ -89,7 +159,8 @@ def create_new_conversation(user_id: str, title: str = "New Project") -> Convers
     try:
         supabase.table("Conversation").insert(data).execute()
         logger.info(f"[Supabase] Created new conversation '{new_id}' (Title: '{title}')")
-        return ConversationItem(conversation_id=new_id, title=title)
+        _in_memory_conversations[new_id] = data
+        return ConversationItem(conversation_id=new_id, title=title, stage="requirements")
     except Exception as e:
         logger.error(f"[Supabase] Failed to create new conversation: {str(e)}")
         raise
@@ -99,6 +170,7 @@ def delete_conversation(conversation_id: str, user_id: str) -> bool:
     if not get_conversation_by_id(conversation_id, user_id):
         return False
 
+    _in_memory_conversations.pop(conversation_id, None)
     supabase = get_supabase_client()
     try:
         supabase.table("Conversation").delete().eq("conv_id", conversation_id).eq("user_id", user_id).execute()
@@ -128,11 +200,77 @@ def get_conversation_by_id(conversation_id: str, user_id: str) -> Optional[Dict]
         raise
 
 
+# LLM and Agent Framework Client configuration (Azure OpenAI with Local SLM Fallback)
 
 # Agent Framework Client configuration (Tiered Fallback: Azure OpenAI -> Groq -> MAQ AI SLM)
 
-def get_agent_framework_client() -> OpenAIChatCompletionClient:
-    return create_fallback_client()
+def get_agent_framework_client(fallback: bool = False) -> OpenAIChatCompletionClient:
+    """Returns Agent Framework client, prioritizing the tiered fallback client."""
+    if fallback:
+        return get_local_slm_client()
+    try:
+        return create_fallback_client()
+    except Exception as e:
+        logger.warning(f"[LLM Client] Failed to create tiered fallback client ({e}). Using direct client.")
+        try:
+            return get_azure_openai_client()
+        except Exception:
+            return get_local_slm_client()
+
+def get_azure_openai_client() -> OpenAIChatCompletionClient:
+    """Configures primary Azure OpenAI client for Microsoft Agent Framework."""
+    api_key = os.getenv("AZURE_OPENAI_APIKEY")
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_version = os.getenv("AZURE_OPENAI_VERSION", "2024-12-01-preview")
+    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+    
+    if not api_key or not endpoint:
+        logger.error("[Azure OpenAI] Credentials missing in environment.")
+        raise ValueError("Azure OpenAI credentials not found in environment.")
+        
+    return OpenAIChatCompletionClient(
+        model=deployment,
+        api_key=api_key,
+        azure_endpoint=endpoint,
+        api_version=api_version,
+    )
+
+def get_local_slm_config() -> Dict[str, str]:
+    """Retrieves Local SLM fallback configuration from environment, prioritizing MAQ_AI_API_KEY."""
+    api_key = (
+        os.getenv("MAQ_AI_API_KEY")
+        or os.getenv("LOCAL_SLM_API_KEY")
+        or os.getenv("LOCAL_SLM_APIKEY")
+        or ""
+    ).strip()
+    base_url = (
+        os.getenv("MAQ_AI_BASE_URL")
+        or os.getenv("LOCAL_SLM_BASE_URL")
+        or "https://indiaai.maqsoftware.net/v1"
+    ).strip()
+    model = (
+        os.getenv("MAQ_AI_MODEL")
+        or os.getenv("LOCAL_SLM_MODEL")
+        or "qwen-3.8-27b"
+    ).strip()
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+    }
+
+def get_local_slm_client() -> OpenAIChatCompletionClient:
+    """Configures fallback Local SLM client for Microsoft Agent Framework."""
+    config = get_local_slm_config()
+    if not config["api_key"]:
+        logger.error("[Local SLM] MAQ_AI_API_KEY / LOCAL_SLM_API_KEY missing in environment.")
+        raise ValueError("Local SLM credentials not found in environment (MAQ_AI_API_KEY missing).")
+        
+    return OpenAIChatCompletionClient(
+        model=config["model"],
+        api_key=config["api_key"],
+        base_url=config["base_url"],
+    )
 
 # Workflow state persistence (Project / Repository tables)
 
@@ -312,11 +450,41 @@ def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
         return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
     return text.rstrip() + "\n\n" + tree_markdown
 
-async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
-    """Uses Microsoft Agent Framework to generate a response with conversation history."""
+def compact_history_message(role: str, text: str, max_chars: int = 350) -> Optional[str]:
+    """
+    Compacts past conversation messages to prevent exceeding LLM token and rate limits
+    (e.g. Groq 8000 TPM limit) while preserving essential conversational context.
+    Filters out transient framework error messages so they don't pollute subsequent turns.
+    """
+    if not text:
+        return None
+
+    # Filter out infrastructure error logs from LLM context
+    if ("Error communicating with Agent Framework:" in text or "All LLM providers failed:" in text
+            or "(Reference: " in text):
+        return None
+
+    if len(text) <= max_chars:
+        return text
+
+    half = max_chars // 2
+    return (
+        f"{text[:half].rstrip()}\n\n"
+        f"[... content truncated for brevity; refer to workflow state ...]\n\n"
+        f"{text[-half:].lstrip()}"
+    )
+
+async def _execute_agent_pipeline(
+    client: OpenAIChatCompletionClient,
+    deployment: str,
+    user_query: str,
+    history: List[Dict],
+    conversation_id: Optional[str] = None,
+) -> str:
+    """Executes the Microsoft Agent Framework multi-agent pipeline with the given client."""
     try:
-        client = get_agent_framework_client()
-        deployment = getattr(client, "current_model", None) or getattr(client, "model", None) or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
+        client = client or get_agent_framework_client()
+        deployment = getattr(client, "current_model", None) or getattr(client, "model", None) or deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
         provider_name = getattr(client, "current_provider_name", "Primary")
 
         main_agent_prompt = """
@@ -416,12 +584,14 @@ DECISION FIELDS:
         stage = effective_stage(workflow_state)
         state_note = "\n\n" + routing_context(workflow_state)
 
-        # Convert history into Agent Framework Messages
+        # Convert history into Agent Framework Messages with compacting & error filtering
         message_list = []
         for msg in history:
             role = msg.get("role", "user")
             text = msg.get("text", "")
-            message_list.append(Message(role=role, contents=[text]))
+            compact_text = compact_history_message(role, text)
+            if compact_text:
+                message_list.append(Message(role=role, contents=[compact_text]))
 
         new_msg = Message(role="user", contents=[user_query])
         message_list.append(new_msg)
@@ -429,9 +599,13 @@ DECISION FIELDS:
         # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
         logger.info(f"[Orchestrator] Running Orchestrator Agent (Provider: {provider_name}, Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
-        orchestrator_messages = list(message_list[:-1]) + [Message(role="user", contents=[user_query + state_note])]
-        orchestrator_response = await orchestrator.run(messages=orchestrator_messages,
-                                                       options={"response_format": RoutingDecision})
+        # Sliding window for Orchestrator: up to 8 recent history messages + latest query with state
+        recent_orch_history = message_list[-9:-1] if len(message_list) > 1 else []
+        orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
+        orchestrator_response = await orchestrator.run(
+            messages=orchestrator_messages,
+            options={"response_format": RoutingDecision}
+        )
         orch_duration = round((time.time() - orch_start) * 1000, 1)
         decision = parse_routing_decision(orchestrator_response)
         logger.info(f"[Orchestrator] Completed in {orch_duration}ms -> {decision.action} "
@@ -463,20 +637,59 @@ DECISION FIELDS:
 
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None and workflow_state.get("project"):
-                workflow_context_note += "\n\n" + store.describe_workflow_state(workflow_state, include_requirements=True)
+                include_trd = operation in ("GENERATE_TRD", "UPDATE_TRD")
+                workflow_context_note += "\n\n" + store.describe_workflow_state(
+                    workflow_state, include_prd=True, include_trd=include_trd
+                )
 
-            # Prepare message list for Requirements_Agent with clear workflow context
-            req_messages = list(message_list[:-1])
+            # Prepare message list for Requirements_Agent with clear workflow context (sliding window of up to 6 recent messages)
+            recent_req_history = message_list[-7:-1] if len(message_list) > 1 else []
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
-            req_messages.append(context_user_msg)
+            req_messages = recent_req_history + [context_user_msg]
 
-            # Invoke Requirements Child Agent
-            logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
-            child_start = time.time()
-            child_response = await requirements_agent.run(messages=req_messages)
-            child_duration = round((time.time() - child_start) * 1000, 1)
-            child_raw_json = child_response.messages[-1].text if child_response.messages else ""
-            logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
+            # 1. Requirements Agent Input Guardrail Check
+            req_input_check = await check_requirements_agent_input(context_user_msg.text)
+            if not req_input_check.allowed:
+                logger.warning(
+                    f"[Requirements_Agent Guardrail Block] Input blocked by '{req_input_check.guardrail_name}': {req_input_check.blocked_reason}"
+                )
+                child_raw_json = json.dumps({
+                    "workflow_stage": "PRD",
+                    "status": "CLARIFICATION_REQUIRED",
+                    "clarification_questions": [{
+                        "question": f"The requirements request could not be processed due to a security policy violation ({req_input_check.guardrail_name}). Please adjust your request.",
+                        "choices": [],
+                        "reason": req_input_check.blocked_reason or "Guardrail violation"
+                    }],
+                    "known_so_far": "Request flagged by requirements security guardrail.",
+                    "readiness_check": {}
+                })
+            else:
+                # Invoke Requirements Child Agent
+                logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
+                child_start = time.time()
+                child_response = await requirements_agent.run(messages=req_messages)
+                child_duration = round((time.time() - child_start) * 1000, 1)
+                child_raw_json = child_response.messages[-1].text if child_response.messages else ""
+                logger.info(f"[Requirements_Agent] Completed in {child_duration}ms")
+
+                # 2. Requirements Agent Output Guardrail Check
+                req_output_check = await check_requirements_agent_output(child_raw_json)
+                if not req_output_check.allowed:
+                    logger.warning(
+                        f"[Requirements_Agent Guardrail Block] Output blocked by '{req_output_check.guardrail_name}': {req_output_check.blocked_reason}"
+                    )
+                    child_raw_json = json.dumps({
+                        "workflow_stage": "PRD",
+                        "status": "CLARIFICATION_REQUIRED",
+                        "clarification_questions": [{
+                            "question": "The generated requirements document could not be validated by internal safety checks. Would you like to refine the specification?",
+                            "choices": [],
+                            "reason": req_output_check.blocked_reason or "Output guardrail violation"
+                        }],
+                        "known_so_far": "Requirements generation interrupted by guardrail.",
+                        "readiness_check": {}
+                    })
 
             # Readiness guard: a new PRD is only accepted when the agent's own readiness check has no missing item
             missing = missing_readiness_items(child_raw_json) if operation == "GENERATE_PRD" else []
@@ -570,7 +783,8 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synthesis_result = await synthesizer_agent.run(
+                messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
@@ -578,17 +792,20 @@ Put a blank line before and after every heading, divider (---) and list; never p
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
 
+            # Repo_Setup_Agent only needs TRD architecture and folder structure (not the bulky PRD)
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None:
                 workflow_context_note += "\n\n" + store.describe_workflow_state(
-                    workflow_state, include_requirements=True, include_structure=True)
+                    workflow_state, include_prd=operation in SCAFFOLD_OPERATIONS, include_trd=True,
+                    include_structure=True
+                )
             if operation in SCAFFOLD_OPERATIONS:
                 workflow_context_note += "\n" + describe_toolchains()
 
-            # Prepare message list for Repo_Setup_Agent with clear workflow context
-            repo_messages = list(message_list[:-1])
+            # Prepare message list for Repo_Setup_Agent with clear workflow context (sliding window of up to 4 recent messages)
+            recent_repo_history = message_list[-5:-1] if len(message_list) > 1 else []
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
-            repo_messages.append(context_user_msg)
+            repo_messages = recent_repo_history + [context_user_msg]
 
             # Invoke Repo Setup Child Agent
             logger.info(f"[Repo_Setup_Agent] Processing request with operation: {operation}...")
@@ -679,7 +896,8 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(messages=[Message(role="user", contents=["Please present this update to the user."])])
+            synthesis_result = await synthesizer_agent.run(
+                messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             response_text = insert_structure_tree(response_text, structure_tree)
@@ -703,6 +921,11 @@ Put a blank line before and after every heading, divider (---) and list; never p
             return SERVICE_UNAVAILABLE_MESSAGE.format(reference=reference)
         logger.exception(f"[Agent Pipeline] [ref {reference}] Unexpected error: {type(e).__name__}: {e}")
         return UNEXPECTED_ERROR_MESSAGE.format(reference=reference)
+
+async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
+    """Runs the agent pipeline on the tiered fallback client (Azure OpenAI -> Groq models -> streamed MAQ AI)."""
+    client = get_agent_framework_client()
+    return await _execute_agent_pipeline(client, getattr(client, "current_model", ""), user_query, history, conversation_id)
 
 def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
     """Next-step suggestions (label + prompt) for the chips above the chat input."""
@@ -776,8 +999,44 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
         if file_info:
             user_query = user_query + f"\n\n[Attached File Content]:\n{file_info}"
 
+    # 1. Orchestrator Input Guardrail Boundary
+    input_check = await check_input_guardrail(user_query)
+    if not input_check.allowed:
+        logger.warning(
+            f"[Orchestrator Guardrail Block] User input blocked by '{input_check.guardrail_name}': {input_check.blocked_reason}"
+        )
+        friendly_error = (
+            f"Your request could not be processed because it violates our safety policy "
+            f"({input_check.guardrail_name}). Please adjust your message and try again."
+        )
+        content_array.append({"role": "user", "text": user_query})
+        content_array.append({"role": "assistant", "text": friendly_error})
+        supabase = get_supabase_client()
+        try:
+            supabase.table("Conversation").update({"content": content_array}).eq("conv_id", conversation_id).execute()
+        except Exception as e:
+            logger.error(f"[Supabase] Failed to save conversation history on guardrail block: {e}")
+        return ChatResponse(
+            conversation_id=conversation_id,
+            response=friendly_error,
+            suggestions=get_suggestions(conversation_id),
+        )
+
     # Generate response via multi-agent pipeline
     response_text = await generate_chat_response(user_query, content_array, conversation_id)
+
+    # 2. Orchestrator Output Guardrail Boundary (redacts PII / blocks restricted URLs)
+    output_check = await check_output_guardrail(response_text)
+    if not output_check.allowed:
+        logger.warning(
+            f"[Orchestrator Guardrail Block] Synthesized response blocked by '{output_check.guardrail_name}': {output_check.blocked_reason}"
+        )
+        response_text = (
+            "I apologize, but the generated response was blocked by our security and safety filters. "
+            "Please try rephrasing your request."
+        )
+    elif output_check.response_text:
+        response_text = output_check.response_text
     
     llm_title = None
     if response_text.startswith("TITLE:"):

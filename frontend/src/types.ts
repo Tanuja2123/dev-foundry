@@ -1,11 +1,13 @@
 export type Project = {
   id: string
   name: string
+  stage?: string
 }
 
 export type Conversation = {
   conversation_id: string
   title: string
+  stage?: string
 }
 
 export type Suggestion = {

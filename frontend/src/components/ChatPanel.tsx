@@ -2,12 +2,11 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEve
 import {
   ArrowUp,
   Paperclip,
-  Sparkles,
   User,
   X,
   ArrowDown,
   AlertCircle,
-  Loader2,
+  Square,
   FileText,
   Lightbulb,
 } from 'lucide-react'
@@ -41,9 +40,6 @@ function PendingResponse() {
   return (
     <article className="bubble bubble-assistant bubble-pending" role="status" aria-live="polite">
       <div className="bubble-header">
-        <div className="bubble-avatar-icon bubble-avatar-assistant">
-          <Sparkles size={14} />
-        </div>
         <span className="bubble-role-name">DevFoundry Copilot</span>
       </div>
       <div className="pending-body">
@@ -67,6 +63,7 @@ type ChatPanelProps = {
   sending: boolean
   error: string | null
   onSend: (content: string) => void
+  onStop?: () => void
   onFilesAdded: (files: FileList) => void
   onRemoveFile: (name: string) => void
 }
@@ -80,6 +77,7 @@ export function ChatPanel({
   sending,
   error,
   onSend,
+  onStop,
   onFilesAdded,
   onRemoveFile,
 }: ChatPanelProps) {
@@ -143,6 +141,13 @@ export function ChatPanel({
     }, 60)
   }
 
+  function handleApplySuggestion(prompt: string) {
+    setDraft(prompt)
+    setTimeout(() => {
+      textareaRef.current?.focus()
+    }, 10)
+  }
+
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -152,8 +157,8 @@ export function ChatPanel({
 
   return (
     <section className="chat-panel">
-      <div className="chat-scroll-area">
-        <div className="chat-messages" ref={messagesRef} onScroll={updateJumpToLatest}>
+      <div className="chat-scroll-area" ref={messagesRef} onScroll={updateJumpToLatest}>
+        <div className="chat-messages">
         {messages.length === 0 ? (
           <div className="copilot-hero">
             <h2>DevFoundry Copilot</h2>
@@ -173,13 +178,11 @@ export function ChatPanel({
                 className={`bubble bubble-${isUser ? 'user' : 'assistant'}`}
               >
                 <div className="bubble-header">
-                  <div
-                    className={`bubble-avatar-icon ${
-                      isUser ? 'bubble-avatar-user' : 'bubble-avatar-assistant'
-                    }`}
-                  >
-                    {isUser ? <User size={13} /> : <Sparkles size={13} />}
-                  </div>
+                  {isUser && (
+                    <div className="bubble-avatar-icon bubble-avatar-user">
+                      <User size={13} />
+                    </div>
+                  )}
                   <span className="bubble-role-name">
                     {isUser ? 'You' : 'DevFoundry Copilot'}
                   </span>
@@ -233,7 +236,7 @@ export function ChatPanel({
                   type="button"
                   className="suggestion-chip"
                   title={suggestion.prompt}
-                  onClick={() => submit(suggestion.prompt)}
+                  onClick={() => handleApplySuggestion(suggestion.prompt)}
                 >
                   {suggestion.label}
                 </button>
@@ -297,24 +300,26 @@ export function ChatPanel({
 
             <button
               type="button"
-              className="composer-icon-button send-icon-btn"
-              disabled={!canSend}
-              onClick={() => submit()}
-              title="Send message"
-              aria-label="Send message"
+              className={`composer-icon-button ${sending ? 'stop-icon-btn' : 'send-icon-btn'}`}
+              disabled={!sending && !canSend}
+              onClick={() => {
+                if (sending) {
+                  onStop?.()
+                } else {
+                  submit()
+                }
+              }}
+              title={sending ? 'Stop generating' : 'Send message'}
+              aria-label={sending ? 'Stop generating' : 'Send message'}
             >
               {sending ? (
-                <Loader2 size={16} className="send-spinner-icon" />
+                <Square size={13} fill="currentColor" strokeWidth={0} />
               ) : (
                 <ArrowUp size={18} />
               )}
             </button>
           </div>
         </div>
-
-        <p className="composer-disclaimer">
-          DevFoundry Copilot synthesizes multi-agent recommendations. Verify critical architecture specifications.
-        </p>
       </div>
     </section>
   )

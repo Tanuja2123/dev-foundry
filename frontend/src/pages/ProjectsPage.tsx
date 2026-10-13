@@ -5,22 +5,28 @@ import {
   Folder,
   FileText,
   Cpu,
-  Package,
+  GitBranch,
   Search,
   X,
-  Cloud,
   ExternalLink,
   MessageSquare,
   ChevronRight,
   FolderOpen,
+  Trash2,
+  Pencil,
 } from 'lucide-react'
-import { fetchProjectsOverview } from '../api/projects'
+import { deleteConversation } from '../api/chat'
+import { fetchProjectsOverview, updateProjectName } from '../api/projects'
+import { ConfirmModal } from '../components/ConfirmModal'
 import { DocumentDrawer } from '../components/DocumentDrawer'
+import { EditProjectModal } from '../components/EditProjectModal'
 import type { ProjectOverview } from '../types'
 
 type ProjectsPageProps = {
   onSelectProject: (projectId: string) => void
   onNewProject?: () => void
+  onDeleteProject?: (projectId: string) => void | Promise<void>
+  onUpdateProjectName?: (projectId: string, newName: string) => void
 }
 
 type ActiveDrawerState = {
@@ -31,10 +37,17 @@ type ActiveDrawerState = {
   updatedAt?: string | null
 }
 
-export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
+export function ProjectsPage({
+  onSelectProject,
+  onDeleteProject,
+  onUpdateProjectName,
+}: ProjectsPageProps) {
   const [projects, setProjects] = useState<ProjectOverview[]>([])
   const [loading, setLoading] = useState(true)
   const [searchQuery, setSearchQuery] = useState('')
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
+  const [isDeleting, setIsDeleting] = useState(false)
+  const [editTarget, setEditTarget] = useState<ProjectOverview | null>(null)
   const [drawerState, setDrawerState] = useState<ActiveDrawerState>({
     isOpen: false,
     docType: null,
@@ -42,6 +55,42 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
     content: null,
     updatedAt: null,
   })
+
+  async function confirmDelete() {
+    if (!deleteTarget) return
+    setIsDeleting(true)
+    try {
+      if (onDeleteProject) {
+        await onDeleteProject(deleteTarget.id)
+      } else {
+        await deleteConversation(deleteTarget.id)
+      }
+      setProjects((prev) => prev.filter((p) => p.conversation_id !== deleteTarget.id))
+      setDeleteTarget(null)
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Could not delete project.')
+    } finally {
+      setIsDeleting(false)
+    }
+  }
+
+  async function handleSaveProjectName(newName: string) {
+    if (!editTarget) return
+    const updated = await updateProjectName(editTarget.conversation_id, newName)
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.conversation_id === editTarget.conversation_id
+          ? {
+              ...p,
+              project_name: updated.project_name,
+              project_link: updated.project_link ?? p.project_link,
+              repo_link: updated.repo_link ?? p.repo_link,
+            }
+          : p,
+      ),
+    )
+    onUpdateProjectName?.(editTarget.conversation_id, updated.project_name || newName)
+  }
 
   // Fetch projects on mount
   useEffect(() => {
@@ -150,7 +199,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
           </div>
           <div className="metric-card">
             <span className="metric-icon">
-              <Package size={18} />
+              <GitBranch size={18} />
             </span>
             <div className="metric-content">
               <span className="metric-value">{metrics.repoCount}</span>
@@ -234,17 +283,28 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                       {/* 1. Project Name & Description */}
                       <td className="td-project-name">
                         <div className="project-name-cell">
-                          <button
-                            type="button"
-                            className="project-name-link"
-                            onClick={() => onSelectProject(project.conversation_id)}
-                            title={`Open workspace for ${displayName}`}
-                          >
-                            <span className="project-cell-icon">
-                              <FileText size={15} />
-                            </span>
-                            <span className="project-cell-title">{displayName}</span>
-                          </button>
+                          <div className="project-name-title-row">
+                            <button
+                              type="button"
+                              className="project-name-link"
+                              onClick={() => onSelectProject(project.conversation_id)}
+                              title={`Open workspace for ${displayName}`}
+                            >
+                              <span className="project-cell-icon">
+                                <Folder size={15} />
+                              </span>
+                              <span className="project-cell-title">{displayName}</span>
+                            </button>
+                            <button
+                              type="button"
+                              className="project-cell-edit-btn"
+                              onClick={() => setEditTarget(project)}
+                              title={`Edit project name for "${displayName}"`}
+                              aria-label={`Edit project name for "${displayName}"`}
+                            >
+                              <Pencil size={13} />
+                            </button>
+                          </div>
                           <p className="project-cell-description" title={displayDesc}>
                             {displayDesc}
                           </p>
@@ -325,7 +385,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             className="external-resource-link"
                             title={`Open ${displayName} in Azure DevOps`}
                           >
-                            <Cloud size={14} className="link-icon" />
+                            <Folder size={14} className="link-icon" />
                             <span>Project</span>
                             <ExternalLink size={11} className="link-ext-symbol" />
                           </a>
@@ -346,7 +406,7 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                             className="external-resource-link repo"
                             title={`Open Git repository for ${displayName}`}
                           >
-                            <Package size={14} className="link-icon" />
+                            <GitBranch size={14} className="link-icon" />
                             <span>Repo</span>
                             <ExternalLink size={11} className="link-ext-symbol" />
                           </a>
@@ -357,17 +417,37 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
                         )}
                       </td>
 
-                      {/* 6. Action / Open Chat (Icon Only) */}
+                      {/* 6. Action / Open Chat, Edit & Delete Project */}
                       <td className="td-actions">
-                        <button
-                          type="button"
-                          className="project-action-btn project-action-btn--icon"
-                          onClick={() => onSelectProject(project.conversation_id)}
-                          title={`Open chat workspace for ${displayName}`}
-                          aria-label={`Open chat workspace for ${displayName}`}
-                        >
-                          <MessageSquare size={16} />
-                        </button>
+                        <div className="project-actions-group">
+                          <button
+                            type="button"
+                            className="project-action-btn project-action-btn--icon project-action-btn--edit"
+                            onClick={() => setEditTarget(project)}
+                            title={`Edit project name for "${displayName}"`}
+                            aria-label={`Edit project name for "${displayName}"`}
+                          >
+                            <Pencil size={15} />
+                          </button>
+                          <button
+                            type="button"
+                            className="project-action-btn project-action-btn--icon"
+                            onClick={() => onSelectProject(project.conversation_id)}
+                            title={`Open chat workspace for ${displayName}`}
+                            aria-label={`Open chat workspace for ${displayName}`}
+                          >
+                            <MessageSquare size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            className="project-action-btn project-action-btn--icon project-action-btn--delete"
+                            onClick={() => setDeleteTarget({ id: project.conversation_id, name: displayName })}
+                            title={`Delete "${displayName}"`}
+                            aria-label={`Delete "${displayName}"`}
+                          >
+                            <Trash2 size={15} />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   )
@@ -386,6 +466,29 @@ export function ProjectsPage({ onSelectProject }: ProjectsPageProps) {
         content={drawerState.content}
         updatedAt={drawerState.updatedAt}
         onClose={handleCloseDrawer}
+      />
+
+      {/* Edit Project Name Modal (with ADO sync support) */}
+      <EditProjectModal
+        isOpen={Boolean(editTarget)}
+        initialName={editTarget?.project_name || ''}
+        isAdoLinked={Boolean(editTarget?.project_link)}
+        onSave={handleSaveProjectName}
+        onClose={() => setEditTarget(null)}
+      />
+
+      {/* Re-verify Delete Confirmation Modal */}
+      <ConfirmModal
+        isOpen={Boolean(deleteTarget)}
+        title="Delete Project"
+        message={`Do you want to delete "${deleteTarget?.name || 'this project'}"? This will permanently delete the project conversation and its requirement documents. This action cannot be undone.`}
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        isLoading={isDeleting}
+        onConfirm={confirmDelete}
+        onCancel={() => {
+          if (!isDeleting) setDeleteTarget(null)
+        }}
       />
     </div>
   )

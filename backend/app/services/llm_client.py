@@ -181,6 +181,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
     """
 
     COOLDOWN_SECONDS = 180  # After 3 minutes, give an unhealthy provider another chance
+    FIREWALL_COOLDOWN_SECONDS = 1800  # 30 minutes cooldown for firewall/network blocked providers (e.g. 403)
 
     def __init__(self, providers: List[ProviderSpec]):
         if not providers:
@@ -224,9 +225,14 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
         cooldown_indices = []
 
         for idx, provider in enumerate(self.providers):
+            cooldown = (
+                self.FIREWALL_COOLDOWN_SECONDS
+                if (provider.last_error and ("403" in provider.last_error or "Virtual Network" in provider.last_error))
+                else self.COOLDOWN_SECONDS
+            )
             if provider.is_healthy:
                 healthy_indices.append(idx)
-            elif (now - provider.last_failure_time) > self.COOLDOWN_SECONDS:
+            elif (now - provider.last_failure_time) > cooldown:
                 cooldown_indices.append(idx)
 
         # If any providers are healthy or out of cooldown, try them in hierarchy order
@@ -270,11 +276,20 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                 effective_options = dict(options) if options is not None else {}
                 effective_options["model"] = provider.model
 
+                # Protect TPM limits: Groq on-demand counts prompt_tokens + max_tokens against its per-request limit
+                # (8,000 on the free tier). Give the answer all the room that is left; other providers are not capped.
+                if provider.max_request_tokens:
+                    if request_tokens is None:
+                        request_tokens = estimate_request_tokens(messages, options)
+                    safe_max = max(MIN_COMPLETION_TOKENS, provider.max_request_tokens - request_tokens - 100)
+                    req_max = effective_options.get("max_tokens") or effective_options.get("max_completion_tokens") or safe_max
+                    effective_options["max_tokens"] = min(req_max, safe_max)
+
                 # Stream internally (keeps slow gateways alive) but still return one complete response
                 stream_internally = provider.stream and not stream
                 logger.info(
-                    f"[LLM Dispatch] Routing request to '{provider.name}' (Model: {provider.model}"
-                    f"{', streamed' if stream_internally else ''})..."
+                    f"[LLM Dispatch] Routing request to '{provider.name}' (Model: {provider.model}, "
+                    f"MaxTokens: {effective_options.get('max_tokens')}{', streamed' if stream_internally else ''})..."
                 )
                 started = time.time()
 
@@ -387,7 +402,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
 
     # 3. Tertiary: MAQ AI Gateway / SLM
     maq_key = os.getenv("MAQ_AI_API_KEY", "").strip()
-    maq_base_url = os.getenv("MAQ_AI_BASE_URL", "https://llm.maqsoftware.net/v1").strip()
+    maq_base_url = os.getenv("MAQ_AI_BASE_URL", "https://indiaai.maqsoftware.net/v1").strip()
     maq_model = os.getenv("MAQ_AI_MODEL", "qwen-3.8-27b").strip() or "qwen-3.8-27b"
 
     if maq_key:

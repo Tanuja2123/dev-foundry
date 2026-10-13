@@ -153,3 +153,19 @@ def test_users_see_a_short_message_and_logs_get_the_details(monkeypatch, caplog)
     assert reply.startswith("⚠️ The AI service is busy or unavailable") and "524" not in reply and "Groq" not in reply
     reference = reply.split("Reference: ")[1].rstrip(")")
     assert any(reference in r.getMessage() and "HTTP 524" in r.getMessage() for r in caplog.records)
+
+
+def test_only_groq_gets_a_max_tokens_clamp_sized_to_the_room_left():
+    seen = {}
+
+    class Capturing(FakeProviderClient):
+        def get_response(self, stream=False, options=None, **kwargs):
+            seen[self.behaviour] = dict(options or {})
+            return super().get_response(stream=stream, **kwargs)
+
+    groq = lc.ProviderSpec("groq", "Groq", Capturing("groq"), "g", max_request_tokens=8000)
+    azure = lc.ProviderSpec("azure_openai", "Azure", Capturing("azure"), "a")
+    run(lc.FallbackChatCompletionClient([groq]), text="short question")
+    run(lc.FallbackChatCompletionClient([azure]), text="short question")
+    assert 6000 < seen["groq"]["max_tokens"] < 8000          # all the room left, not a fixed 1500
+    assert "max_tokens" not in seen["azure"]                  # no cap: long PRD/TRD answers are not cut off

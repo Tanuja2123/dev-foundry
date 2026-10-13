@@ -1,7 +1,7 @@
 import { useMsal } from '@azure/msal-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { PanelLeftOpen, Moon, Sun } from 'lucide-react'
+import { PanelLeftOpen, Moon, Sun, Pencil } from 'lucide-react'
 
 import {
   continueChat,
@@ -9,7 +9,9 @@ import {
   getConversation,
   listConversations,
 } from '../api/chat'
+import { updateProjectName } from '../api/projects'
 import { ChatPanel } from '../components/ChatPanel'
+import { EditProjectModal } from '../components/EditProjectModal'
 import { Sidebar, type SidebarState } from '../components/Sidebar'
 import { TypewriterText } from '../components/TypewriterText'
 import { ProjectsPage } from './ProjectsPage'
@@ -67,6 +69,8 @@ export function HomePage() {
     const saved = localStorage.getItem('theme')
     return saved === 'dark' ? 'dark' : 'light'
   })
+  const [isEditActiveProjectOpen, setIsEditActiveProjectOpen] = useState(false)
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   useEffect(() => {
     localStorage.setItem('sidebarState', sidebarState)
@@ -95,6 +99,7 @@ export function HomePage() {
         const mapped = items.map((item) => ({
           id: item.conversation_id,
           name: item.title,
+          stage: item.stage,
         }))
         setConversations(mapped)
         // Continue the conversation that was open last (reload, reopened browser, laptop wake-up).
@@ -189,7 +194,16 @@ export function HomePage() {
     navigate('/projects')
   }
 
+  function handleStopChat() {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+    setSending(false)
+  }
+
   function selectConversation(conversationId: string) {
+    handleStopChat()
     setSelectedId(conversationId)
     setDraftMessages([])
     setDraftFiles([])
@@ -200,6 +214,7 @@ export function HomePage() {
   }
 
   const handleNewConversation = useCallback(() => {
+    handleStopChat()
     try {
       localStorage.removeItem(lastConversationKey)
     } catch {
@@ -250,6 +265,12 @@ export function HomePage() {
     return () => window.removeEventListener('keydown', onGlobalKeyDown)
   }, [handleNewConversation])
 
+  function handleUpdateProjectName(conversationId: string, newName: string) {
+    setConversations((prev) =>
+      prev.map((c) => (c.id === conversationId ? { ...c, name: newName } : c)),
+    )
+  }
+
   async function handleDeleteProject(projectId: string) {
     try {
       await deleteConversation(projectId)
@@ -281,6 +302,9 @@ export function HomePage() {
     }
     const attachedFile = files[0] ?? null
 
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+
     setChatError(null)
     setSending(true)
 
@@ -295,7 +319,7 @@ export function HomePage() {
 
     try {
       // Pass null for conversationId on the very first message
-      const result = await continueChat(conversationId, content, attachedFile)
+      const result = await continueChat(conversationId, content, attachedFile, controller.signal)
       const assistantMessage: ChatMessage = {
         id: createId(),
         role: 'assistant',
@@ -321,6 +345,7 @@ export function HomePage() {
         const newProject: Project = {
           id: newId,
           name: projectTitle,
+          stage: 'requirements',
         }
         setConversations((prev) => [newProject, ...prev])
         setSelectedId(newId)
@@ -350,11 +375,19 @@ export function HomePage() {
         }))
       }
     } catch (reason) {
+      if (
+        (reason instanceof DOMException && reason.name === 'AbortError') ||
+        (reason instanceof Error && reason.name === 'AbortError') ||
+        controller.signal.aborted
+      ) {
+        return
+      }
       setChatError(
         reason instanceof Error ? reason.message : 'Chat request failed.',
       )
     } finally {
       setSending(false)
+      abortControllerRef.current = null
     }
   }
 
@@ -438,7 +471,22 @@ export function HomePage() {
                   <PanelLeftOpen size={18} />
                 </button>
               )}
-              <h1>{isProjectsView ? 'Projects' : <TypewriterText text={activeProject.name} speed={28} />}</h1>
+              {!isProjectsView && (
+                <div className="topbar-title-with-actions">
+                  <h1><TypewriterText text={activeProject.name} speed={28} /></h1>
+                  {conversation && (
+                    <button
+                      type="button"
+                      className="topbar-edit-btn"
+                      onClick={() => setIsEditActiveProjectOpen(true)}
+                      title={`Edit project name for "${activeProject.name}"`}
+                      aria-label={`Edit project name for "${activeProject.name}"`}
+                    >
+                      <Pencil size={13} />
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -459,6 +507,8 @@ export function HomePage() {
           <ProjectsPage
             onSelectProject={selectConversation}
             onNewProject={handleNewConversation}
+            onDeleteProject={(id) => void handleDeleteProject(id)}
+            onUpdateProjectName={handleUpdateProjectName}
           />
         ) : (
           <ChatPanel
@@ -469,11 +519,25 @@ export function HomePage() {
             sending={sending}
             error={chatError}
             onSend={(content) => void sendMessage(content)}
+            onStop={handleStopChat}
             onFilesAdded={addFiles}
             onRemoveFile={removeFile}
           />
         )}
       </div>
+
+      {/* Edit Project Name Modal from Topbar */}
+      {conversation && (
+        <EditProjectModal
+          isOpen={isEditActiveProjectOpen}
+          initialName={activeProject.name}
+          onSave={async (newName) => {
+            const updated = await updateProjectName(conversation.id, newName)
+            handleUpdateProjectName(conversation.id, updated.project_name || newName)
+          }}
+          onClose={() => setIsEditActiveProjectOpen(false)}
+        />
+      )}
     </div>
   )
 }

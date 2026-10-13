@@ -1,5 +1,4 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
-import { createPortal } from 'react-dom'
 import {
   PanelLeftClose,
   Plus,
@@ -11,6 +10,7 @@ import {
   User,
   LogIn,
 } from 'lucide-react'
+import { ConfirmModal } from './ConfirmModal'
 import type { Project } from '../types'
 import { TypewriterText } from './TypewriterText'
 
@@ -21,6 +21,15 @@ type SidebarUserProfile = {
   initials: string
   onSignOut?: () => void
   onSignIn?: () => void
+}
+
+const STAGE_CONFIG: Record<string, { label: string; className: string }> = {
+  completed: { label: 'Completed', className: 'stage--completed' },
+  repo_created: { label: 'Repo Created', className: 'stage--repo' },
+  project_created: { label: 'Project Created', className: 'stage--project' },
+  trd_created: { label: 'TRD Created', className: 'stage--trd' },
+  prd_created: { label: 'PRD Created', className: 'stage--prd' },
+  requirements: { label: 'Requirements', className: 'stage--requirements' },
 }
 
 type SidebarProps = {
@@ -57,23 +66,11 @@ export function Sidebar({
   const [searchQuery, setSearchQuery] = useState('')
   const [isProfileOpen, setIsProfileOpen] = useState(false)
   const [isResizing, setIsResizing] = useState(false)
-  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null)
+  const [pendingDeleteProject, setPendingDeleteProject] = useState<Project | null>(null)
   const profileContainerRef = useRef<HTMLDivElement>(null)
 
   const isExpanded = sidebarState !== 'hidden'
   const isHidden = sidebarState === 'hidden'
-
-  // Close confirmation modal on Escape
-  useEffect(() => {
-    if (!projectToDelete) return
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setProjectToDelete(null)
-      }
-    }
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [projectToDelete])
 
   // Close profile popup on click outside or Escape
   useEffect(() => {
@@ -241,6 +238,11 @@ export function Sidebar({
 
         {filteredProjects.map((project) => {
           const isActive = project.id === selectedProjectId
+          const stageConfig = project.stage ? STAGE_CONFIG[project.stage] ?? {
+            label: project.stage.replace(/_/g, ' '),
+            className: 'stage--requirements',
+          } : null
+
           return (
             <div
               key={project.id}
@@ -250,16 +252,24 @@ export function Sidebar({
                 type="button"
                 className="project-item-button"
                 onClick={() => onSelectProject(project.id)}
-                title={project.name}
+                title={`${project.name}${stageConfig ? ` · ${stageConfig.label}` : ''}`}
                 aria-label={project.name}
               >
                 <span className="project-item-icon">
                   <FileText size={15} />
                 </span>
                 {isExpanded && (
-                  <span className="project-item-name">
-                    <TypewriterText text={project.name} animateOnChange={isActive} animateOnMount={isActive} speed={28} />
-                  </span>
+                  <div className="project-item-content">
+                    <span className="project-item-name">
+                      <TypewriterText text={project.name} animateOnChange={isActive} animateOnMount={isActive} speed={28} />
+                    </span>
+                    {stageConfig && (
+                      <span className={`sidebar-stage-badge ${stageConfig.className}`}>
+                        <span className="sidebar-stage-dot" />
+                        {stageConfig.label}
+                      </span>
+                    )}
+                  </div>
                 )}
               </button>
               {isExpanded && onDeleteProject && (
@@ -270,7 +280,7 @@ export function Sidebar({
                   aria-label={`Delete ${project.name}`}
                   onClick={(e) => {
                     e.stopPropagation()
-                    setProjectToDelete(project)
+                    setPendingDeleteProject(project)
                   }}
                 >
                   <Trash2 size={13} />
@@ -285,25 +295,42 @@ export function Sidebar({
       <div className="sidebar-footer">
         {user ? (
           <div className="sidebar-user-container" ref={profileContainerRef}>
-            <button
-              type="button"
-              className={`sidebar-user-card ${isProfileOpen ? 'open' : ''}`}
-              onClick={() => setIsProfileOpen((prev) => !prev)}
-              aria-expanded={isProfileOpen}
-              aria-haspopup="menu"
-              title={`Account options for ${user.name}`}
-            >
-              <div className="sidebar-user-info">
-                <div className="sidebar-avatar-monogram">
-                  {user.initials || <User size={14} />}
-                </div>
-                {isExpanded && (
-                  <div className="sidebar-user-details">
-                    <span className="sidebar-user-name">{user.name}</span>
+            <div className="sidebar-user-row">
+              <button
+                type="button"
+                className={`sidebar-user-card ${isProfileOpen ? 'open' : ''}`}
+                onClick={() => setIsProfileOpen((prev) => !prev)}
+                aria-expanded={isProfileOpen}
+                aria-haspopup="menu"
+                title={`Account options for ${user.name}`}
+              >
+                <div className="sidebar-user-info">
+                  <div className="sidebar-avatar-monogram">
+                    {user.initials || <User size={14} />}
                   </div>
-                )}
-              </div>
-            </button>
+                  {isExpanded && (
+                    <div className="sidebar-user-details">
+                      <span className="sidebar-user-name">{user.name}</span>
+                    </div>
+                  )}
+                </div>
+              </button>
+
+              {isExpanded && user.onSignOut && (
+                <button
+                  type="button"
+                  className="sidebar-user-signout-btn"
+                  title="Sign out"
+                  aria-label="Sign out"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    user.onSignOut?.()
+                  }}
+                >
+                  <LogOut size={16} />
+                </button>
+              )}
+            </div>
 
             {/* Profile Popover / Dropdown Menu when clicked */}
             {isProfileOpen && (
@@ -373,63 +400,21 @@ export function Sidebar({
         </div>
       )}
 
-      {/* Custom Confirmation Modal for Deleting Projects */}
-      {projectToDelete &&
-        typeof document !== 'undefined' &&
-        createPortal(
-          <div
-            className="modal-overlay"
-            onClick={() => setProjectToDelete(null)}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="confirm-delete-title"
-          >
-            <div
-              className="confirm-modal-box"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="confirm-modal-header">
-                <div className="confirm-modal-icon-badge">
-                  <Trash2 size={18} className="confirm-modal-icon" />
-                </div>
-                <div className="confirm-modal-content">
-                  <h3 id="confirm-delete-title" className="confirm-modal-title">
-                    Delete Project?
-                  </h3>
-                  <p className="confirm-modal-desc">
-                    Are you sure you want to delete{' '}
-                    <strong className="confirm-modal-name">
-                      "{projectToDelete.name}"
-                    </strong>
-                    ? This will permanently delete the conversation and cannot be undone.
-                  </p>
-                </div>
-              </div>
-
-              <div className="confirm-modal-footer">
-                <button
-                  type="button"
-                  className="btn-modal-cancel"
-                  onClick={() => setProjectToDelete(null)}
-                >
-                  No, cancel
-                </button>
-                <button
-                  type="button"
-                  className="btn-modal-delete"
-                  onClick={() => {
-                    const id = projectToDelete.id
-                    setProjectToDelete(null)
-                    onDeleteProject?.(id)
-                  }}
-                >
-                  Yes, delete
-                </button>
-              </div>
-            </div>
-          </div>,
-          document.body
-        )}
+      {/* Re-verify Delete Confirmation Modal */}
+      <ConfirmModal
+        isOpen={Boolean(pendingDeleteProject)}
+        title="Delete Conversation"
+        message={`Do you want to delete "${pendingDeleteProject?.name || 'this conversation'}"? This will permanently delete the conversation and its requirement documents. This action cannot be undone.`}
+        confirmLabel="Delete"
+        cancelLabel="Cancel"
+        onConfirm={() => {
+          if (pendingDeleteProject) {
+            onDeleteProject?.(pendingDeleteProject.id)
+            setPendingDeleteProject(null)
+          }
+        }}
+        onCancel={() => setPendingDeleteProject(null)}
+      />
     </aside>
   )
 }

@@ -109,6 +109,12 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
     if stage == store.STAGE_REQUIREMENTS and not has_prd:
         return ["GENERATE_PRD", "UPDATE_PRD"]
     operations = list(ALLOWED_OPERATIONS.get(stage, ()))
+    # If the repository exists in STRUCTURE_REVIEW but structure has not been saved yet,
+    # allow CREATE_REPOSITORY to idempotently complete structure creation
+    if stage == store.STAGE_STRUCTURE_REVIEW and state:
+        repo = state.get("repository") or {}
+        if not repo.get("structure") and "CREATE_REPOSITORY" not in operations:
+            operations.append("CREATE_REPOSITORY")
     # The PRD and TRD can be updated at any time; downstream artifacts are then flagged as outdated.
     if has_prd and "UPDATE_PRD" not in operations:
         operations.append("UPDATE_PRD")
@@ -162,13 +168,13 @@ def apply_intent_rules(decision: RoutingDecision, stage: Optional[str],
     if (decision.action == "delegate" and decision.operation in _DOCUMENT_TRANSITIONS
             and decision.user_intent in ("approve_only", "question")):
         return RoutingDecision(reasoning=f"{decision.operation} needs an explicit request (intent: {decision.user_intent})",
-                               user_intent=decision.user_intent, action="respond",
-                               reply=_DOCUMENT_TRANSITIONS[decision.operation])
+                                user_intent=decision.user_intent, action="respond",
+                                reply=_DOCUMENT_TRANSITIONS[decision.operation])
     if (decision.action == "respond" and decision.user_intent == "change_request" and decision.mentions_technology
             and "UPDATE_TRD" in allowed_operations(stage, state) and _documents(state)[1]):
         return RoutingDecision(reasoning="technology change request -> TRD update", user_intent="change_request",
-                               mentions_technology=True, action="delegate", agent="Requirements_Agent",
-                               operation="UPDATE_TRD")
+                                mentions_technology=True, action="delegate", agent="Requirements_Agent",
+                                operation="UPDATE_TRD")
     return decision
 
 
@@ -222,18 +228,21 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
     # Only suggest moving forward when nothing upstream is outdated
     if not suggestions:
         if stage == store.STAGE_PRD_REVIEW:
-            suggestions.append(("Create the TRD", "The PRD looks good. Please create the Technical Requirements Document (TRD)."))
+            suggestions.append(("Create the TRD", "The PRD looks comprehensive and approved. Please generate the detailed Technical Requirements Document (TRD) covering technology stack, system architecture, and API design."))
         elif stage == store.STAGE_TRD_REVIEW:
-            suggestions.append(("Proceed to repository setup", "The TRD looks good. Let's proceed with repository setup."))
+            suggestions.append(("Proceed to repository setup", "The TRD architecture and technology stack are approved. Let's proceed with repository setup and propose the Azure DevOps project name and description."))
         elif stage == store.STAGE_PROJECT_REVIEW:
-            suggestions.append(("Create the project", "Looks good, create the Azure DevOps project."))
+            suggestions.append(("Create the project", "The proposed Azure DevOps project name and description look good. Please go ahead and create the Azure DevOps project."))
         elif stage == store.STAGE_REPOSITORY_REVIEW:
             if repository.get("repo_name"):
-                suggestions.append(("Create the repository", "Approved, create the repository."))
+                suggestions.append(("Create the repository", "The proposed repository name is approved. Please create the Git repository in Azure DevOps."))
             else:
-                suggestions.append(("Suggest a repository name", "Please suggest a repository name."))
+                suggestions.append(("Suggest a repository name", "Please analyze the project requirements and recommend suitable repository names."))
     if store.STRUCTURE_CHANGES_NOT_PUSHED in outdated and store.STRUCTURE_OUTDATED not in outdated:
-        suggestions.append(("Push the changes", "Looks good, push the structure changes as a new commit."))
+        suggestions.append(("Push the changes", "The folder structure changes look good. Please push these structure updates as a new commit to Azure DevOps."))
     elif stage == store.STAGE_STRUCTURE_REVIEW and repository.get("pushed_structure") is None and not suggestions:
-        suggestions.append(("Push to main", "Looks good, push the structure to the main branch."))
+        if not repository.get("structure"):
+            suggestions.append(("Propose folder structure", "Please propose the complete skeleton folder structure for the repository based on the approved TRD architecture."))
+        else:
+            suggestions.append(("Push to main", "The proposed repository folder structure is approved. Please push the initial structure to the main branch in Azure DevOps."))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]

@@ -121,6 +121,7 @@ def test_auth_settings_fall_back_to_frontend_values(monkeypatch):
 @pytest.mark.parametrize("method, path", [
     ("get", "/api/conversation"), ("post", "/api/conversation"),
     ("get", f"/api/conversation/{uuid.uuid4()}"), ("delete", f"/api/conversation/{uuid.uuid4()}"),
+    ("get", "/api/projects"),
 ])
 def test_every_api_route_requires_sign_in(client, method, path):
     response = getattr(client, method)(path)
@@ -168,6 +169,118 @@ def test_list_returns_only_my_conversations(client, db):
     assert [c["conversation_id"] for c in response.json()] == [mine]
 
 
+def test_projects_overview_returns_only_my_projects(client, db):
+    alice_conv = seed_conversation(db, ALICE, "Alice Project")
+    bob_conv = seed_conversation(db, BOB, "Bob Project")
+
+    db.table("Project").insert({
+        "conv_id": alice_conv,
+        "project_name": "Alice App",
+        "prd": {"Objective": "Alice Requirements"},
+        "trd": {"Backend": "Python"},
+    }).execute()
+
+    db.table("Project").insert({
+        "conv_id": bob_conv,
+        "project_name": "Bob App",
+        "prd": {"Objective": "Bob Requirements"},
+        "trd": {"Backend": "Node"},
+    }).execute()
+
+    # Alice only sees her project
+    alice_res = client.get("/api/projects", headers=bearer(oid=ALICE))
+    assert alice_res.status_code == 200
+    alice_projects = alice_res.json()
+    assert len(alice_projects) == 1
+    assert alice_projects[0]["conversation_id"] == alice_conv
+    assert alice_projects[0]["project_name"] == "Alice App"
+
+    # Bob only sees his project
+    bob_res = client.get("/api/projects", headers=bearer(oid=BOB))
+    assert bob_res.status_code == 200
+    bob_projects = bob_res.json()
+    assert len(bob_projects) == 1
+    assert bob_projects[0]["conversation_id"] == bob_conv
+    assert bob_projects[0]["project_name"] == "Bob App"
+
+
+def test_rename_project_unauthorized(client):
+    assert client.patch("/api/projects/some-id", json={"project_name": "New Name"}).status_code == 401
+
+
+def test_rename_project_empty_name_returns_400(client, db):
+    conv_id = seed_conversation(db, ALICE, "Initial Title")
+    res = client.patch(f"/api/projects/{conv_id}", json={"project_name": "   "}, headers=bearer(oid=ALICE))
+    assert res.status_code == 400
+    assert "empty" in res.json()["detail"].lower()
+
+
+def test_rename_project_forbidden_for_other_user(client, db):
+    bob_conv = seed_conversation(db, BOB, "Bob Title")
+    res = client.patch(f"/api/projects/{bob_conv}", json={"project_name": "Hacked Name"}, headers=bearer(oid=ALICE))
+    assert res.status_code == 400
+
+
+def test_rename_project_success_and_syncs_conversation_title(client, db):
+    alice_conv = seed_conversation(db, ALICE, "Initial Title")
+    db.table("Project").insert({
+        "conv_id": alice_conv,
+        "project_name": "Initial Project",
+        "prd": {"Objective": "Build something"},
+        "trd": {"Backend": "FastAPI"},
+    }).execute()
+
+    res = client.patch(
+        f"/api/projects/{alice_conv}",
+        json={"project_name": "Updated Project Name"},
+        headers=bearer(oid=ALICE),
+    )
+    assert res.status_code == 200
+    data = res.json()
+    assert data["project_name"] == "Updated Project Name"
+
+    # Verify Project table was updated
+    project_row = db.table("Project").select("*").eq("conv_id", alice_conv).execute().data[0]
+    assert project_row["project_name"] == "Updated Project Name"
+
+    # Verify Conversation title was updated to maintain strict consistency
+    conv_row = db.table("Conversation").select("*").eq("conv_id", alice_conv).execute().data[0]
+    assert conv_row["title"] == "Updated Project Name"
+
+
+def test_rename_project_updates_azure_devops_if_linked(client, db, monkeypatch):
+    from unittest.mock import MagicMock
+    import app.services.mcp.ado_mcp_server as ado_server
+
+    mock_ado = MagicMock(return_value={
+        "status": "success",
+        "project_id": "ado-12345",
+        "project_name": "New Azure DevOps Project",
+        "url": "https://dev.azure.com/myorg/New%20Azure%20DevOps%20Project",
+    })
+    monkeypatch.setattr(ado_server, "update_ado_project", mock_ado)
+
+    alice_conv = seed_conversation(db, ALICE, "Old ADO App")
+    db.table("Project").insert({
+        "conv_id": alice_conv,
+        "project_name": "Old ADO App",
+        "ado_project_id": "ado-12345",
+        "ado_project_url": "https://dev.azure.com/myorg/Old%20ADO%20App",
+    }).execute()
+
+    res = client.patch(
+        f"/api/projects/{alice_conv}",
+        json={"project_name": "New Azure DevOps Project"},
+        headers=bearer(oid=ALICE),
+    )
+    assert res.status_code == 200
+    mock_ado.assert_called_once_with(project_id="ado-12345", project_name="New Azure DevOps Project")
+
+    data = res.json()
+    assert data["project_name"] == "New Azure DevOps Project"
+    assert data["project_link"] == "https://dev.azure.com/myorg/New%20Azure%20DevOps%20Project"
+
+
 def test_other_users_conversation_is_not_found(client, db):
     bobs = seed_conversation(db, BOB)
     assert client.get(f"/api/conversation/{bobs}", headers=bearer()).status_code == 404
@@ -203,6 +316,19 @@ def test_first_chat_message_creates_a_conversation_owned_by_me(client, db, monke
     response = client.post("/api/chat", data={"user_query": "Build a clinic app"}, headers=bearer())
     assert response.status_code == 200
     conv_id = response.json()["conversation_id"]
+    [row] = [r for r in db.tables["Conversation"] if r["conv_id"] == conv_id]
+    assert row["user_id"] == ALICE and len(row["content"]) == 2
+
+
+def test_first_chat_message_with_null_conversation_id(client, db, monkeypatch):
+    async def reply(user_query, history, conversation_id=None):
+        return "Hello!"
+
+    monkeypatch.setattr(cs, "generate_chat_response", reply)
+    response = client.post("/api/chat", data={"user_query": "Build a clinic app", "conversation_id": "null"}, headers=bearer())
+    assert response.status_code == 200
+    conv_id = response.json()["conversation_id"]
+    assert conv_id is not None and conv_id != "null"
     [row] = [r for r in db.tables["Conversation"] if r["conv_id"] == conv_id]
     assert row["user_id"] == ALICE and len(row["content"]) == 2
 

@@ -40,12 +40,22 @@ Then fill in `.env`:
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | Yes (chat replies fail without it) |
 | `AZURE_OPENAI_VERSION` | API version (default: `2024-12-01-preview`) | Optional |
 | `AZURE_OPENAI_DEPLOYMENT` | Deployment name (default: `gpt-4`) | Optional |
+| `LOCAL_SLM_API_KEY` | Local SLM API key (automatic fallback if Azure OpenAI fails) | Optional |
+| `LOCAL_SLM_BASE_URL` | Local SLM endpoint (default: `https://llm.maqsoftware.net/v1`) | Optional |
+| `LOCAL_SLM_MODEL` | Local SLM model name (default: `qwen-3.8-27b`) | Optional |
+| `GUARDRAILS_API_KEY` | Guardrails SLM API key (defaults to `LOCAL_SLM_API_KEY` / `MAQ_AI_API_KEY`) | Optional |
+| `GUARDRAILS_BASE_URL` | Guardrails SLM endpoint (default: `https://llm.maqsoftware.net/v1`) | Optional |
+| `GUARDRAILS_MODEL` | Guardrails SLM model name (default: `qwen-3.8-27b`) | Optional |
+| `GUARDRAILS_ALLOWED_DOMAINS` | Comma-separated domain allowlist for URL filter | Optional |
 | `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
 | `GROQ_API_KEY` / `GROQ_MODEL` | Fallback provider. `GROQ_MODEL` may list several models, tried in order (default `openai/gpt-oss-20b,openai/gpt-oss-120b`; each has its own free-tier quota) | Optional |
 | `MAQ_AI_API_KEY` / `MAQ_AI_BASE_URL` / `MAQ_AI_MODEL` | Last fallback (internal SLM gateway). Requests are streamed so slow answers are not cut off by the gateway's 120 s limit | Optional |
 | `<PROVIDER>_TIMEOUT_SECONDS` / `<PROVIDER>_MAX_RETRIES` | Per-provider limits, `<PROVIDER>` = `AZURE_OPENAI` (120 s, 1 retry), `GROQ` (60 s, 2), `MAQ_AI` (900 s, 0). `GROQ_MAX_REQUEST_TOKENS` (8000): larger requests skip Groq | Optional |
 | `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project/code read & write scopes | Yes (for ADO project & repo creation) |
 
+> **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  
+> **If Azure OpenAI encounters any errors or credentials fail**, the chat service automatically falls back to Local SLM (`LOCAL_SLM_API_KEY`).  
+> **Multi-Agent Guardrails Layer:** User inputs and agent outputs are validated via `openai-guardrails` against the local SLM with a fail-closed policy. PII is automatically redacted and external URLs are restricted to allowed domains.
 
 **LLM fallback:** Azure OpenAI → Groq models (in `GROQ_MODEL` order) → MAQ AI. A provider that fails is skipped for 3 minutes.
 Users only ever see a short "AI service busy or unavailable" message with a reference id; the backend log shows, under
@@ -89,9 +99,10 @@ Open `http://localhost:5173` in your browser.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Returns `{ "status": "ok" }` |
-| GET | `/api/conversation` | Lists all conversations (`conversation_id`, `title`) |
+| GET | `/api/conversation` | Lists all conversations owned by the user (`conversation_id`, `title`) |
 | POST | `/api/conversation` | Creates a new conversation; returns `{ "conversation_id", "title" }` |
 | POST | `/api/chat` | Accepts JSON `{ "conversation_id", "user_query" }` or multipart form-data with an optional `file` field; returns `{ "conversation_id", "response" }` |
+| GET | `/api/projects` | Lists all projects owned by the signed-in user (`conversation_id`, `project_name`, `prd`, `trd`, etc.) |
 
 `POST /api/chat` returns 404 when `conversation_id` does not exist.
 
@@ -102,6 +113,7 @@ Open `http://localhost:5173` in your browser.
 - **Sign-in on every API call:** the frontend sends the user's Microsoft Entra ID token (MSAL) as `Authorization: Bearer <token>` on every `/api/*` call.
 - **Token validation:** the backend (`backend/app/core/auth.py`) validates it: signature against the tenant's keys, issuer, audience (the app's client id) and expiry. It identifies the user by the immutable Entra object id (`oid`).
 - **Ownership:** each conversation belongs to the user who created it. The API lists only your own conversations, and another user's conversation returns **404**. `/health` stays public.
+- **Project ownership:** projects are linked to conversations via `conv_id`. `GET /api/projects` returns only the projects associated with the signed-in user's conversations.
 - **User table:** signed-in users are recorded in the `AppUser` table (`user_id` = `oid`, `username`, `display_name`, `email`, `last_seen_at`).
 - **Table links:** `Project.conv_id` references `Conversation`, so deleting a conversation deletes its `Project` and `Repository` rows. Nothing is deleted in Azure DevOps.
 - **Database access:** the tables are closed to Supabase's anon/authenticated keys. Only the backend, using the **service-role key**, can read and write them.
@@ -200,6 +212,22 @@ $env:SUPABASE_INTEGRATION_TESTS="1"
 # Full flow end to end (real Azure OpenAI, generator commands and Azure DevOps; in-memory database): a CLI app and a
 # React + FastAPI app, from the description to the pushed commits. Each creates and deletes a "DevFoundry-E2E-<id>" project.
 $env:ADO_E2E_TESTS="1"; pytest tests/test_repo_setup_agent_e2e.py -m e2e -s
+```
+
+# Guardrails Layer
+
+DevFoundry implements a defense-in-depth safety layer via the `openai-guardrails` Python package, executed exclusively against the local SLM through an OpenAI-compatible endpoint.
+
+- **Centralized Layer (`backend/app/services/guardrails_layer/`):** All guardrail clients, configs, and check handlers are encapsulated. Agents interact via unified functions without directly importing the guardrails library.
+- **2-Boundary Orchestrator Architecture:**
+  - **Input Boundary:** Enforces `Off-Topic Prompts` and `Prompt Injection Detection`. Blocks non-software engineering or adversarial attempts immediately with audit logging.
+  - **Output Boundary:** Redacts sensitive PII (emails, phone numbers, credit cards, bank accounts, SSNs) using spaCy NLP + Presidio, and applies `URL Filter` / `Restrict URLs` allowing only trusted domains (`dev.azure.com`, `azure.com`, `github.com`, `microsoft.com`, `maqsoftware.net`, etc.).
+- **Child Agent Boundaries:** The Requirements Agent enforces input validation against `System Prompt Leakage` and output validation against `Hallucinated Functions / Tool Misuse`, returning structured clarification JSON when triggered.
+- **Fail-Closed Security:** Configured with `raise_guardrail_errors=True` so any evaluation error or tripwire safely halts generation and logs the event for security auditing.
+
+```powershell
+# Run Guardrails test suite
+pytest backend/tests/test_guardrails.py -v
 ```
 
 # Build and Test

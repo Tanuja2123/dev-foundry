@@ -100,8 +100,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         except store.StoreError as e:
             return _error(str(e))
         if project and project.get("ado_project_id"):
-            return _error(f"An Azure DevOps project was already created for this conversation: "
-                          f"'{project.get('project_name')}' ({project.get('ado_project_url')}).", "ALREADY_CREATED")
+            return _error("An Azure DevOps project was already created for this conversation.", "ALREADY_CREATED")
 
         approved_name = (project or {}).get("project_name")
         if not store.is_placeholder_name(approved_name):
@@ -245,7 +244,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         )
     )
     def tool_save_repository_structure(
-        files: Annotated[List[RepositoryFile], Field(description="Every file of the structure. Use non-empty .gitkeep, __init__.py or README.md files to keep folders.")],
+        files: Annotated[List[RepositoryFile], Field(description="List of skeleton files (12-25 files) with their 'path' fields.")],
     ) -> Dict[str, Any]:
         """TOOL 3 — SAVE REPOSITORY STRUCTURE (validated, stored in the Repository table)."""
         try:

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "input": {
+    "version": 1,
+    "guardrails": [
+      {
+        "name": "System Prompt Leakage",
+        "config": {
+          "model": "qwen-3.8-27b",
+          "confidence_threshold": 0.85
+        }
+      },
+      {
+        "name": "Off Topic Prompts",
+        "config": {
+          "model": "qwen-3.8-27b",
+          "confidence_threshold": 0.8,
+          "system_prompt_details": "Requirements Agent allowed scope: conversational greetings (e.g. hello, hi, hey), pleasantries, gathering, analyzing, clarifying, and drafting software functional and non-functional requirements, Product Requirements Documents (PRD), user stories, and acceptance criteria."
+        }
+      }
+    ]
+  }
+}

@@ -40,6 +40,10 @@ class _Query:
         self.filters.append((column, value))
         return self
 
+    def in_(self, column, values):
+        self.filters.append((column, set(values)))
+        return self
+
     def order(self, column, desc=False):
         self.order_by = (column, desc)
         return self
@@ -82,7 +86,13 @@ class _Query:
             rows.append(row)
             return SimpleNamespace(data=[copy.deepcopy(row)])
 
-        matched = [r for r in rows if all(r.get(c) == v for c, v in self.filters)]
+        matched = [
+            r for r in rows
+            if all(
+                (r.get(c) in v if isinstance(v, set) else r.get(c) == v)
+                for c, v in self.filters
+            )
+        ]
         if self.op == "delete":
             self.db.tables[self.table] = [r for r in rows if r not in matched]
             return SimpleNamespace(data=copy.deepcopy(matched))
