@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "input": {
+    "version": 1,
+    "guardrails": [
+      {
+        "name": "Jailbreak",
+        "config": {
+          "model": "qwen-3.8-27b",
+          "confidence_threshold": 0.8
+        }
+      },
+      {
+        "name": "NSFW Text",
+        "config": {
+          "model": "qwen-3.8-27b",
+          "confidence_threshold": 0.8
+        }
+      },
+      {
+        "name": "Prompt Injection Detection",
+        "config": {
+          "model": "qwen-3.8-27b",
+          "confidence_threshold": 0.8
+        }
+      },
+      {
+        "name": "Off Topic Prompts",
+        "config": {
+          "model": "qwen-3.8-27b",
+          "confidence_threshold": 0.8,
+          "system_prompt_details": "DevFoundry software development assistant: assisting users with software planning, requirements gathering, Product Requirements Documents (PRD), Technical Requirements Documents (TRD), architecture and tech stack selection, Azure DevOps project and repository creation, and repository structure scaffolding."
+        }
+      }
+    ]
+  }
+}

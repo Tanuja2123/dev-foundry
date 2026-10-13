@@ -35,9 +35,19 @@ Then fill in `.env`:
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | Yes (chat replies fail without it) |
 | `AZURE_OPENAI_VERSION` | API version (default: `2024-12-01-preview`) | Optional |
 | `AZURE_OPENAI_DEPLOYMENT` | Deployment name (default: `gpt-4`) | Optional |
+| `LOCAL_SLM_API_KEY` | Local SLM API key (automatic fallback if Azure OpenAI fails) | Optional |
+| `LOCAL_SLM_BASE_URL` | Local SLM endpoint (default: `https://llm.maqsoftware.net/v1`) | Optional |
+| `LOCAL_SLM_MODEL` | Local SLM model name (default: `qwen-3.8-27b`) | Optional |
+| `GUARDRAILS_API_KEY` | Guardrails SLM API key (defaults to `LOCAL_SLM_API_KEY` / `MAQ_AI_API_KEY`) | Optional |
+| `GUARDRAILS_BASE_URL` | Guardrails SLM endpoint (default: `https://llm.maqsoftware.net/v1`) | Optional |
+| `GUARDRAILS_MODEL` | Guardrails SLM model name (default: `qwen-3.8-27b`) | Optional |
+| `GUARDRAILS_ALLOWED_DOMAINS` | Comma-separated domain allowlist for URL filter | Optional |
 | `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
 | `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project/code read & write scopes | Yes (for ADO project & repo creation) |
 
+> **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  
+> **If Azure OpenAI encounters any errors or credentials fail**, the chat service automatically falls back to Local SLM (`LOCAL_SLM_API_KEY`).  
+> **Multi-Agent Guardrails Layer:** User inputs and agent outputs are validated via `openai-guardrails` against the local SLM with a fail-closed policy. PII is automatically redacted and external URLs are restricted to allowed domains.
 
 Register `http://localhost:5173/auth-callback` as a **Single-page application** redirect URI on the Entra app registration.
 
@@ -158,6 +168,22 @@ $env:SUPABASE_INTEGRATION_TESTS="1"
 
 # Full flow end to end (real Azure OpenAI, Supabase and Azure DevOps). This creates and deletes a "DevFoundry-E2E-<id>" project.
 $env:ADO_E2E_TESTS="1"; pytest -m e2e -s
+```
+
+# Guardrails Layer
+
+DevFoundry implements a defense-in-depth safety layer via the `openai-guardrails` Python package, executed exclusively against the local SLM through an OpenAI-compatible endpoint.
+
+- **Centralized Layer (`backend/app/services/guardrails_layer/`):** All guardrail clients, configs, and check handlers are encapsulated. Agents interact via unified functions without directly importing the guardrails library.
+- **2-Boundary Orchestrator Architecture:**
+  - **Input Boundary:** Enforces `Off-Topic Prompts` and `Prompt Injection Detection`. Blocks non-software engineering or adversarial attempts immediately with audit logging.
+  - **Output Boundary:** Redacts sensitive PII (emails, phone numbers, credit cards, bank accounts, SSNs) using spaCy NLP + Presidio, and applies `URL Filter` / `Restrict URLs` allowing only trusted domains (`dev.azure.com`, `azure.com`, `github.com`, `microsoft.com`, `maqsoftware.net`, etc.).
+- **Child Agent Boundaries:** The Requirements Agent enforces input validation against `System Prompt Leakage` and output validation against `Hallucinated Functions / Tool Misuse`, returning structured clarification JSON when triggered.
+- **Fail-Closed Security:** Configured with `raise_guardrail_errors=True` so any evaluation error or tripwire safely halts generation and logs the event for security auditing.
+
+```powershell
+# Run Guardrails test suite
+pytest backend/tests/test_guardrails.py -v
 ```
 
 # Build and Test
