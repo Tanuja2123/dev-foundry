@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import {
   PanelLeftClose,
   Plus,
@@ -11,6 +12,7 @@ import {
   LogIn,
 } from 'lucide-react'
 import type { Project } from '../types'
+import { TypewriterText } from './TypewriterText'
 
 export type SidebarState = 'expanded' | 'collapsed' | 'hidden'
 
@@ -55,10 +57,23 @@ export function Sidebar({
   const [searchQuery, setSearchQuery] = useState('')
   const [isProfileOpen, setIsProfileOpen] = useState(false)
   const [isResizing, setIsResizing] = useState(false)
+  const [projectToDelete, setProjectToDelete] = useState<Project | null>(null)
   const profileContainerRef = useRef<HTMLDivElement>(null)
 
   const isExpanded = sidebarState !== 'hidden'
   const isHidden = sidebarState === 'hidden'
+
+  // Close confirmation modal on Escape
+  useEffect(() => {
+    if (!projectToDelete) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setProjectToDelete(null)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [projectToDelete])
 
   // Close profile popup on click outside or Escape
   useEffect(() => {
@@ -241,7 +256,11 @@ export function Sidebar({
                 <span className="project-item-icon">
                   <FileText size={15} />
                 </span>
-                {isExpanded && <span className="project-item-name">{project.name}</span>}
+                {isExpanded && (
+                  <span className="project-item-name">
+                    <TypewriterText text={project.name} animateOnChange={isActive} animateOnMount={isActive} speed={28} />
+                  </span>
+                )}
               </button>
               {isExpanded && onDeleteProject && (
                 <button
@@ -251,9 +270,7 @@ export function Sidebar({
                   aria-label={`Delete ${project.name}`}
                   onClick={(e) => {
                     e.stopPropagation()
-                    if (window.confirm(`Delete "${project.name}"?`)) {
-                      onDeleteProject(project.id)
-                    }
+                    setProjectToDelete(project)
                   }}
                 >
                   <Trash2 size={13} />
@@ -355,6 +372,64 @@ export function Sidebar({
           <div className="sidebar-resizer-handle" />
         </div>
       )}
+
+      {/* Custom Confirmation Modal for Deleting Projects */}
+      {projectToDelete &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            className="modal-overlay"
+            onClick={() => setProjectToDelete(null)}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-delete-title"
+          >
+            <div
+              className="confirm-modal-box"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="confirm-modal-header">
+                <div className="confirm-modal-icon-badge">
+                  <Trash2 size={18} className="confirm-modal-icon" />
+                </div>
+                <div className="confirm-modal-content">
+                  <h3 id="confirm-delete-title" className="confirm-modal-title">
+                    Delete Project?
+                  </h3>
+                  <p className="confirm-modal-desc">
+                    Are you sure you want to delete{' '}
+                    <strong className="confirm-modal-name">
+                      "{projectToDelete.name}"
+                    </strong>
+                    ? This will permanently delete the conversation and cannot be undone.
+                  </p>
+                </div>
+              </div>
+
+              <div className="confirm-modal-footer">
+                <button
+                  type="button"
+                  className="btn-modal-cancel"
+                  onClick={() => setProjectToDelete(null)}
+                >
+                  No, cancel
+                </button>
+                <button
+                  type="button"
+                  className="btn-modal-delete"
+                  onClick={() => {
+                    const id = projectToDelete.id
+                    setProjectToDelete(null)
+                    onDeleteProject?.(id)
+                  }}
+                >
+                  Yes, delete
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </aside>
   )
 }

@@ -50,10 +50,10 @@ def remove_conversation(conversation_id: str, user: CurrentUser = Depends(get_cu
     try:
         deleted = delete_conversation(conversation_id, user.user_id)
     except Exception as exc:
-        logger.error(f"[Route] Error deleting conversation: {str(exc)}")
+        logger.exception(f"[Route] Error deleting conversation '{conversation_id}': {exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete conversation: {str(exc)}",
+            detail="The conversation could not be deleted. Please try again.",
         ) from exc
     if not deleted:
         raise _not_found(conversation_id)

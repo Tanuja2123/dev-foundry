@@ -73,6 +73,9 @@ class _Query:
                 row.setdefault("structure_trd_version", 0)
                 row.setdefault("pushed_structure", None)
                 row.setdefault("pushed_structure_version", None)
+                for column in ("scaffold_commands", "scaffold_structure"):  # migration 005
+                    if column not in self.db.missing_columns:
+                        row.setdefault(column, None)
             for existing in rows:
                 if self.table == "Project" and existing["conv_id"] == row["conv_id"]:
                     raise Exception("duplicate key value violates unique constraint")
@@ -84,6 +87,10 @@ class _Query:
             self.db.tables[self.table] = [r for r in rows if r not in matched]
             return SimpleNamespace(data=copy.deepcopy(matched))
         if self.op == "update":
+            unknown = set(self.payload) & self.db.missing_columns
+            if unknown:
+                raise Exception({"code": "PGRST204", "message": f"Could not find the '{sorted(unknown)[0]}' column of "
+                                                                f"'{self.table}' in the schema cache"})
             for r in matched:
                 r.update(copy.deepcopy(self.payload))
             return SimpleNamespace(data=copy.deepcopy(matched))
@@ -95,9 +102,10 @@ class _Query:
 
 
 class FakeSupabase:
-    def __init__(self, missing_tables=()):
+    def __init__(self, missing_tables=(), missing_columns=()):
         self.tables: Dict[str, List[Dict[str, Any]]] = {}
         self.missing_tables = set(missing_tables)
+        self.missing_columns = set(missing_columns)   # simulate a migration that was not run yet
 
     def table(self, name: str) -> _Query:
         return _Query(self, name)

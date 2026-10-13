@@ -8,8 +8,22 @@ env/
 ENV/
 
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
+
+# Node (the frontend has its own .gitignore; this also covers tools run from the root)
+node_modules/
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
+
+# Local scaffolding experiments (e.g. `uv init` / `npx create-*` output). DevFoundry generates repository
+# structures in the OS temp folder, never inside this repo.
+test-cli/
 
 .env
 .env.*
@@ -22,3 +36,4 @@ htmlcov/
 
 ISSUES.md
 TESTING.md
+MERGE_NOTES.md

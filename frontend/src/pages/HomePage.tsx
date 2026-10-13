@@ -11,6 +11,7 @@ import {
 } from '../api/chat'
 import { ChatPanel } from '../components/ChatPanel'
 import { Sidebar, type SidebarState } from '../components/Sidebar'
+import { TypewriterText } from '../components/TypewriterText'
 import { ProjectsPage } from './ProjectsPage'
 import type { ChatMessage, Project, Suggestion } from '../types'
 
@@ -36,6 +37,8 @@ export function HomePage() {
 
   const [conversations, setConversations] = useState<Project[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  // The open conversation is remembered per account, so a reload or reopened browser continues it.
+  const lastConversationKey = `lastConversation:${account?.localAccountId ?? account?.homeAccountId ?? 'anonymous'}`
   const [listStatus, setListStatus] = useState<string | null>('Loading projects…')
   const [messagesByConversation, setMessagesByConversation] = useState<
     Record<string, ChatMessage[]>
@@ -94,8 +97,17 @@ export function HomePage() {
           name: item.title,
         }))
         setConversations(mapped)
-        // No project is auto-selected: after signing in (or reloading) the app opens a new chat,
-        // and earlier projects stay available in the sidebar.
+        // Continue the conversation that was open last (reload, reopened browser, laptop wake-up).
+        // After an explicit sign-out the key is cleared, so a fresh sign-in starts with a new chat.
+        let lastId: string | null = null
+        try {
+          lastId = localStorage.getItem(lastConversationKey)
+        } catch {
+          // storage unavailable (private mode): start with a new chat
+        }
+        if (lastId && mapped.some((item) => item.id === lastId)) {
+          setSelectedId(lastId)
+        }
         setListStatus(mapped.length === 0 ? 'No projects yet.' : null)
       } catch (reason) {
         if (cancelled) return
@@ -112,6 +124,17 @@ export function HomePage() {
       cancelled = true
     }
   }, [])
+
+  // Remember the open conversation. Not cleared on a null selection here: on page load nothing is selected
+  // until the list has loaded, which would wipe the saved id. "New Project" and sign-out clear it explicitly.
+  useEffect(() => {
+    if (!selectedId) return
+    try {
+      localStorage.setItem(lastConversationKey, selectedId)
+    } catch {
+      // storage unavailable: nothing to remember
+    }
+  }, [selectedId, lastConversationKey])
 
   // Automatically fetch existing conversation history when switching projects
   useEffect(() => {
@@ -177,6 +200,11 @@ export function HomePage() {
   }
 
   const handleNewConversation = useCallback(() => {
+    try {
+      localStorage.removeItem(lastConversationKey)
+    } catch {
+      // ignore
+    }
     setSelectedId(null)
     setDraftMessages([])
     setDraftFiles([])
@@ -187,7 +215,7 @@ export function HomePage() {
     setTimeout(() => {
       document.querySelector<HTMLTextAreaElement>('.composer-row textarea')?.focus()
     }, 60)
-  }, [location.pathname, navigate])
+  }, [location.pathname, navigate, lastConversationKey])
 
   // Global keyboard accessibility shortcuts:
   // - Toggle Sidebar: Ctrl+B / Ctrl+\ / Ctrl+Shift+S
@@ -280,12 +308,14 @@ export function HomePage() {
 
       if (isNew) {
         const newId = result.conversation_id
-        let projectTitle = 'New Project'
-        try {
-          const fresh = await getConversation(newId)
-          if (fresh.title) projectTitle = fresh.title
-        } catch {
-          // fallback
+        let projectTitle = result.title || 'New Project'
+        if (!result.title) {
+          try {
+            const fresh = await getConversation(newId)
+            if (fresh.title) projectTitle = fresh.title
+          } catch {
+            // fallback
+          }
         }
 
         const newProject: Project = {
@@ -301,6 +331,13 @@ export function HomePage() {
         setDraftMessages([])
         setDraftFiles([])
       } else {
+        if (result.title) {
+          setConversations((current) =>
+            current.map((p) =>
+              p.id === conversationId ? { ...p, name: result.title! } : p,
+            ),
+          )
+        }
         if (attachedFile) {
           setFilesByConversation((current) => ({
             ...current,
@@ -374,7 +411,14 @@ export function HomePage() {
         user={{
           name: displayName,
           initials,
-          onSignOut: () => instance.logoutRedirect(),
+          onSignOut: () => {
+            try {
+              localStorage.removeItem(lastConversationKey)
+            } catch {
+              // ignore
+            }
+            void instance.logoutRedirect()
+          },
         }}
       />
       <div className="main">
@@ -394,7 +438,7 @@ export function HomePage() {
                   <PanelLeftOpen size={18} />
                 </button>
               )}
-              <h1>{isProjectsView ? 'Projects' : activeProject.name}</h1>
+              <h1>{isProjectsView ? 'Projects' : <TypewriterText text={activeProject.name} speed={28} />}</h1>
             </div>
           </div>
 

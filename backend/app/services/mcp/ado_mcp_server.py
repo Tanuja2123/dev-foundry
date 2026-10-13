@@ -126,12 +126,41 @@ def read_project(client: httpx.Client, org_url: str, project_id_or_name: str, he
     return {"status": "success", "id": data.get("id"), "name": data.get("name"),
             "description": data.get("description"), "url": web_url}
 
+# https://learn.microsoft.com/en-us/azure/devops/organizations/settings/naming-restrictions (project names)
+ADO_PROJECT_NAME_FORBIDDEN = re.compile(r"""[/:\\~&%;@'"?<>|#$*{},+=\[\]\x00-\x1f\x7f]""")
+ADO_PROJECT_NAME_MAX_LENGTH = 64
+ADO_RESERVED_PROJECT_NAMES = {
+    "aux", "con", "nul", "prn", "server", "signalr", "web", "web.config", "defaultcollection", "bin",
+    "app_browsers", "app_code", "app_data", "app_globalresources", "app_localresources", "app_themes",
+    "app_webresources", *(f"com{i}" for i in range(1, 11)), *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def sanitize_ado_project_name(name: str) -> str:
+    """
+    Makes a name valid under the Azure DevOps project naming rules: '&' becomes 'and', the forbidden characters
+    / : backslash ~ & % ; @ ' " ? < > | # $ * { } , + = [ ] and control characters are removed, whitespace is collapsed, the
+    name may not start with '_' or start/end with '.', and it is at most 64 characters. Letters (any language),
+    digits, spaces, hyphens, underscores and periods are kept. Reserved names get a " project" suffix.
+    """
+    cleaned = re.sub(r"\s*&\s*", " and ", str(name or "").strip())
+    cleaned = ADO_PROJECT_NAME_FORBIDDEN.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned[:ADO_PROJECT_NAME_MAX_LENGTH].strip("-. ").lstrip("_-. ")  # also trims dangling hyphens
+    if not cleaned:
+        return "project"
+    if cleaned.lower() in ADO_RESERVED_PROJECT_NAMES:
+        cleaned = f"{cleaned} project"
+    return cleaned
+
+
 @mcp.tool(name="create_ado_project", description="Create a new Azure DevOps project using the approved project name and description.")
 def create_ado_project(project_name: str, project_description: str) -> Dict[str, Any]:
     """
     TOOL 1 — ADO PROJECT CREATION
     Creates an Azure DevOps project using the approved project name and description.
     """
+    project_name = sanitize_ado_project_name(project_name)
     config = get_ado_config()
     org_url = config.get("org_url")
     pat = config.get("pat")
@@ -269,7 +298,8 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
 
 @mcp.tool(name="push_repository_files", description="Push a list of files (path + non-empty content) to a newly created, empty Azure DevOps repository as a single initial commit.")
 def push_repository_files(project_id_or_name: str, repository_name: str, files: List[Dict[str, str]],
-                          commit_message: Optional[str] = None, branch: Optional[str] = None) -> Dict[str, Any]:
+                          commit_message: Optional[str] = None, branch: Optional[str] = None,
+                          allow_empty: bool = False) -> Dict[str, Any]:
     """
     TOOL 3 — REPOSITORY FILE PUSH
     Pushes caller-supplied files ([{"path": ..., "content": ...}]) as one commit (validated paths, non-empty content,
@@ -280,18 +310,10 @@ def push_repository_files(project_id_or_name: str, repository_name: str, files: 
     logger.info(f"[ADO MCP] Tool invoked: push_repository_files(project='{project_id_or_name}', "
                 f"repository_name='{repository_name}', files={len(files or [])})")
     try:
-        file_map: Dict[str, str] = {}
-        for index, item in enumerate(files or []):
-            data = item if isinstance(item, dict) else (item.model_dump() if hasattr(item, "model_dump") else {})
-            path, content = data.get("path"), data.get("content")
-            if not isinstance(path, str) or not isinstance(content, str):
-                raise AdoPushError(f"File #{index + 1} must have string 'path' and 'content' fields.",
-                                   error_type="VALIDATION_ERROR")
-            if path in file_map:
-                raise AdoPushError(f"Duplicate file path '{path}'.", error_type="VALIDATION_ERROR")
-            file_map[path] = content
+        # [{path, content, encoding?}] -> path -> content (binary files keep their base64 marker)
+        file_map = _files_to_map(files)
         return push_files_to_repo(project_id_or_name, repository_name, file_map, commit_message=commit_message,
-                                  branch=branch, allow_existing_branch=False)
+                                  branch=branch, allow_existing_branch=False, allow_empty=allow_empty)
     except AdoPushError as e:
         logger.error(f"[ADO MCP] Custom file push failed: {e.error_type}: {e.message}")
         return e.to_dict()
@@ -310,7 +332,7 @@ def _files_to_map(files: List[Any]) -> Dict[str, str]:
 @mcp.tool(name="push_repository_changes", description="Push the differences between the previously pushed files and the new files (add / edit / delete) as one follow-up commit.")
 def push_repository_changes(project_id_or_name: str, repository_name: str, base_files: List[Dict[str, str]],
                             files: List[Dict[str, str]], commit_message: Optional[str] = None,
-                            branch: Optional[str] = None) -> Dict[str, Any]:
+                            branch: Optional[str] = None, allow_empty: bool = False) -> Dict[str, Any]:
     """
     TOOL 4 — REPOSITORY CHANGE PUSH
     `base_files` is the structure as last pushed, `files` the new structure. Only the differences are committed.
@@ -322,7 +344,7 @@ def push_repository_changes(project_id_or_name: str, repository_name: str, base_
     try:
         return push_files_to_repo(project_id_or_name, repository_name, _files_to_map(files),
                                   commit_message=commit_message, branch=branch,
-                                  base_files=_files_to_map(base_files))
+                                  base_files=_files_to_map(base_files), allow_empty=allow_empty)
     except AdoPushError as e:
         logger.error(f"[ADO MCP] Change push failed: {e.error_type}: {e.message}")
         return e.to_dict()
@@ -355,7 +377,7 @@ def update_ado_project(project_id: str, project_name: Optional[str] = None,
         }
     payload = {}
     if project_name and project_name.strip():
-        payload["name"] = project_name.strip()
+        payload["name"] = sanitize_ado_project_name(project_name)
     if project_description is not None and project_description.strip():
         payload["description"] = project_description.strip()
     if not payload:

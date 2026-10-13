@@ -227,3 +227,41 @@ def test_create_ado_repository_unchanged(scripted):
 def test_existing_tools_report_missing_config(no_ado_config):
     assert server.create_ado_project("P", "D")["status"] == "error"
     assert server.create_ado_repository("P", "r")["status"] == "error"
+
+
+def test_sanitize_ado_project_name():
+    # Replaces & with and
+    assert server.sanitize_ado_project_name("Git Changelog & Release Notes CLI") == "Git Changelog and Release Notes CLI"
+    assert server.sanitize_ado_project_name("A&B") == "A and B"
+    assert server.sanitize_ado_project_name("Foo  &  Bar") == "Foo and Bar"
+
+    # Strips the characters Azure DevOps forbids; keeps the allowed ones ('!', '_', '.', '(', letters of any language)
+    assert server.sanitize_ado_project_name("My Project #1 @ 2026! / test?") == "My Project 1 2026! test"
+    assert server.sanitize_ado_project_name("Café Ops_v2.0 (beta)") == "Café Ops_v2.0 (beta)"
+    assert server.sanitize_ado_project_name("_hidden.") == "hidden"            # no leading '_', no trailing '.'
+    assert server.sanitize_ado_project_name("CON") == "CON project"            # reserved name
+
+    # Trims hyphens, spaces, periods from ends
+    assert server.sanitize_ado_project_name(" -..My-Project..- ") == "My-Project"
+
+    # Enforces 64 char limit
+    long_name = "A" * 70
+    assert len(server.sanitize_ado_project_name(long_name)) <= 64
+
+    # Empty fallback
+    assert server.sanitize_ado_project_name("") == "project"
+
+
+def test_create_and_update_ado_project_sanitizes_ampersand(scripted):
+    _ScriptedClient.reset(["succeeded"])
+    res_create = server.create_ado_project("Git Changelog & Release Notes CLI", "CLI tools")
+    assert res_create["status"] == "success"
+    assert res_create["name"] == "Git Changelog and Release Notes CLI"
+    create_payload = json.loads(_ScriptedClient.requests[0].content)
+    assert create_payload["name"] == "Git Changelog and Release Notes CLI"
+
+    _ScriptedClient.reset(["succeeded"])
+    res_update = server.update_ado_project("real-project-guid", project_name="Tools & Utilities")
+    assert res_update["status"] == "success"
+    patch_payload = json.loads(_ScriptedClient.requests[0].content)
+    assert patch_payload["name"] == "Tools and Utilities"

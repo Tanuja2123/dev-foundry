@@ -23,10 +23,10 @@ RETRY_BACKOFF_SECONDS = 1.0
 MAX_RETRY_AFTER_SECONDS = 10.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-# Sanity limits for agent-supplied file lists
-MAX_FILES = 200
-MAX_FILE_BYTES = 100_000
-MAX_TOTAL_BYTES = 2_000_000
+# Sanity limits for file lists (scaffold generators can emit lock files of several hundred KB)
+MAX_FILES = 300
+MAX_FILE_BYTES = 1_000_000
+MAX_TOTAL_BYTES = 10_000_000
 MAX_PATH_LENGTH = 400
 MAX_COMMIT_MESSAGE_LENGTH = 1000
 
@@ -59,6 +59,11 @@ class AdoPushError(Exception):
             "message": self.message,
             "details": self.details,
         }
+
+
+class Base64Content(str):
+    """File content that is base64-encoded binary data (e.g. an image a scaffold generator produced).
+    Stored in a structure as {"path", "content", "encoding": "base64"} and pushed with contentType 'base64encoded'."""
 
 
 @dataclass
@@ -117,8 +122,13 @@ def normalize_branch(branch: str) -> str:
 
 
 def prepare_files(files: Mapping[str, str], *, max_files: int = MAX_FILES,
-                  max_file_bytes: int = MAX_FILE_BYTES, max_total_bytes: int = MAX_TOTAL_BYTES) -> Dict[str, str]:
-    """Validates and normalizes a path -> content map. Returns a new map keyed by normalized path."""
+                  max_file_bytes: int = MAX_FILE_BYTES, max_total_bytes: int = MAX_TOTAL_BYTES,
+                  allow_empty: bool = False) -> Dict[str, str]:
+    """
+    Validates and normalizes a path -> content map. Returns a new map keyed by normalized path.
+    `allow_empty` accepts empty files (generators create them, e.g. an empty README.md); hand-written files must
+    have content. Base64Content values keep their type.
+    """
     if not files:
         raise AdoPushError("At least one file is required.", error_type="VALIDATION_ERROR")
     if len(files) > max_files:
@@ -131,7 +141,7 @@ def prepare_files(files: Mapping[str, str], *, max_files: int = MAX_FILES,
         normalized = normalize_path(path)
         if normalized in prepared or normalized.lower() in seen_lower:
             raise AdoPushError(f"Duplicate file path '{normalized}'.", error_type="VALIDATION_ERROR")
-        if not isinstance(content, str) or not content.strip():
+        if not isinstance(content, str) or (not allow_empty and not content.strip()):
             raise AdoPushError(f"File '{normalized}' has empty content. Every file must contain text.",
                                error_type="VALIDATION_ERROR")
         size = len(content.encode("utf-8"))
@@ -168,7 +178,8 @@ def build_changes_body(branch: str, old_object_id: str, commit_message: str,
     for change_type, path, content in changes:
         change: Dict[str, Any] = {"changeType": change_type, "item": {"path": path}}
         if change_type != "delete":
-            change["newContent"] = {"content": content, "contentType": "rawtext"}
+            content_type = "base64encoded" if isinstance(content, Base64Content) else "rawtext"
+            change["newContent"] = {"content": content, "contentType": content_type}
         body_changes.append(change)
     return {
         "refUpdates": [{"name": f"refs/heads/{branch}", "oldObjectId": old_object_id}],
@@ -302,6 +313,7 @@ def push_files_to_repo(
     *,
     allow_existing_branch: bool = True,
     base_files: Optional[Mapping[str, str]] = None,
+    allow_empty: bool = False,
     org_url: Optional[str] = None,
     pat: Optional[str] = None,
     client: Optional[httpx.Client] = None,
@@ -316,6 +328,7 @@ def push_files_to_repo(
     - An existing branch is updated from its current head, unless `allow_existing_branch` is False,
       in which case an ALREADY_INITIALIZED error is raised before anything is pushed.
     - If the branch moves between reading the head and pushing (409), the head is re-read and the push retried once.
+    - Base64Content values are pushed as binary; `allow_empty` permits empty files (validated structures).
     - With `base_files` (the files as last pushed), the branch must already exist and the commit contains only the
       differences: new files are added, changed files edited, missing files deleted. No differences -> NO_CHANGES error.
 
@@ -332,8 +345,9 @@ def push_files_to_repo(
     if len(message) > MAX_COMMIT_MESSAGE_LENGTH:
         raise AdoPushError(f"Commit message exceeds {MAX_COMMIT_MESSAGE_LENGTH} characters.",
                            error_type="VALIDATION_ERROR")
-    prepared = prepare_files(files)
-    changes = compute_changes(prepare_files(base_files) if base_files else {}, prepared) if update_mode else None
+    prepared = prepare_files(files, allow_empty=allow_empty)
+    changes = (compute_changes(prepare_files(base_files, allow_empty=True) if base_files else {}, prepared)
+               if update_mode else None)
     if update_mode and not changes:
         raise AdoPushError("The structure is identical to what was already pushed; there is nothing to push.",
                            error_type="NO_CHANGES")

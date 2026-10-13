@@ -17,6 +17,7 @@ export type ChatApiResponse = {
   conversation_id: string
   response: string
   suggestions?: Suggestion[]
+  title?: string | null
 }
 
 export type ChatRole = 'user' | 'assistant'

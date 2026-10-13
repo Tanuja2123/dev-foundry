@@ -36,7 +36,9 @@ const msalConfig: Configuration = {
     postLogoutRedirectUri,
   },
   cache: {
-    cacheLocation: 'sessionStorage',
+    // localStorage keeps the sign-in across browser restarts (sessionStorage is wiped when the browser closes,
+    // which forced a sign-in redirect - a full page reload - every time the browser was reopened).
+    cacheLocation: 'localStorage',
   },
 }
 

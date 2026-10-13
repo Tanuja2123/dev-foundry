@@ -115,6 +115,16 @@ def get_file_content(project: str, repo: str, path: str, branch: str) -> str:
         return r.json()["content"]
 
 
+def get_file_bytes(project: str, repo: str, path: str, branch: str) -> bytes:
+    """Raw bytes of a file as stored in the repository (works for binary and empty files)."""
+    with client() as c:
+        r = c.get(f"{repo_url(project, repo)}/items", params={
+            "path": path, "download": "true", "$format": "octetStream", "versionDescriptor.version": branch,
+            "versionDescriptor.versionType": "branch", "api-version": "7.1"})
+        r.raise_for_status()
+        return r.content
+
+
 def supabase():
     from supabase import create_client
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
