@@ -57,9 +57,26 @@ if "Hallucinated Functions / Tool Misuse" not in default_spec_registry._guardrai
     )
 
 
+import dataclasses
+import re
+
 class RestrictURLsConfig(BaseModel):
     allowed_domains: List[str] = Field(default_factory=list)
     url_allow_list: List[str] = Field(default_factory=list)
+
+
+async def safe_urls(
+    ctx: Any,
+    data: str,
+    config: URLConfig,
+) -> GuardrailResult:
+    """
+    Wrapper around URL check that normalizes sentence-ending punctuation before newlines.
+    Prevents false positives where markdown paragraphs (e.g. '...repository.\\n\\nWe're...')
+    are misinterpreted by guardrails' ASCII control char URL scanner as a malicious URL.
+    """
+    cleaned_data = re.sub(r'([.?!])\s*(\n+)', r'\1 \2', data) if isinstance(data, str) else data
+    return await urls(ctx, cleaned_data, config)
 
 
 async def restrict_urls_check_fn(
@@ -70,9 +87,16 @@ async def restrict_urls_check_fn(
     """Wrapper that maps allowed_domains or url_allow_list to standard URL check."""
     domains = list(set(config.allowed_domains + config.url_allow_list))
     url_cfg = URLConfig(url_allow_list=domains)
-    res = await urls(ctx, data, url_cfg)
-    return res
+    return await safe_urls(ctx, data, url_cfg)
 
+
+# Wrap standard 'URL Filter' in registry with safe_urls
+if "URL Filter" in default_spec_registry._guardrailspecs:
+    orig_url_spec = default_spec_registry._guardrailspecs["URL Filter"]
+    default_spec_registry._guardrailspecs["URL Filter"] = dataclasses.replace(
+        orig_url_spec,
+        check_fn=safe_urls,
+    )
 
 # Register alias: Restrict URLs
 if "Restrict URLs" not in default_spec_registry._guardrailspecs:

@@ -234,12 +234,25 @@ def get_azure_openai_client() -> OpenAIChatCompletionClient:
     )
 
 def get_local_slm_config() -> Dict[str, str]:
-    """Retrieves Local SLM fallback configuration from environment."""
-    api_key = os.getenv("LOCAL_SLM_API_KEY") or os.getenv("LOCAL_SLM_APIKEY")
-    base_url = os.getenv("LOCAL_SLM_BASE_URL", "https://llm.maqsoftware.net/v1")
-    model = os.getenv("LOCAL_SLM_MODEL", "qwen-3.8-27b")
+    """Retrieves Local SLM fallback configuration from environment, prioritizing MAQ_AI_API_KEY."""
+    api_key = (
+        os.getenv("MAQ_AI_API_KEY")
+        or os.getenv("LOCAL_SLM_API_KEY")
+        or os.getenv("LOCAL_SLM_APIKEY")
+        or ""
+    ).strip()
+    base_url = (
+        os.getenv("MAQ_AI_BASE_URL")
+        or os.getenv("LOCAL_SLM_BASE_URL")
+        or "https://indiaai.maqsoftware.net/v1"
+    ).strip()
+    model = (
+        os.getenv("MAQ_AI_MODEL")
+        or os.getenv("LOCAL_SLM_MODEL")
+        or "qwen-3.8-27b"
+    ).strip()
     return {
-        "api_key": api_key or "",
+        "api_key": api_key,
         "base_url": base_url,
         "model": model,
     }
@@ -248,8 +261,8 @@ def get_local_slm_client() -> OpenAIChatCompletionClient:
     """Configures fallback Local SLM client for Microsoft Agent Framework."""
     config = get_local_slm_config()
     if not config["api_key"]:
-        logger.error("[Local SLM] LOCAL_SLM_API_KEY missing in environment.")
-        raise ValueError("Local SLM credentials not found in environment (LOCAL_SLM_API_KEY missing).")
+        logger.error("[Local SLM] MAQ_AI_API_KEY / LOCAL_SLM_API_KEY missing in environment.")
+        raise ValueError("Local SLM credentials not found in environment (MAQ_AI_API_KEY missing).")
         
     return OpenAIChatCompletionClient(
         model=config["model"],
@@ -822,7 +835,7 @@ async def generate_direct_slm_chat_response(
     model = config["model"]
 
     if not api_key:
-        raise ValueError("Local SLM API key is not configured (LOCAL_SLM_API_KEY).")
+        raise ValueError("MAQ AI / Local SLM API key is not configured (MAQ_AI_API_KEY).")
 
     logger.info(f"[Local SLM Direct] Generating chat response with model '{model}' at '{base_url}'...")
 
@@ -882,7 +895,7 @@ async def generate_chat_response(user_query: str, history: List[Dict], conversat
     if not local_config["api_key"]:
         err_msg = (
             f"Azure OpenAI error: {str(azure_error)}. "
-            "Local SLM fallback is not configured. Please set LOCAL_SLM_API_KEY in your .env file."
+            "Local SLM fallback is not configured. Please set MAQ_AI_API_KEY in your .env file."
         )
         logger.error(f"[Fallback Failed] {err_msg}")
         return err_msg

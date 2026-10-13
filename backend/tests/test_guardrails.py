@@ -93,6 +93,27 @@ def test_orchestrator_output_url_filter_authorized():
     asyncio.run(_run())
 
 
+def test_orchestrator_output_newline_period_not_flagged_as_url():
+    """
+    Regression test: Sentences ending with periods followed by paragraph breaks
+    (e.g., '...from requirements to repository.\n\nWe're ready to get started...')
+    must not be falsely identified as ambiguous URLs containing control characters.
+    """
+    async def _run():
+        greeting_output = (
+            "Hello! I am your AI Copilot for DevFoundry, ready to assist you across the software "
+            "development lifecycle from requirements to repository.\n\n"
+            "We're ready to get started. How can I help you today?"
+        )
+        result = await check_output_guardrail(greeting_output)
+
+        assert result.allowed is True
+        assert result.blocked_reason is None
+        assert result.response_text == greeting_output
+
+    asyncio.run(_run())
+
+
 def test_orchestrator_input_prompt_injection_mock():
     """
     Tripwire test: Prompt Injection Detection trips fail-closed when malicious prompt is submitted.

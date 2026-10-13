@@ -36,23 +36,23 @@ def get_guardrails_slm_config() -> Dict[str, str]:
     """
     base_url = (
         os.getenv("GUARDRAILS_BASE_URL")
-        or os.getenv("LOCAL_SLM_BASE_URL")
         or os.getenv("MAQ_AI_BASE_URL")
-        or "https://llm.maqsoftware.net/v1"
+        or os.getenv("LOCAL_SLM_BASE_URL")
+        or "https://indiaai.maqsoftware.net/v1"
     ).strip()
 
     api_key = (
-        os.getenv("GUARDRAILS_API_KEY")
+        os.getenv("MAQ_AI_API_KEY")
+        or os.getenv("GUARDRAILS_API_KEY")
         or os.getenv("LOCAL_SLM_API_KEY")
         or os.getenv("LOCAL_SLM_APIKEY")
-        or os.getenv("MAQ_AI_API_KEY")
         or ""
     ).strip()
 
     model = (
         os.getenv("GUARDRAILS_MODEL")
-        or os.getenv("LOCAL_SLM_MODEL")
         or os.getenv("MAQ_AI_MODEL")
+        or os.getenv("LOCAL_SLM_MODEL")
         or "qwen-3.8-27b"
     ).strip()
 
@@ -76,14 +76,16 @@ ALLOWED_DOMAINS: List[str] = [
 
 ORCHESTRATOR_ALLOWED_SCOPE = (
     "DevFoundry AI-powered software development assistant. Allowed scope covers "
+    "conversational greetings (such as hello, hi, hey, greetings, pleasantries), introductory dialogue, "
     "software requirements gathering, Product Requirements Documents (PRD), "
     "Technical Requirements Documents (TRD), architecture and tech stack selection, "
     "software architecture planning, repository scaffolding and file structure, "
-    "and Azure DevOps project/repo setup."
+    "and Azure DevOps project/repo setup. Polite greetings and conversational pleasantries are explicitly on-topic."
 )
 
 REQUIREMENTS_AGENT_ALLOWED_SCOPE = (
-    "Requirements Agent allowed scope: gathering, analyzing, clarifying, and drafting "
+    "Requirements Agent allowed scope: conversational greetings, pleasantries, "
+    "gathering, analyzing, clarifying, and drafting "
     "software functional and non-functional requirements, Product Requirements Documents (PRD), "
-    "user stories, and acceptance criteria."
+    "user stories, and acceptance criteria. Greetings and conversational pleasantries are on-topic."
 )
