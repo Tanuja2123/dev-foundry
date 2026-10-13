@@ -4,14 +4,14 @@
     "version": 1,
     "guardrails": [
       {
-        "name": "Jailbreak",
+        "name": "NSFW Text",
         "config": {
           "model": "qwen-3.8-27b",
           "confidence_threshold": 0.8
         }
       },
       {
-        "name": "NSFW Text",
+        "name": "Jailbreak",
         "config": {
           "model": "qwen-3.8-27b",
           "confidence_threshold": 0.8
