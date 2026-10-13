@@ -4,6 +4,17 @@ import pytest
 from app.services import conversation_service
 
 
+SLM_ENV = ("MAQ_AI_API_KEY", "MAQ_AI_BASE_URL", "MAQ_AI_MODEL",
+           "LOCAL_SLM_API_KEY", "LOCAL_SLM_APIKEY", "LOCAL_SLM_BASE_URL", "LOCAL_SLM_MODEL")
+
+
+@pytest.fixture(autouse=True)
+def isolated_slm_env(monkeypatch):
+    """The real .env must never leak into these tests (MAQ_AI_* takes precedence over LOCAL_SLM_*)."""
+    for name in SLM_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_get_local_slm_config_defaults(monkeypatch):
     monkeypatch.delenv("LOCAL_SLM_API_KEY", raising=False)
     monkeypatch.delenv("LOCAL_SLM_APIKEY", raising=False)
@@ -12,7 +23,7 @@ def test_get_local_slm_config_defaults(monkeypatch):
 
     config = conversation_service.get_local_slm_config()
     assert config["api_key"] == ""
-    assert config["base_url"] == "https://llm.maqsoftware.net/v1"
+    assert config["base_url"] == "https://indiaai.maqsoftware.net/v1"   # PR 24 default
     assert config["model"] == "qwen-3.8-27b"
 
 
@@ -31,7 +42,7 @@ def test_get_local_slm_client_missing_key(monkeypatch):
     monkeypatch.delenv("LOCAL_SLM_API_KEY", raising=False)
     monkeypatch.delenv("LOCAL_SLM_APIKEY", raising=False)
 
-    with pytest.raises(ValueError, match="LOCAL_SLM_API_KEY missing"):
+    with pytest.raises(ValueError, match="MAQ_AI_API_KEY missing"):
         conversation_service.get_local_slm_client()
 
 

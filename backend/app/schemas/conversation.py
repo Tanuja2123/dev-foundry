@@ -23,3 +23,4 @@ class ChatResponse(BaseModel):
     conversation_id: str = Field(..., description="Conversation identifier for the response")
     response: str = Field(..., description="LLM-generated answer for the user query")
     suggestions: List[Suggestion] = Field(default_factory=list, description="Next-step suggestions for the user")
+    title: Optional[str] = Field(None, description="Current or updated title for the conversation")

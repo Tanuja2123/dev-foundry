@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import asyncio
 from typing import Any, Dict, List, Optional, Sequence, Mapping
@@ -8,6 +9,113 @@ from agent_framework import Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from agent_framework._types import ChatResponse, ResponseStream, ChatResponseUpdate
 from app.core.logger import logger
+
+
+# Per-provider HTTP limits. Without them the OpenAI SDK waits up to 600 s per attempt and retries twice, honouring a
+# server "Retry-After" of up to 120 s, so a hanging provider (e.g. a Cloudflare 524 after ~100 s) could take ~9 minutes
+# before the next provider is tried. Override with <PREFIX>_TIMEOUT_SECONDS / <PREFIX>_MAX_RETRIES in .env.
+PROVIDER_LIMIT_DEFAULTS = {
+    # provider_id: (env prefix, read timeout seconds, retries after the first attempt)
+    "azure_openai": ("AZURE_OPENAI", 120.0, 1),
+    "groq": ("GROQ", 60.0, 2),          # 429 per-minute limits ask for waits of a few seconds: cheap to retry
+    # The SLM can be slow: allow 15 minutes. Its gateway sits behind Cloudflare, which aborts a request after 120 s
+    # without any response bytes (HTTP 524), so MAQ AI requests are streamed (see STREAMING_PROVIDERS) - tokens keep
+    # the connection alive however long the answer takes. No automatic retry: a retry would start over from scratch.
+    "maq_ai": ("MAQ_AI", 900.0, 0),
+}
+STREAMING_PROVIDERS = {"maq_ai"}          # disable with MAQ_AI_STREAM=false
+CONNECT_TIMEOUT_SECONDS = 10.0
+
+# Groq's free tier allows 8,000 tokens per request (prompt + completion) and per minute, per model. Requests that
+# cannot fit are skipped instead of being sent and rejected with HTTP 413. Override with GROQ_MAX_REQUEST_TOKENS.
+DEFAULT_GROQ_MODELS = "openai/gpt-oss-20b,openai/gpt-oss-120b"
+DEFAULT_GROQ_MAX_REQUEST_TOKENS = 8000
+MIN_COMPLETION_TOKENS = 1000
+
+
+class AllProvidersFailedError(RuntimeError):
+    """Every configured LLM provider failed or was skipped. `errors` holds one technical line per provider (for logs)."""
+
+    def __init__(self, errors: List[str]):
+        self.errors = errors
+        super().__init__("All LLM providers failed: " + " | ".join(errors))
+
+
+def _short_error(exc: Exception) -> str:
+    """One-line, log-friendly summary of a provider error: HTTP status + the provider's own message (no response dump)."""
+    import re
+    text = " ".join(str(exc).split())
+    code = re.search(r"Error code: (\d{3})", text)
+    status = code.group(1) if code else ""
+    if status == "524" or ("524" in text and "cloudflare" in text.lower()):
+        return "HTTP 524: the gateway (Cloudflare) closed the request after 120 s without a response"
+    if "Virtual Network/Firewall" in text:
+        return "HTTP 403: access denied by the Azure OpenAI network/firewall rules (VPN / IP allow-list)"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "Timeout" in type(exc).__name__ or "timed out" in text:
+        return f"timeout: no answer within the configured time ({type(exc).__name__})"
+    message = re.search(r"""['"]message['"]: ['"](.+?)['"](?:, ['"]|\})""", text)
+    detail = message.group(1) if message else text
+    detail = re.sub(r" in organization `[^`]+`", "", detail)          # keep account ids out of the logs
+    detail = re.sub(r"\s*Need more tokens\?.*$", "", detail)
+    return (f"HTTP {status}: " if status else f"{type(exc).__name__}: ") + detail[:300]
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = (os.getenv(name, "") or "").strip().lower()
+    return default if not value else value not in ("0", "false", "no", "off")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, "") or default)
+        return value if value > 0 else default
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, "") or default))
+    except ValueError:
+        return default
+
+
+def apply_provider_limits(client: OpenAIChatCompletionClient, provider_id: str) -> tuple:
+    """Sets the read timeout and retry count of the provider's underlying OpenAI SDK client. Returns (timeout, retries)."""
+    prefix, default_timeout, default_retries = PROVIDER_LIMIT_DEFAULTS[provider_id]
+    timeout = _env_float(f"{prefix}_TIMEOUT_SECONDS", default_timeout)
+    retries = _env_int(f"{prefix}_MAX_RETRIES", default_retries)
+    import httpx
+    client.client = client.client.with_options(
+        timeout=httpx.Timeout(timeout, connect=min(CONNECT_TIMEOUT_SECONDS, timeout)), max_retries=retries)
+    return timeout, retries
+
+
+def _token_counter():
+    try:
+        import tiktoken
+        encoding = tiktoken.get_encoding("o200k_base")   # gpt-4.1 / gpt-oss tokenizer family
+        return lambda text: len(encoding.encode(text, disallowed_special=()))
+    except Exception:
+        return lambda text: int(len(text) / 3.5) + 1
+
+
+_count_tokens = _token_counter()
+
+
+def estimate_request_tokens(messages: Sequence[Message], options: Optional[Mapping[str, Any]]) -> int:
+    """Approximate prompt tokens of a chat request: messages + system instructions + tool and response schemas."""
+    parts: List[str] = [m.text or "" for m in messages or []]
+    options = options or {}
+    parts.append(str(options.get("instructions") or ""))
+    for item in options.get("tools") or []:
+        spec = item.to_json_schema_spec() if hasattr(item, "to_json_schema_spec") else item
+        parts.append(json.dumps(spec, default=str))
+    response_format = options.get("response_format")
+    if response_format is not None:
+        schema = response_format.model_json_schema() if hasattr(response_format, "model_json_schema") else response_format
+        parts.append(json.dumps(schema, default=str))
+    return sum(_count_tokens(p) for p in parts) + 8 * len(parts)
 
 
 def load_environment():
@@ -34,6 +142,7 @@ class ProviderSpec:
         model: str,
         base_url: Optional[str] = None,
         is_primary: bool = False,
+        max_request_tokens: Optional[int] = None,
     ):
         self.provider_id = provider_id
         self.name = name
@@ -41,6 +150,9 @@ class ProviderSpec:
         self.model = model
         self.base_url = base_url
         self.is_primary = is_primary
+        self.max_request_tokens = max_request_tokens   # None = no per-request limit
+        self.stream = provider_id in STREAMING_PROVIDERS and _env_bool(
+            f"{PROVIDER_LIMIT_DEFAULTS.get(provider_id, ('X',))[0]}_STREAM", True)
         self.is_healthy = True
         self.last_failure_time: float = 0.0
         self.last_error: Optional[str] = None
@@ -61,8 +173,11 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
 
     Fallback Hierarchy:
     1. Primary: Azure OpenAI (or OpenAI)
-    2. Secondary: Groq (high-speed open-source reasoning model, e.g. openai/gpt-oss-120b)
+    2. Secondary: Groq, one provider per configured model (default openai/gpt-oss-20b, then openai/gpt-oss-120b).
+       Groq's free-tier quotas are per model, so a model that hit its daily limit falls through to the next one.
     3. Tertiary: MAQ AI Gateway / SLM (OpenAI-compatible internal gateway, e.g. qwen-3.8-27b)
+    Each provider has its own timeout / retry limits (PROVIDER_LIMIT_DEFAULTS); providers with a per-request token
+    limit (Groq) are skipped for requests that cannot fit.
     """
 
     COOLDOWN_SECONDS = 180  # After 3 minutes, give an unhealthy provider another chance
@@ -73,7 +188,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
             raise ValueError(
                 "No LLM providers are configured. Please set at least one of:\n"
                 "- AZURE_OPENAI_APIKEY & AZURE_OPENAI_ENDPOINT\n"
-                "- GROQ_API_KEY (with GROQ_MODEL, e.g. openai/gpt-oss-120b)\n"
+                "- GROQ_API_KEY (with GROQ_MODEL, e.g. openai/gpt-oss-20b,openai/gpt-oss-120b)\n"
                 "- MAQ_AI_API_KEY (with MAQ_AI_BASE_URL, e.g. https://llm.maqsoftware.net/v1)"
             )
 
@@ -145,35 +260,43 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
         async def _execute_with_fallback():
             candidate_indices = self._get_candidate_provider_indices()
             errors = []
+            request_tokens = None
 
             for idx in candidate_indices:
                 provider = self.providers[idx]
+                if provider.max_request_tokens:
+                    if request_tokens is None:
+                        request_tokens = estimate_request_tokens(messages, options)
+                    if request_tokens + MIN_COMPLETION_TOKENS > provider.max_request_tokens:
+                        reason = (f"request ~{request_tokens} tokens + {MIN_COMPLETION_TOKENS} for the answer exceeds its "
+                                  f"{provider.max_request_tokens}-token request limit")
+                        errors.append(f"[{provider.name}]: skipped ({reason})")
+                        logger.info(f"[LLM Fallback] Skipping '{provider.name}': {reason}.")
+                        continue
                 effective_options = dict(options) if options is not None else {}
                 effective_options["model"] = provider.model
 
-                # Protect TPM limits: Groq on-demand calculates TPM quota as (prompt_tokens + max_tokens).
-                # Limit 8000 TPM means prompt_tokens + max_tokens MUST be <= 8000.
-                if provider.provider_id == "groq":
-                    total_chars = sum(len(str(getattr(m, "contents", m))) for m in messages)
-                    est_prompt_tokens = (total_chars // 3) + 1200
-                    safe_max = max(500, 7800 - est_prompt_tokens)
-                    req_max = effective_options.get("max_tokens") or effective_options.get("max_completion_tokens") or 1500
+                # Protect TPM limits: Groq on-demand counts prompt_tokens + max_tokens against its per-request limit
+                # (8,000 on the free tier). Give the answer all the room that is left; other providers are not capped.
+                if provider.max_request_tokens:
+                    if request_tokens is None:
+                        request_tokens = estimate_request_tokens(messages, options)
+                    safe_max = max(MIN_COMPLETION_TOKENS, provider.max_request_tokens - request_tokens - 100)
+                    req_max = effective_options.get("max_tokens") or effective_options.get("max_completion_tokens") or safe_max
                     effective_options["max_tokens"] = min(req_max, safe_max)
-                else:
-                    if "max_tokens" not in effective_options and "max_completion_tokens" not in effective_options:
-                        effective_options["max_tokens"] = 3500
 
+                # Stream internally (keeps slow gateways alive) but still return one complete response
+                stream_internally = provider.stream and not stream
                 logger.info(
-                    f"[LLM Dispatch] Routing request to '{provider.name}' (Model: {provider.model}, MaxTokens: {effective_options.get('max_tokens')})..."
+                    f"[LLM Dispatch] Routing request to '{provider.name}' (Model: {provider.model}, "
+                    f"MaxTokens: {effective_options.get('max_tokens')}{', streamed' if stream_internally else ''})..."
                 )
-
-                # Timeout protection per provider to fail fast before Cloudflare's 120s timeout
-                provider_timeout = 75.0
+                started = time.time()
 
                 try:
                     res = provider.client.get_response(
                         messages=messages,
-                        stream=stream,
+                        stream=stream or stream_internally,
                         options=effective_options,
                         compaction_strategy=compaction_strategy,
                         tokenizer=tokenizer,
@@ -182,7 +305,10 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                         middleware=middleware,
                     )
                     if asyncio.iscoroutine(res):
-                        res = await asyncio.wait_for(res, timeout=provider_timeout)
+                        res = await res
+                    if stream_internally:
+                        res = await res.get_final_response()
+                    logger.info(f"[LLM Dispatch] '{provider.name}' answered in {time.time() - started:.1f}s")
 
                     provider.mark_success()
                     self.active_provider_index = idx
@@ -190,21 +316,18 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                     return res
 
                 except Exception as exc:
-                    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-                        err_summary = f"TimeoutError: Request exceeded {provider_timeout}s timeout"
-                    else:
-                        err_summary = f"{type(exc).__name__}: {str(exc)}"
+                    err_summary = _short_error(exc)
                     provider.mark_failed(exc)
-                    errors.append(f"[{provider.name}]: {err_summary}")
+                    errors.append(f"[{provider.name}] after {time.time() - started:.1f}s: {err_summary}")
                     logger.warning(
-                        f"[LLM Fallback] Provider '{provider.name}' failed ({err_summary}). "
-                        f"Attempting next provider in fallback chain..."
+                        f"[LLM Fallback] Provider '{provider.name}' failed after {time.time() - started:.1f}s "
+                        f"({err_summary}). Attempting next provider in fallback chain..."
                     )
+                    logger.debug(f"[LLM Fallback] Full error from '{provider.name}': {exc!r}")
 
             # If all candidate providers failed
-            all_errors_str = " | ".join(errors)
-            logger.error(f"[LLM Fallback] All LLM providers exhausted: {all_errors_str}")
-            raise RuntimeError(f"All LLM providers failed: {all_errors_str}")
+            logger.error("[LLM Fallback] All LLM providers exhausted:\n  " + "\n  ".join(errors))
+            raise AllProvidersFailedError(errors)
 
         if stream:
             # Non-streaming is standard across all agents in DevFoundry, but handle stream if requested
@@ -231,6 +354,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                 azure_endpoint=azure_endpoint,
                 api_version=azure_version,
             )
+            timeout, retries = apply_provider_limits(client, "azure_openai")
             providers.append(
                 ProviderSpec(
                     provider_id="azure_openai",
@@ -241,34 +365,40 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                     is_primary=True,
                 )
             )
-            logger.info(f"[LLM Config] Configured Primary Provider: Azure OpenAI ({azure_deployment})")
+            logger.info(f"[LLM Config] Configured Primary Provider: Azure OpenAI ({azure_deployment}; "
+                        f"timeout {timeout:g}s, retries {retries})")
         except Exception as e:
             logger.warning(f"[LLM Config] Failed to initialize Azure OpenAI client: {e}")
 
-    # 2. Secondary: Groq
+    # 2. Secondary: Groq (GROQ_MODEL may list several models, comma separated, tried in order)
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     groq_base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip()
-    groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b"
+    groq_models = [m.strip() for m in (os.getenv("GROQ_MODEL", "") or DEFAULT_GROQ_MODELS).split(",") if m.strip()]
+    groq_max_tokens = _env_int("GROQ_MAX_REQUEST_TOKENS", DEFAULT_GROQ_MAX_REQUEST_TOKENS) or None
 
     if groq_key:
-        try:
-            client = OpenAIChatCompletionClient(
-                model=groq_model,
-                api_key=groq_key,
-                base_url=groq_base_url,
-            )
-            providers.append(
-                ProviderSpec(
-                    provider_id="groq",
-                    name="Groq",
-                    client=client,
+        for groq_model in dict.fromkeys(groq_models):
+            try:
+                client = OpenAIChatCompletionClient(
                     model=groq_model,
+                    api_key=groq_key,
                     base_url=groq_base_url,
                 )
-            )
-            logger.info(f"[LLM Config] Configured Secondary Provider: Groq ({groq_model})")
-        except Exception as e:
-            logger.warning(f"[LLM Config] Failed to initialize Groq client: {e}")
+                timeout, retries = apply_provider_limits(client, "groq")
+                providers.append(
+                    ProviderSpec(
+                        provider_id="groq",
+                        name=f"Groq ({groq_model.split('/')[-1]})",
+                        client=client,
+                        model=groq_model,
+                        base_url=groq_base_url,
+                        max_request_tokens=groq_max_tokens,
+                    )
+                )
+                logger.info(f"[LLM Config] Configured Secondary Provider: Groq ({groq_model}; timeout {timeout:g}s, "
+                            f"retries {retries}, max {groq_max_tokens} tokens per request)")
+            except Exception as e:
+                logger.warning(f"[LLM Config] Failed to initialize Groq client ({groq_model}): {e}")
 
     # 3. Tertiary: MAQ AI Gateway / SLM
     maq_key = os.getenv("MAQ_AI_API_KEY", "").strip()
@@ -282,6 +412,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                 api_key=maq_key,
                 base_url=maq_base_url,
             )
+            timeout, retries = apply_provider_limits(client, "maq_ai")
             providers.append(
                 ProviderSpec(
                     provider_id="maq_ai",
@@ -291,7 +422,8 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                     base_url=maq_base_url,
                 )
             )
-            logger.info(f"[LLM Config] Configured Tertiary Provider: MAQ AI ({maq_model})")
+            logger.info(f"[LLM Config] Configured Tertiary Provider: MAQ AI ({maq_model}; timeout {timeout:g}s, "
+                        f"retries {retries}, streamed: {providers[-1].stream})")
         except Exception as e:
             logger.warning(f"[LLM Config] Failed to initialize MAQ AI client: {e}")
 

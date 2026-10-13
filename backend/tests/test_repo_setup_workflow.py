@@ -42,14 +42,15 @@ def ado(monkeypatch):
         return {"status": "success", "name": repository_name, "id": "repo-guid",
                 "url": f"https://dev.azure.com/org/{project_id_or_name}/_git/{repository_name}"}
 
-    def push(project_id_or_name, repository_name, files, commit_message=None, branch=None):
+    def push(project_id_or_name, repository_name, files, commit_message=None, branch=None, allow_empty=False):
         calls.append(("push_repository_files", project_id_or_name, repository_name, json.loads(json.dumps(files)),
                       commit_message))
         return {"status": "success", "commit_id": "c0ffee", "commit_message": commit_message or "chore: initial project scaffold",
                 "branch": "main", "files_count": len(files), "files": sorted(f["path"] for f in files),
                 "commit_url": "https://dev.azure.com/org/p/_git/r/commit/c0ffee"}
 
-    def push_changes(project_id_or_name, repository_name, base_files, files, commit_message=None, branch=None):
+    def push_changes(project_id_or_name, repository_name, base_files, files, commit_message=None, branch=None,
+                     allow_empty=False):
         base = {f["path"]: f["content"] for f in base_files}
         new = {f["path"]: f["content"] for f in files}
         if base == new:
@@ -275,20 +276,22 @@ def test_update_ado_project_uses_stored_id_and_marks_it_current(db, ado):
     assert store.outdated_items(store.get_workflow_state(CONV)) == []
 
 
-def test_agent_registers_the_six_workflow_tools():
+def test_agent_registers_the_workflow_tools():
     from agent_framework.openai import OpenAIChatCompletionClient
     client = OpenAIChatCompletionClient(model="test", api_key="k", azure_endpoint="https://example.openai.azure.com",
                                         api_version="2024-12-01-preview")
     agent = rsa.get_repo_setup_agent(client, CONV)
     assert [t.name for t in agent.default_options["tools"]] == [
         "create_ado_project", "update_ado_project", "create_ado_repository", "save_repository_structure",
-        "update_repository_structure", "push_repository_structure"]
+        "scaffold_repository_structure", "update_repository_structure", "push_repository_structure"]
     instructions = agent.default_options["instructions"]
     for op in ["GENERATE_PROJECT_PROPOSAL", "UPDATE_PROJECT_PROPOSAL", "CREATE_PROJECT", "GENERATE_REPOSITORY_PROPOSAL",
                "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY", "GENERATE_REPOSITORY_STRUCTURE",
                "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE", "UPDATE_ADO_PROJECT"]:
         assert op in instructions
-    assert "template" not in instructions.lower()
+    # The structure comes from generator commands, never from files the model writes or from repo templates
+    assert "SCAFFOLD COMMAND RULES" in instructions and "NEVER write starter" in instructions
+    assert "templates/" not in instructions.lower()
     push_schema = {t.name: t for t in agent.default_options["tools"]}["push_repository_structure"].parameters()
     assert "files" not in push_schema["properties"]                       # the model cannot choose what is pushed
 

@@ -3231,3 +3231,36 @@ code {
   animation: spin 0.8s linear infinite;
 }
 
+/* Typewriter Title Animation */
+.typewriter-container {
+  display: inline-flex;
+  align-items: baseline;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.typewriter-text {
+  display: inline;
+}
+
+.typewriter-caret {
+  display: inline-block;
+  width: 2px;
+  height: 0.85em;
+  background-color: var(--ms-primary, #0078d4);
+  margin-left: 2px;
+  vertical-align: -0.05em;
+  border-radius: 1px;
+  animation: typewriter-blink 0.75s ease-in-out infinite;
+}
+
+@keyframes typewriter-blink {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}

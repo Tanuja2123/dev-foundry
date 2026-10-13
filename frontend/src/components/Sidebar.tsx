@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { ConfirmModal } from './ConfirmModal'
 import type { Project } from '../types'
+import { TypewriterText } from './TypewriterText'
 
 export type SidebarState = 'expanded' | 'collapsed' | 'hidden'
 
@@ -259,7 +260,9 @@ export function Sidebar({
                 </span>
                 {isExpanded && (
                   <div className="project-item-content">
-                    <span className="project-item-name">{project.name}</span>
+                    <span className="project-item-name">
+                      <TypewriterText text={project.name} animateOnChange={isActive} animateOnMount={isActive} speed={28} />
+                    </span>
                     {stageConfig && (
                       <span className={`sidebar-stage-badge ${stageConfig.className}`}>
                         <span className="sidebar-stage-dot" />

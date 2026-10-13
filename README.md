@@ -9,6 +9,11 @@ Requirement-to-delivery agent. The frontend is a React (Vite + TypeScript) app w
 | Python | 3.12+ |
 | Node.js | 18+ |
 | npm | 9+ |
+| uv | 0.5+ (scaffold commands for Python stacks) |
+
+The backend server runs the repository generators itself (see "Repository structure from generator commands"), so the
+CLIs for the stacks you want to generate must be installed **on the backend host**: Node.js/npm (`npx`) for JavaScript and
+TypeScript stacks, `uv` for Python stacks, and optionally the .NET SDK, Go or Cargo.
 
 # Environment Setup
 
@@ -43,11 +48,19 @@ Then fill in `.env`:
 | `GUARDRAILS_MODEL` | Guardrails SLM model name (default: `qwen-3.8-27b`) | Optional |
 | `GUARDRAILS_ALLOWED_DOMAINS` | Comma-separated domain allowlist for URL filter | Optional |
 | `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
+| `GROQ_API_KEY` / `GROQ_MODEL` | Fallback provider. `GROQ_MODEL` may list several models, tried in order (default `openai/gpt-oss-20b,openai/gpt-oss-120b`; each has its own free-tier quota) | Optional |
+| `MAQ_AI_API_KEY` / `MAQ_AI_BASE_URL` / `MAQ_AI_MODEL` | Last fallback (internal SLM gateway). Requests are streamed so slow answers are not cut off by the gateway's 120 s limit | Optional |
+| `<PROVIDER>_TIMEOUT_SECONDS` / `<PROVIDER>_MAX_RETRIES` | Per-provider limits, `<PROVIDER>` = `AZURE_OPENAI` (120 s, 1 retry), `GROQ` (60 s, 2), `MAQ_AI` (900 s, 0). `GROQ_MAX_REQUEST_TOKENS` (8000): larger requests skip Groq | Optional |
 | `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project/code read & write scopes | Yes (for ADO project & repo creation) |
 
 > **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  
 > **If Azure OpenAI encounters any errors or credentials fail**, the chat service automatically falls back to Local SLM (`LOCAL_SLM_API_KEY`).  
 > **Multi-Agent Guardrails Layer:** User inputs and agent outputs are validated via `openai-guardrails` against the local SLM with a fail-closed policy. PII is automatically redacted and external URLs are restricted to allowed domains.
+
+**LLM fallback:** Azure OpenAI → Groq models (in `GROQ_MODEL` order) → MAQ AI. A provider that fails is skipped for 3 minutes.
+Users only ever see a short "AI service busy or unavailable" message with a reference id; the backend log shows, under
+the same reference, why each provider failed (e.g. `HTTP 403: … firewall`, `HTTP 429: rate limit …`, `skipped (request
+~9500 tokens … exceeds its 8000-token request limit)`).
 
 Register `http://localhost:5173/auth-callback` as a **Single-page application** redirect URI on the Entra app registration.
 
@@ -110,6 +123,7 @@ Database migrations, run in this order in the Supabase SQL editor:
 2. `backend/db/migrations/002_document_versions.sql`
 3. `backend/db/migrations/003_users_and_ownership.sql`: the `AppUser` table, the Conversation → Project link and the database hardening. **Switch the backend to the service-role key first.**
 4. `backend/db/migrations/004_assign_existing_conversations.sql`: assigns the old `default_user` conversations to one account and makes the owner mandatory. Set your email in the file and run it **after signing in once**.
+5. `backend/db/migrations/005_scaffold_commands.sql`: stores the generator commands and their exact output (`Repository.scaffold_commands`, `Repository.scaffold_structure`). Without it, the generated files and the requested changes are pushed as one commit.
 
 # Azure DevOps Repository Setup
 
@@ -118,11 +132,36 @@ After the PRD and TRD are approved, the Repo Setup Agent works through these ste
 1. **Project proposal:** the agent proposes an ADO project name and description from the PRD and TRD. The user can change them as often as needed.
 2. **Create project:** the agent creates the ADO project, waits until ADO has finished provisioning it, and saves the real project id. It then suggests a repository name.
 3. **Repository name:** the user can change the suggested name. The TRD isn't re-opened at this point.
-4. **Create repository:** the agent creates an empty repository. It then designs a folder structure from the TRD, for any tech stack, and shows it.
-5. **Structure review:** the user can request changes. Each change set produces a new structure version.
-6. **Push:** the agent pushes the approved structure to `main` as one commit.
+4. **Create repository:** the agent creates an empty repository, then generates its structure by **running the stack's official generator commands** (see below) and shows the commands and the resulting tree.
+5. **Structure review:** the user can
+   - approve it,
+   - ask for specific extra files or folders (they are layered on top of the generated files and marked "(added)"), or
+   - reject the approach / ask for another stack, framework or template: the TRD is updated and the structure is generated again with new commands. Requested files that still fit are re-added.
+6. **Push:** the first push commits the generator output exactly as produced (commit 1, its message lists the commands), then the requested changes (commit 2, only if there are any). Later changes are pushed as one follow-up commit with only the differences.
 
-The structure shown in chat and the files pushed are guaranteed to be the same. Both come from the `Repository.structure` row in Supabase: the tree is drawn by code, and the push tool reads that row instead of taking files from the model.
+The structure shown in chat and the files pushed are guaranteed to be the same. Both come from the `Repository` row in Supabase: the tree is drawn by code, and the push tool reads that row instead of taking files from the model.
+
+## Repository structure from generator commands
+
+The Repo Setup Agent reads the TRD and the CLIs installed on the server, and chooses commands such as:
+
+| Stack | Commands |
+| --- | --- |
+| Python CLI | `uv init --package --vcs none --name <repo> .` then `uv add --no-sync typer` |
+| React + FastAPI | `npx --yes create-vite@latest frontend --template react-ts`, `uv init --app --vcs none --name backend backend`, `uv add --no-sync fastapi[standard]` (in `backend/`) |
+| Next.js / Angular / NestJS / .NET | `create-next-app`, `@angular/cli new`, `@nestjs/cli new`, `dotnet new ...` |
+
+`backend/app/services/scaffold_service.py` runs them in an empty temporary folder (the repository root) and reads back
+every file byte for byte: empty files stay empty, images are kept as binary (pushed base64-encoded), and installer
+folders (`node_modules`, `.venv`, `.git`, `obj`...) are skipped. No file content is written by DevFoundry itself; a single
+application is generated at the repository root, several parts get one folder each.
+
+Safety: no shell is used; only allow-listed executables and subcommands (`npx`, `npm create/init/install/pkg`, `pnpm`, `yarn`,
+`uv init/add/remove/lock`, `uvx`, `dotnet new/sln/add`, `go mod/get`, `cargo new/init/add`, `poetry new/init/add`) and
+allow-listed generator packages run; arguments cannot contain shell operators, URLs, absolute paths or `..`; `npm install`
+never runs dependency scripts; the commands get a minimal environment **without** the PAT, Supabase or OpenAI keys, and a
+timeout. Generators still download and run their npm/PyPI package on the backend host, so in a deployment run the backend
+in a container or sandbox.
 
 **Routing:** the Orchestrator returns a structured routing decision through Agent Framework's `response_format`. Code checks the decision against the operations allowed in the current stage (`backend/app/services/workflow_routing.py`).
 - **No skipped steps:** approving the PRD or TRD only confirms it. Moving on to the TRD or to repository setup needs an explicit request.
@@ -152,6 +191,8 @@ The structure shown in chat and the files pushed are guaranteed to be the same. 
 | `AZURE_DEVOPS_PAT` | yes | Personal access token with the scopes listed below |
 | `ADO_SCAFFOLD_COMMIT_MESSAGE` | no | Default commit message. The default is `chore: initial project scaffold`. |
 | `ADO_SCAFFOLD_DEFAULT_BRANCH` | no | Branch to create in the empty repository. The default is `main`. |
+| `SCAFFOLD_COMMAND_TIMEOUT_SECONDS` | no | Time limit per generator command. The default is `240`. |
+| `SCAFFOLD_ALLOWED_PACKAGES` | no | Extra generator packages `npx` / `uvx` / `npm create` may run (comma separated), e.g. `create-my-template` |
 
 The PAT needs **Project and Team (Read, write & manage)** to create projects and **Code (Read & write)** to create repositories and push.
 
@@ -161,15 +202,16 @@ From `backend`, with the venv activated:
 
 ```powershell
 # Unit tests (mocked ADO and Supabase, no network)
-pytest tests/test_ado_git_push.py tests/test_repo_structure.py tests/test_ado_tools.py tests/test_repo_setup_workflow.py
+pytest tests/test_ado_git_push.py tests/test_repo_structure.py tests/test_ado_tools.py tests/test_repo_setup_workflow.py tests/test_scaffold_service.py
 
 # Live Azure DevOps tests. They create and delete repos inside a THROWAWAY project, plus one temporary project.
 $env:ADO_INTEGRATION_TESTS="1"; $env:ADO_IT_PROJECT="DevFoundry-Scaffold-IT"; pytest -m integration -s
 # Add the Supabase round-trip test (needs the migration):
 $env:SUPABASE_INTEGRATION_TESTS="1"
 
-# Full flow end to end (real Azure OpenAI, Supabase and Azure DevOps). This creates and deletes a "DevFoundry-E2E-<id>" project.
-$env:ADO_E2E_TESTS="1"; pytest -m e2e -s
+# Full flow end to end (real Azure OpenAI, generator commands and Azure DevOps; in-memory database): a CLI app and a
+# React + FastAPI app, from the description to the pushed commits. Each creates and deletes a "DevFoundry-E2E-<id>" project.
+$env:ADO_E2E_TESTS="1"; pytest tests/test_repo_setup_agent_e2e.py -m e2e -s
 ```
 
 # Guardrails Layer

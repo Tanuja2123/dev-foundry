@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Optional
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
-from openai import OpenAI
 from agent_framework import Agent, Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from supabase import create_client, Client
@@ -15,13 +14,16 @@ from supabase import create_client, Client
 from app.schemas.conversation import ChatResponse, ConversationItem
 from app.services.agents.requirements_agent import process_uploaded_document, get_requirements_agent
 from app.services.agents.repo_setup_agent import get_repo_setup_agent
+from app.services.mcp.ado_mcp_server import sanitize_ado_project_name
 from app.services import project_store as store
-from app.services.repo_structure import render_structure_tree
+from app.services.repo_structure import layer_changes, render_structure_tree
+from app.services.scaffold_service import describe_toolchains
 from app.services.workflow_routing import (RoutingDecision, blocked_reply, effective_stage, next_steps,
                                            parse_routing_decision, routing_context, validate_decision,
                                            apply_intent_rules)
 from app.core.logger import logger
 
+from app.services.llm_client import AllProvidersFailedError, create_fallback_client
 from app.services.llm_client import create_fallback_client
 from app.services.guardrails_layer import (
     check_input_guardrail,
@@ -273,7 +275,14 @@ def get_local_slm_client() -> OpenAIChatCompletionClient:
 # Workflow state persistence (Project / Repository tables)
 
 STRUCTURE_PLACEHOLDER = "[[REPOSITORY_STRUCTURE]]"
+
+# Shown to the user instead of technical errors (the details are logged with the same reference)
+SERVICE_UNAVAILABLE_MESSAGE = ("⚠️ The AI service is busy or unavailable right now, so I couldn't process your message. "
+                               "Nothing was changed - please try again in a minute. (Reference: {reference})")
+UNEXPECTED_ERROR_MESSAGE = ("⚠️ Something went wrong while processing your message. Nothing was changed - please try "
+                            "again. (Reference: {reference})")
 STRUCTURE_STAGES = ("REPOSITORY_CREATED", "STRUCTURE_REVIEW", "STRUCTURE_PUSHED")
+SCAFFOLD_OPERATIONS = ("CREATE_REPOSITORY", "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE")
 
 def parse_agent_json(text: str) -> Optional[Dict]:
     """Extracts the JSON object a child agent returned (tolerates ```json fences)."""
@@ -287,6 +296,22 @@ def parse_agent_json(text: str) -> Optional[Dict]:
         return data if isinstance(data, dict) else None
     except json.JSONDecodeError:
         return None
+
+def agent_json_error(text: str) -> Optional[str]:
+    """Why a child agent's output is not a usable JSON object (None when it is)."""
+    if not text or not text.strip():
+        return "empty output"
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return "no JSON object found"
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        return f"{e.msg} at character {e.pos}"
+    if not isinstance(data, dict) or not data.get("status"):
+        return "JSON object without a 'status' field"
+    return None
+
 
 def missing_readiness_items(raw_output: str) -> List[str]:
     """R1-R5 items the Requirements_Agent itself marked "missing" in a PRD it nevertheless returned as COMPLETE."""
@@ -339,15 +364,20 @@ def persist_repo_setup_output(conversation_id: Optional[str], raw_output: str) -
     stage = data.get("workflow_stage")
     try:
         proposal = data.get("project_proposal") or {}
+        if stage == "PROJECT_REVIEW" and store.is_placeholder_name(proposal.get("project_name")):
+            if proposal.get("project_name"):
+                logger.warning(f"[ProjectStore] Ignored placeholder project name {proposal.get('project_name')!r}")
+            proposal = {}
         if stage == "PROJECT_REVIEW" and proposal.get("project_name"):
             project = store.ensure_project(conversation_id)
             if not project.get("ado_project_id"):
                 versions = {"proposal_trd_version": project.get("trd_version") or 0} if "trd_version" in project else {}
-                store.update_project(project["project_id"], project_name=proposal["project_name"].strip(),
+                cleaned_name = sanitize_ado_project_name(proposal["project_name"])
+                store.update_project(project["project_id"], project_name=cleaned_name,
                                      project_description=(proposal.get("project_description") or "").strip(),
                                      workflow_stage=store.STAGE_PROJECT_REVIEW, **versions)
         repo_proposal = data.get("repository_proposal") or {}
-        if stage in ("PROJECT_CREATED", "REPOSITORY_REVIEW") and (repo_proposal.get("repo_name") or "").strip():
+        if stage in ("PROJECT_CREATED", "REPOSITORY_REVIEW") and not store.is_placeholder_name(repo_proposal.get("repo_name")):
             project = store.get_project(conversation_id)
             if project and project.get("ado_project_id"):
                 store.propose_repository_name(project["project_id"], repo_proposal["repo_name"].strip())
@@ -368,16 +398,49 @@ def follow_up_note(conversation_id: Optional[str]) -> str:
             "\nEnd your answer with a short '**Suggested next steps**' list offering to update them (in that order), "
             "instead of moving the workflow forward.")
 
+def _format_commands(commands: List[Dict]) -> str:
+    lines = []
+    for item in commands or []:
+        cwd = (item.get("cwd") or ".").strip()
+        lines.append(item.get("command", "") + (f"    # in {cwd}/" if cwd not in ("", ".") else ""))
+    return "```bash\n" + "\n".join(lines) + "\n```"
+
+
 def render_structure_for_display(state: Dict) -> Optional[str]:
-    """Renders the stored structure (the exact files that are / will be pushed) as Markdown."""
+    """
+    Renders the stored structure (the exact files that are / will be pushed) as Markdown: the generator commands that
+    produced it, the tree (files added or edited on request are marked), and how it will be committed.
+    """
     repository = (state or {}).get("repository") or {}
     files = repository.get("structure") or []
     if not files:
         return None
-    pushed = repository.get("status") == store.REPO_PUSHED
+    pushed = repository.get("status") == store.REPO_PUSHED and repository.get("pushed_structure") in (None, files)
     title = "Pushed repository structure" if pushed else "Proposed repository structure"
-    header = f"**{title}** (version {repository.get('structure_version')}, {len(files)} files)"
-    return header + "\n\n" + render_structure_tree(files, root_name=repository.get("repo_name"))
+    parts = [f"**{title}** (version {repository.get('structure_version')}, {len(files)} files)"]
+
+    scaffold = repository.get("scaffold_structure")
+    commands = repository.get("scaffold_commands") or []
+    notes: Dict[str, str] = {}
+    changes = {"add": [], "edit": [], "delete": []}
+    if scaffold:
+        changes = layer_changes(scaffold, files)
+        notes.update({path: "added" for path in changes["add"]})
+        notes.update({path: "edited" for path in changes["edit"]})
+    if commands:
+        parts.append("Generated by running these commands (the files below are their exact output"
+                     + (", plus the changes you asked for" if notes or changes["delete"] else "") + "):")
+        parts.append(_format_commands(commands))
+    parts.append(render_structure_tree(files, root_name=repository.get("repo_name"), notes=notes))
+    if changes["delete"]:
+        parts.append("Removed from the generated files: " + ", ".join(f"`{p}`" for p in changes["delete"]))
+
+    if not pushed and repository.get("pushed_structure") is None and scaffold and any(changes.values()):
+        counts = ", ".join(f"{len(changes[k])} {label}" for k, label in
+                           (("add", "added"), ("edit", "edited"), ("delete", "removed")) if changes[k])
+        parts.append(f"On approval this is pushed to `main` in two commits: the generator output ({len(scaffold)} files), "
+                     f"then your requested changes ({counts}).")
+    return "\n\n".join(parts)
 
 def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
     """Replaces the synthesizer's placeholder with the code-rendered tree (appends it if the placeholder is missing)."""
@@ -397,7 +460,8 @@ def compact_history_message(role: str, text: str, max_chars: int = 350) -> Optio
         return None
 
     # Filter out infrastructure error logs from LLM context
-    if "Error communicating with Agent Framework:" in text or "All LLM providers failed:" in text:
+    if ("Error communicating with Agent Framework:" in text or "All LLM providers failed:" in text
+            or "(Reference: " in text):
         return None
 
     if len(text) <= max_chars:
@@ -436,12 +500,16 @@ AVAILABLE CHILD AGENTS AND OPERATIONS:
    - GENERATE_TRD: create the Technical Requirements Document from the PRD.
    - UPDATE_TRD: change, add, remove or confirm technologies in an existing TRD.
 2. Repo_Setup_Agent
-   - GENERATE_PROJECT_PROPOSAL / UPDATE_PROJECT_PROPOSAL: propose / change the Azure DevOps project name and description (before it exists).
+   - GENERATE_PROJECT_PROPOSAL / UPDATE_PROJECT_PROPOSAL: propose / change the Azure DevOps project name and description (before it exists). Azure DevOps project names must use ONLY letters, numbers, spaces, and hyphens (max 64 chars); never use '&' or special characters, always write 'and'.
    - CREATE_PROJECT: create the Azure DevOps project (explicit approval only); it also suggests a repository name.
    - UPDATE_ADO_PROJECT: rename / change the description of the already created Azure DevOps project.
    - GENERATE_REPOSITORY_PROPOSAL / UPDATE_REPOSITORY_PROPOSAL: propose / rename the repository.
-   - CREATE_REPOSITORY: create the empty repository (explicit approval only); it also proposes the folder structure.
-   - GENERATE_REPOSITORY_STRUCTURE / UPDATE_REPOSITORY_STRUCTURE: propose a new structure / change the shown structure.
+   - CREATE_REPOSITORY: create the empty repository (explicit approval only); it then generates the folder structure by
+     running the stack's official generator commands (e.g. create-vite, uv init) and shows it.
+   - GENERATE_REPOSITORY_STRUCTURE: generate the structure again with different generator commands (the user does not accept
+     the generated approach, or wants another generator / template).
+   - UPDATE_REPOSITORY_STRUCTURE: add / change / remove the files the user explicitly asks for on top of the generated
+     structure, or bring the structure in line with the latest TRD (STRUCTURE_OUTDATED).
    - PUSH_REPOSITORY_STRUCTURE: push the approved structure to the main branch (explicit approval only); if it was pushed
      before, only the changes are pushed as a follow-up commit.
 
@@ -478,7 +546,9 @@ ROUTING RULES:
    - PROJECT_REVIEW: name/description changes -> UPDATE_PROJECT_PROPOSAL; explicit approval to create -> CREATE_PROJECT.
    - REPOSITORY_REVIEW: different repository name -> UPDATE_REPOSITORY_PROPOSAL; explicit approval to create -> CREATE_REPOSITORY;
      no repository name proposed yet -> GENERATE_REPOSITORY_PROPOSAL.
-   - STRUCTURE_REVIEW: changes to folders/files -> UPDATE_REPOSITORY_STRUCTURE; a completely new structure -> GENERATE_REPOSITORY_STRUCTURE;
+   - STRUCTURE_REVIEW: changes to folders/files -> UPDATE_REPOSITORY_STRUCTURE; rejecting the generated approach without
+     naming a technology ("start over", "use another generator") -> GENERATE_REPOSITORY_STRUCTURE; a different language,
+     framework or library is a technology change -> UPDATE_TRD (rule 2), after which the structure is offered for update;
      explicit approval to push (optionally with a commit message) -> PUSH_REPOSITORY_STRUCTURE.
 6. COMPLETE: the structure was pushed. Further structure changes -> UPDATE_REPOSITORY_STRUCTURE (pushed later as a follow-up
    commit after explicit approval); project rename/description -> UPDATE_ADO_PROJECT; otherwise respond directly.
@@ -496,7 +566,9 @@ DECISION FIELDS:
 - action: "delegate" or "respond".
 - agent + operation: required when delegating (operation must be in allowed_operations).
 - reply: required when responding. Friendly, concise Markdown that ends with the clear next step the user can take.
-- title: only for the very first user message of a new conversation (there are no previous messages): a 3-5 word project title. Otherwise null.
+- title: ONLY for the very first user message of a new conversation (there are no previous messages): your best guess of
+  the project's name in 2-5 words, based on what the user described (e.g. "Clinic Appointment Booking"). Never a
+  placeholder. Otherwise null (later the conversation title follows the project name automatically).
 """
 
         orchestrator = Agent(
@@ -506,7 +578,6 @@ DECISION FIELDS:
         )
 
         requirements_agent = get_requirements_agent(client)
-        repo_setup_agent = get_repo_setup_agent(client, conversation_id)
 
         # Stored workflow state (Project / Repository tables) for routing and child agents. Never persisted in chat history.
         workflow_state = store.get_workflow_state(conversation_id) if conversation_id else None
@@ -533,7 +604,7 @@ DECISION FIELDS:
         orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
         orchestrator_response = await orchestrator.run(
             messages=orchestrator_messages,
-            options={"response_format": RoutingDecision, "max_tokens": 800}
+            options={"response_format": RoutingDecision}
         )
         orch_duration = round((time.time() - orch_start) * 1000, 1)
         decision = parse_routing_decision(orchestrator_response)
@@ -541,8 +612,9 @@ DECISION FIELDS:
                     f"{decision.agent or ''} {decision.operation or ''} | intent={decision.user_intent}, "
                     f"tech={decision.mentions_technology} | {decision.reasoning}")
 
+        # The model's title guess is only used for a new conversation; afterwards the project name decides the title
         title_prefix = ""
-        if decision.title and decision.title.strip() and not history:
+        if not history and decision.title and not store.is_placeholder_name(decision.title):
             title_prefix = f"TITLE: {decision.title.strip()}\n\n"
 
         # 2. Workflow guard: the operation must be allowed in the current stage
@@ -632,6 +704,24 @@ DECISION FIELDS:
                 child_response = await requirements_agent.run(messages=retry_messages)
                 child_raw_json = child_response.messages[-1].text if child_response.messages else child_raw_json
 
+            # JSON guard: unreadable output would be shown to the user but never saved (seen with fallback models).
+            # Ask once for the same answer as valid JSON (safe: the Requirements Agent has no tools).
+            json_error = agent_json_error(child_raw_json)
+            if json_error:
+                logger.warning(f"[JSON Guard] Requirements_Agent output is not valid JSON ({json_error}); asking again")
+                repair_messages = req_messages + [
+                    Message(role="assistant", contents=[child_raw_json]),
+                    Message(role="user", contents=[
+                        f"[JSON guard] Your previous answer is not valid JSON ({json_error}). Return the same answer again "
+                        "as ONE valid JSON object only, exactly following the output contract. No text outside the JSON."]),
+                ]
+                child_response = await requirements_agent.run(messages=repair_messages)
+                repaired = child_response.messages[-1].text if child_response.messages else ""
+                if not agent_json_error(repaired):
+                    child_raw_json = repaired
+                else:
+                    logger.error("[JSON Guard] Requirements_Agent output still not valid JSON; nothing was saved")
+
             persist_requirements_output(conversation_id, child_raw_json)
             follow_ups = follow_up_note(conversation_id)
 
@@ -694,9 +784,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 client=client,
             )
             synthesis_result = await synthesizer_agent.run(
-                messages=[Message(role="user", contents=["Please present this update to the user."])],
-                options={"max_tokens": 1000}
-            )
+                messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
@@ -708,8 +796,11 @@ Put a blank line before and after every heading, divider (---) and list; never p
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
             if workflow_state is not None:
                 workflow_context_note += "\n\n" + store.describe_workflow_state(
-                    workflow_state, include_prd=False, include_trd=True, include_structure=True
+                    workflow_state, include_prd=operation in SCAFFOLD_OPERATIONS, include_trd=True,
+                    include_structure=True
                 )
+            if operation in SCAFFOLD_OPERATIONS:
+                workflow_context_note += "\n" + describe_toolchains()
 
             # Prepare message list for Repo_Setup_Agent with clear workflow context (sliding window of up to 4 recent messages)
             recent_repo_history = message_list[-5:-1] if len(message_list) > 1 else []
@@ -719,7 +810,9 @@ Put a blank line before and after every heading, divider (---) and list; never p
             # Invoke Repo Setup Child Agent
             logger.info(f"[Repo_Setup_Agent] Processing request with operation: {operation}...")
             child_start = time.time()
-            child_response = await repo_setup_agent.run(messages=repo_messages, options={"max_tokens": 1200})
+            # Built per operation: only the tools this operation allows (none for proposals)
+            repo_setup_agent = get_repo_setup_agent(client, conversation_id, operation)
+            child_response = await repo_setup_agent.run(messages=repo_messages)
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
@@ -769,25 +862,29 @@ CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW":
 
 CASE 5: If status is "COMPLETE" and workflow_stage is "REPOSITORY_CREATED":
 - Announce that the (empty) Azure DevOps Git repository has been created successfully, with **Repository Name**, **Repository ID** and **Repository URL** ([link](url)).
-- Briefly explain the proposed folder structure (structure.summary), then output the placeholder line (see STRUCTURE RULE).
-- Invite the user to review it: they can request changes to folders/files, or approve it to push it to the main branch as a single initial commit.
+- Explain in one or two sentences that the starter structure was generated by running the stack's official generator commands
+  (structure.summary), then output the placeholder line (see STRUCTURE RULE). The system shows the exact commands and files.
+- Invite the user to review it: they can approve it to push it to the main branch, ask for specific extra files/folders (pushed
+  as a second commit after the generator output), or ask for a different stack / generator (the structure is regenerated).
 
 CASE 6: If status is "COMPLETE" and workflow_stage is "STRUCTURE_REVIEW":
 - Briefly state what changed (structure.summary), then output the placeholder line (see STRUCTURE RULE).
-- Invite the user to request further changes or approve pushing it to the main branch as a single initial commit.
+- Invite the user to request further changes or approve pushing it to the main branch.
 
 CASE 7: If status is "COMPLETE" and workflow_stage is "STRUCTURE_PUSHED":
-- Announce that the approved structure was pushed as a single commit (say whether it is the initial commit or a follow-up
-  commit; for a follow-up commit list the added, edited and deleted files from push.changes).
-- Show **Repository**, **Commit ID**, **Commit Message**, **Branch**, **Files** (files_count) and a link to the commit (commit_url).
+- Announce that the approved structure was pushed to the branch, as push.commits describes: one line per commit with its
+  kind, **Commit ID** (short), **Commit Message** (first line only), file count and a [link](commit_url). For a commit with
+  changes, list the added, edited and deleted files.
+- Show **Repository**, **Branch** and **Files** (files_count).
 - Output the placeholder line (see STRUCTURE RULE), then state that repository setup is complete and the project is ready for development.
 
 CASE 8: If status is "COMPLETE" and workflow_stage is "ADO_PROJECT_UPDATED":
 - Announce that the Azure DevOps project was updated, with **Project Name**, **Project Description** and **Project URL** ([link](url)).
 
-STRUCTURE RULE (CASES 5, 6, 7):
-- Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs. The system replaces it with the exact stored structure.
-- NEVER draw the folder tree or list the files yourself.
+STRUCTURE RULE (CASES 1, 5, 6, 7):
+- Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs. The system replaces it with
+  the exact stored structure and the commands that generated it (also in CASE 1 when a structure exists).
+- NEVER draw the folder tree, list the files or repeat the generator commands yourself.
 
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
 Put a blank line before and after every heading, divider (---) and list; never put "---" at the end of a text line.
@@ -800,9 +897,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 client=client,
             )
             synthesis_result = await synthesizer_agent.run(
-                messages=[Message(role="user", contents=["Please present this update to the user."])],
-                options={"max_tokens": 1000}
-            )
+                messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
             response_text = insert_structure_tree(response_text, structure_tree)
@@ -820,106 +915,17 @@ Put a blank line before and after every heading, divider (---) and list; never p
             return ("⚠️ This message (or an attached document) was blocked by the AI content-safety filter, usually because it "
                     "contains text that looks like instructions to the AI (a possible prompt injection). Please remove that text "
                     "and try again. Nothing was changed.")
-        logger.error(f"[Agent Pipeline] Error: {str(e)}")
-        raise
-
-async def generate_direct_slm_chat_response(
-    user_query: str,
-    history: List[Dict],
-    conversation_id: Optional[str] = None,
-) -> str:
-    """Fallback chat completion using direct OpenAI client pointing to Local SLM."""
-    config = get_local_slm_config()
-    api_key = config["api_key"]
-    base_url = config["base_url"]
-    model = config["model"]
-
-    if not api_key:
-        raise ValueError("MAQ AI / Local SLM API key is not configured (MAQ_AI_API_KEY).")
-
-    logger.info(f"[Local SLM Direct] Generating chat response with model '{model}' at '{base_url}'...")
-
-    client = OpenAI(
-        base_url=base_url,
-        api_key=api_key,
-    )
-
-    system_prompt = (
-        "You are DevFoundry, an AI-powered software development orchestration assistant.\n"
-        "You assist users with planning software requirements (PRD), technical requirements (TRD), "
-        "and repository planning. Be concise, friendly, structured, and helpful."
-    )
-    workflow_state = store.get_workflow_state(conversation_id) if conversation_id else None
-    if workflow_state:
-        state_desc = store.describe_workflow_state(workflow_state, include_requirements=True)
-        if state_desc:
-            system_prompt += f"\n\n[Current Project & Requirements State]:\n{state_desc}"
-
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in history:
-        role = msg.get("role", "user")
-        text = msg.get("text", "")
-        if role in ("user", "assistant", "system") and text:
-            messages.append({"role": role, "content": text})
-
-    messages.append({"role": "user", "content": user_query})
-
-    def _sync_create():
-        return client.chat.completions.create(
-            model=model,
-            messages=messages,
-        )
-
-    resp = await asyncio.to_thread(_sync_create)
-    return resp.choices[0].message.content or ""
+        reference = uuid.uuid4().hex[:8]
+        if isinstance(e, AllProvidersFailedError):
+            logger.error(f"[Agent Pipeline] [ref {reference}] No AI model could answer:\n  " + "\n  ".join(e.errors))
+            return SERVICE_UNAVAILABLE_MESSAGE.format(reference=reference)
+        logger.exception(f"[Agent Pipeline] [ref {reference}] Unexpected error: {type(e).__name__}: {e}")
+        return UNEXPECTED_ERROR_MESSAGE.format(reference=reference)
 
 async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
-    """
-    Attempts to generate a response via Azure OpenAI and Microsoft Agent Framework (primary).
-    If Azure OpenAI encounters any errors (missing credentials, auth error, firewall/network, quota, etc.),
-    automatically falls back to the Local SLM configuration.
-    """
-    azure_error: Optional[Exception] = None
-
-    # 1. Primary: Azure OpenAI via Agent Framework
-    try:
-        azure_client = get_azure_openai_client()
-        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4")
-        return await _execute_agent_pipeline(azure_client, deployment, user_query, history, conversation_id)
-    except Exception as e:
-        azure_error = e
-        logger.warning(f"[Azure OpenAI] Primary execution failed ({str(e)}). Switching to Local SLM fallback...")
-
-    # 2. Local SLM configuration verification
-    local_config = get_local_slm_config()
-    if not local_config["api_key"]:
-        err_msg = (
-            f"Azure OpenAI error: {str(azure_error)}. "
-            "Local SLM fallback is not configured. Please set MAQ_AI_API_KEY in your .env file."
-        )
-        logger.error(f"[Fallback Failed] {err_msg}")
-        return err_msg
-
-    # 3. Attempt Agent Framework with Local SLM
-    try:
-        local_client = get_local_slm_client()
-        logger.info(f"[Local SLM] Attempting Agent Framework with model '{local_config['model']}'...")
-        return await _execute_agent_pipeline(local_client, local_config["model"], user_query, history, conversation_id)
-    except Exception as local_af_error:
-        logger.warning(
-            f"[Local SLM] Agent Framework execution with Local SLM failed ({str(local_af_error)}). "
-            "Falling back to direct OpenAI chat completion..."
-        )
-
-    # 4. Fallback to direct Local SLM chat completion
-    try:
-        return await generate_direct_slm_chat_response(user_query, history, conversation_id)
-    except Exception as direct_error:
-        err_msg = (
-            f"Azure OpenAI failed ({str(azure_error)}) and Local SLM fallback failed ({str(direct_error)})."
-        )
-        logger.error(f"[Fallback Failed] {err_msg}")
-        return err_msg
+    """Runs the agent pipeline on the tiered fallback client (Azure OpenAI -> Groq models -> streamed MAQ AI)."""
+    client = get_agent_framework_client()
+    return await _execute_agent_pipeline(client, getattr(client, "current_model", ""), user_query, history, conversation_id)
 
 def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
     """Next-step suggestions (label + prompt) for the chips above the chat input."""
@@ -930,6 +936,41 @@ def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
     except Exception as e:
         logger.error(f"[Suggestions] Could not compute suggestions: {e}")
         return []
+
+DEFAULT_TITLE = "New Project"
+DEFAULT_TITLES = {"new project", "new conversation", "new chat", ""}
+
+
+def _title_from_query(user_query: str) -> Optional[str]:
+    """Fallback title from the first words of the user's first message (used when the model gave none)."""
+    first_line = (user_query.split("[Attached File Content]")[0].strip().split("\n") or [""])[0].strip()
+    title = " ".join(first_line.split()[:5])
+    if len(title) > 36:
+        title = title[:33] + "..."
+    return title or None
+
+
+def resolve_conversation_title(current_title: Optional[str], llm_title: Optional[str], user_query: str,
+                               project_name: Optional[str]) -> str:
+    """
+    The conversation (sidebar) title:
+    1. Once the project has a name (proposed, created or renamed), the title is always that name.
+    2. Before that, a new conversation gets the model's best guess of the project name from the first message
+       (or the first words of the conversation's first message); later messages don't change it.
+    Placeholder values ("placeholder", "<project name>", "TBD"...) are never used.
+    """
+    if not store.is_placeholder_name(project_name):
+        return project_name.strip()
+    current = (current_title or "").strip()
+    if current.lower() in DEFAULT_TITLES or store.is_placeholder_name(current):
+        if not store.is_placeholder_name(llm_title):
+            return llm_title.strip()
+        fallback = _title_from_query(user_query)
+        if not store.is_placeholder_name(fallback):
+            return fallback
+        return DEFAULT_TITLE
+    return current
+
 
 async def process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None,
                                *, user_id: str) -> ChatResponse:
@@ -997,34 +1038,28 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
     elif output_check.response_text:
         response_text = output_check.response_text
     
-    # Extract dynamically generated title on first message
+    llm_title = None
     if response_text.startswith("TITLE:"):
         parts = response_text.split("\n\n", 1)
         if len(parts) > 1:
-            new_title = parts[0].replace("TITLE:", "").strip()
+            llm_title = parts[0].replace("TITLE:", "").strip()
             response_text = parts[1].strip()
-            supabase = get_supabase_client()
-            try:
-                supabase.table("Conversation").update({"title": new_title}).eq("conv_id", conversation_id).execute()
-                logger.info(f"[Supabase] Updated conversation title to: '{new_title}'")
-            except Exception as e:
-                logger.error(f"[Supabase] Failed to update title: {str(e)}")
-    elif conv.get("title") in ("New Project", "New Conversation"):
-        # Fallback: Auto-generate a title from the user query if LLM didn't prefix TITLE:
-        clean_query = user_query.split("[Attached File Content]")[0].strip()
-        if clean_query:
-            first_line = clean_query.split("\n")[0].strip()
-            words = [w for w in first_line.split() if w]
-            candidate_title = " ".join(words[:5])
-            if len(candidate_title) > 36:
-                candidate_title = candidate_title[:33] + "..."
-            if candidate_title:
-                supabase = get_supabase_client()
-                try:
-                    supabase.table("Conversation").update({"title": candidate_title}).eq("conv_id", conversation_id).execute()
-                    logger.info(f"[Supabase] Auto-updated default conversation title to: '{candidate_title}'")
-                except Exception as e:
-                    logger.error(f"[Supabase] Failed to auto-update title: {str(e)}")
+    project_row = None
+    try:
+        project_row = store.get_project(conversation_id)
+    except Exception as e:
+        logger.debug(f"[Supabase] Project check skipped: {e}")
+    current_title = conv.get("title") or DEFAULT_TITLE
+    first_user_message = next((m.get("text") or "" for m in content_array if m.get("role") == "user"), user_query)
+    new_title = resolve_conversation_title(current_title, llm_title, first_user_message,
+                                           (project_row or {}).get("project_name"))
+    if new_title != current_title:
+        try:
+            get_supabase_client().table("Conversation").update({"title": new_title}).eq("conv_id", conversation_id).execute()
+            logger.info(f"[Supabase] Conversation title: '{current_title}' -> '{new_title}'")
+            current_title = new_title
+        except Exception as e:
+            logger.error(f"[Supabase] Failed to update title: {str(e)}")
 
     # Persist updated conversation history
     content_array.append({"role": "user", "text": user_query})
@@ -1041,6 +1076,7 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
     logger.info(f"=== Chat pipeline completed successfully in {total_time}ms ===")
 
     return ChatResponse(conversation_id=conversation_id, response=response_text,
-                        suggestions=get_suggestions(conversation_id))
+                        suggestions=get_suggestions(conversation_id),
+                        title=current_title)
 
 

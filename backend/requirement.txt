@@ -1,6 +1,8 @@
-fastapi==0.115.0
+fastapi==0.143.0
+# openai-guardrails -> openai-agents needs Starlette 1.x; FastAPI 0.143 supports it (0.115 required starlette<0.39)
+starlette>=1.3.1,<2
 uvicorn[standard]>=0.31.1
-python-multipart==0.0.9
+python-multipart==0.0.32
 pytest==8.3.2
 httpx==0.27.2
 openai
@@ -12,5 +14,9 @@ agent-framework-openai==1.15.0
 mcp==1.30.0
 pydantic==2.13.5
 PyJWT[crypto]==2.15.1
-openai-guardrails
-
+openai-guardrails==0.3.3
+openai-agents==0.23.1
+# spaCy English model used by the 'Contains PII' guardrail (without it every reply is blocked)
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
+# Accurate token counts for the LLM fallback's request-size check (falls back to an estimate without it)
+tiktoken==0.14.0
