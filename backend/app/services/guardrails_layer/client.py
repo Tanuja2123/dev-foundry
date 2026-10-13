@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 from dataclasses import dataclass, field
@@ -330,9 +331,10 @@ async def check_output_guardrail(
             if other_specs:
                 other_bundle = load_config_bundle({"guardrails": other_specs, "version": 1})
                 other_instances = instantiate_guardrails(other_bundle)
+                url_scan_text = re.sub(r'([.?!])\s*(\n+)', r'\1 \2', sanitized_text)
                 await run_guardrails(
                     ctx=ctx,
-                    data=sanitized_text,
+                    data=url_scan_text,
                     media_type="text/plain",
                     guardrails=other_instances,
                     raise_guardrail_errors=True,
@@ -341,9 +343,10 @@ async def check_output_guardrail(
         else:
             bundle = load_config_bundle(output_stage)
             guardrails_instances = instantiate_guardrails(bundle)
+            url_scan_text = re.sub(r'([.?!])\s*(\n+)', r'\1 \2', text)
             results = await run_guardrails(
                 ctx=ctx,
-                data=text,
+                data=url_scan_text,
                 media_type="text/plain",
                 guardrails=guardrails_instances,
                 raise_guardrail_errors=True,

@@ -272,7 +272,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
 
     # 3. Tertiary: MAQ AI Gateway / SLM
     maq_key = os.getenv("MAQ_AI_API_KEY", "").strip()
-    maq_base_url = os.getenv("MAQ_AI_BASE_URL", "https://llm.maqsoftware.net/v1").strip()
+    maq_base_url = os.getenv("MAQ_AI_BASE_URL", "https://indiaai.maqsoftware.net/v1").strip()
     maq_model = os.getenv("MAQ_AI_MODEL", "qwen-3.8-27b").strip() or "qwen-3.8-27b"
 
     if maq_key:

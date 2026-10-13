@@ -15,7 +15,7 @@
         "config": {
           "model": "qwen-3.8-27b",
           "confidence_threshold": 0.8,
-          "system_prompt_details": "Requirements Agent allowed scope: gathering, analyzing, clarifying, and drafting software functional and non-functional requirements, Product Requirements Documents (PRD), user stories, and acceptance criteria."
+          "system_prompt_details": "Requirements Agent allowed scope: conversational greetings (e.g. hello, hi, hey), pleasantries, gathering, analyzing, clarifying, and drafting software functional and non-functional requirements, Product Requirements Documents (PRD), user stories, and acceptance criteria."
         }
       }
     ]
