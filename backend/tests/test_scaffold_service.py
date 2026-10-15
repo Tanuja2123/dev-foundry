@@ -82,6 +82,7 @@ def runner(monkeypatch):
 
     monkeypatch.setattr(ss, "_resolve_executable", lambda name: f"/usr/bin/{name}" if name in ("uv", "npx", "npm") else None)
     monkeypatch.setattr(ss.subprocess, "run", fake_run)
+    monkeypatch.setattr(ss, "_command_version", lambda command, args: None)   # no version lookups here
     return calls
 
 
@@ -430,15 +431,19 @@ def test_without_migration_005_everything_is_pushed_as_one_commit(monkeypatch, a
     assert pushed["status"] == "success" and len([c for c in ado if c[0].startswith("push_")]) == 1
 
 
-def test_display_shows_commands_markers_and_commit_plan(db, ado, runner):
+def test_display_shows_markers_and_commit_plan_and_commands_only_after_the_push(db, ado, runner):
     tools = created_repo(db, ado)
     call(tools, "scaffold_repository_structure", commands=FULLSTACK_COMMANDS)
     call(tools, "update_repository_structure", upsert_files=[{"path": "/backend/app/auth/__init__.py", "content": '"""Auth."""\n'}])
-    text = render_structure_for_display(store.get_workflow_state(CONV))
-    assert "npx --yes create-vite@latest frontend --template react-ts" in text
-    assert "uv add --no-sync fastapi[standard]    # in backend/" in text
-    assert "__init__.py  (added)" in text and "hero.png" in text
-    assert "two commits" in text and "(9 files)" not in text
+    review = render_structure_for_display(store.get_workflow_state(CONV))
+    assert "__init__.py  (added)" in review and "hero.png" in review
+    assert "two commits" in review and "(9 files)" not in review
+    assert "create-vite" not in review and "uv add" not in review          # commands are not shown before the push
+    call(tools, "push_repository_structure")
+    pushed = render_structure_for_display(store.get_workflow_state(CONV))
+    assert "Created by running these commands" in pushed
+    assert "npx --yes create-vite@latest frontend --template react-ts" in pushed
+    assert "uv add --no-sync fastapi[standard]    # in backend/" in pushed
 
 
 def test_agent_context_lists_paths_but_not_generated_contents(db, ado, runner):
@@ -460,7 +465,7 @@ def test_agent_registers_scaffold_tool_with_command_list():
     schema = str(tool.to_json_schema_spec() if hasattr(tool, "to_json_schema_spec") else tool.parameters())
     assert "commands" in schema and "cwd" in schema
     instructions = agent.default_options["instructions"]
-    assert "SCAFFOLD COMMAND RULES" in instructions and "Do NOT create frontend/ or backend/ folders" in instructions
+    assert "SCAFFOLD RULES" in instructions and "Do NOT create frontend/ or backend/ folders" in instructions
 
 
 # ---------------------------------------------------------------------------

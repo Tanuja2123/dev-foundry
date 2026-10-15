@@ -27,36 +27,18 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 from app.core.logger import logger
 from app.services.mcp.ado_git_push import AdoPushError, Base64Content, MAX_FILE_BYTES, MAX_FILES
 from app.services.repo_structure import normalize_structure
+from app.services.scaffold_catalog import (ALLOWED_COMMANDS, COMPOSER_PACKAGES, DEFAULT_ALLOWED_PACKAGES, EXTRA_ENV,
+                                           GENERATORS, apply_auto_flags, describe_scaffold_catalog, find_generator,
+                                           missing_expected_files)
+from app.services.scaffold_initializers import describe_initializers, run_initializer
 
 MAX_COMMANDS = 8
-DEFAULT_COMMAND_TIMEOUT_SECONDS = 240
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 600     # first runs of Maven, Gradle, Pulumi and `go get` download caches
 OUTPUT_TAIL_CHARS = 1500
 
-# Executables the agent may run, with the subcommands each may use (None = package runner, checked below).
-ALLOWED_COMMANDS: Dict[str, Optional[Tuple[str, ...]]] = {
-    "npx": None,                                            # npx <generator package> ...
-    "npm": ("create", "init", "install", "i", "add", "pkg"),
-    "pnpm": ("create", "dlx", "init", "add", "install"),
-    "yarn": ("create", "init", "add"),
-    "uv": ("init", "add", "remove", "lock"),
-    "uvx": None,                                            # uvx [--from <package>] <tool> ...
-    "dotnet": ("new", "sln", "add"),
-    "go": ("mod", "get"),
-    "cargo": ("new", "init", "add"),
-    "poetry": ("new", "init", "add"),
-}
-
-# Generator packages that npx / npm create / pnpm create|dlx / yarn create / uvx may download and run.
-# Extend with SCAFFOLD_ALLOWED_PACKAGES="pkg-a,pkg-b" (comma separated).
-DEFAULT_ALLOWED_PACKAGES = {
-    # JavaScript / TypeScript
-    "create-vite", "create-next-app", "create-react-router", "create-remix", "create-astro", "create-svelte", "sv",
-    "create-vue", "nuxi", "create-nuxt", "@angular/cli", "@nestjs/cli", "create-expo-app", "create-t3-app",
-    "express-generator", "create-tauri-app", "create-electron-app", "create-turbo", "create-solid", "create-qwik",
-    "typescript", "gitignore",
-    # Python
-    "django", "pyscaffold", "poetry",
-}
+# The allowed executables, subcommands and generator packages come from the scaffold catalog
+# (scaffold_catalog.ALLOWED_COMMANDS / DEFAULT_ALLOWED_PACKAGES); extend packages with SCAFFOLD_ALLOWED_PACKAGES.
+VERSION_LOOKUP_TIMEOUT_SECONDS = 4.0
 
 # Folders that installers / tools create but that never belong in a repository.
 IGNORED_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -75,7 +57,7 @@ _ENV_ALLOWLIST = {
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
     "DOTNET_ROOT", "GOPATH", "GOROOT", "GOMODCACHE", "CARGO_HOME", "RUSTUP_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
     "XDG_DATA_HOME", "UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "NPM_CONFIG_CACHE", "NPM_CONFIG_REGISTRY",
-}
+} | set(EXTRA_ENV)
 _NON_INTERACTIVE_ENV = {
     "CI": "true", "npm_config_yes": "true", "npm_config_fund": "false", "npm_config_audit": "false",
     "npm_config_update_notifier": "false", "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_NOLOGO": "1",
@@ -88,18 +70,24 @@ _NON_INTERACTIVE_ENV = {
 class ScaffoldCommand:
     command: str
     cwd: str = "."
+    generator: Optional[str] = None      # scaffold catalog id, e.g. "vite"
+    version: Optional[str] = None        # version actually used, e.g. "create-vite 7.1.2"
 
     def to_dict(self) -> Dict[str, str]:
-        return {"command": self.command, "cwd": self.cwd}
+        data = {"command": self.command, "cwd": self.cwd}
+        if self.version:
+            data["version"] = self.version
+        return data
 
 
 @dataclass
 class ScaffoldResult:
     files: List[Dict[str, str]]
-    commands: List[ScaffoldCommand]
+    commands: List[Any]                  # ScaffoldCommand / InitializerRun (both have to_dict) in execution order
     outputs: List[Dict[str, Any]] = field(default_factory=list)
     skipped: Dict[str, List[str]] = field(default_factory=dict)
     duration_seconds: float = 0.0
+    warnings: List[str] = field(default_factory=list)
 
 
 def _error(message: str, error_type: str, details: str = "") -> AdoPushError:
@@ -126,6 +114,21 @@ def _resolve_executable(name: str) -> Optional[str]:
     return shutil.which(name)
 
 
+_VERSION_ARGS = {"go": ["version"]}            # executables without a `--version` flag
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _version_line(output: str, name: str = "") -> str:
+    """
+    The line that carries the tool's version: the first one starting with the tool's name (Mix prints an Erlang banner
+    first), else the first one with a digit (skips banners such as Gradle's dashes). Colour codes are stripped.
+    """
+    lines = [line.strip() for line in _ANSI_ESCAPE.sub("", output or "").splitlines()]
+    lines = [line for line in lines if line and re.search(r"\d", line)]
+    own = [line for line in lines if name and line.lower().startswith(name.lower())]
+    return (own or lines or [""])[0][:60]
+
+
 @lru_cache(maxsize=1)
 def available_toolchains() -> Dict[str, str]:
     """{executable: version} for the allow-listed executables installed on this server (cached per process)."""
@@ -136,9 +139,10 @@ def available_toolchains() -> Dict[str, str]:
             continue
         version = ""
         try:
-            proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15,
-                                  stdin=subprocess.DEVNULL, env=_command_env(), encoding="utf-8", errors="replace")
-            version = (proc.stdout or proc.stderr or "").strip().splitlines()[0][:60] if proc.returncode == 0 else ""
+            proc = subprocess.run([path] + _VERSION_ARGS.get(name, ["--version"]), capture_output=True, text=True,
+                                  timeout=60, stdin=subprocess.DEVNULL, env=_command_env(), encoding="utf-8",
+                                  errors="replace")      # JVM tools can take a while to start
+            version = _version_line(proc.stdout or proc.stderr, name) if proc.returncode == 0 else ""
         except Exception:
             pass
         tools[name] = version or "installed"
@@ -146,10 +150,8 @@ def available_toolchains() -> Dict[str, str]:
 
 
 def describe_toolchains() -> str:
-    tools = available_toolchains()
-    if not tools:
-        return "scaffold_toolchains: none installed on the server"
-    return "scaffold_toolchains (installed on the server): " + ", ".join(f"{k} ({v})" for k, v in tools.items())
+    """The scaffold catalog for the agent: available generators, online initializers and missing toolchains."""
+    return describe_scaffold_catalog(available_toolchains().keys(), describe_initializers())
 
 
 # ---------------------------------------------------------------------------
@@ -241,16 +243,22 @@ def parse_command(spec: Any) -> Tuple[ScaffoldCommand, List[str]]:
                      "COMMAND_NOT_ALLOWED")
     rest = args[1:]
     subcommands = ALLOWED_COMMANDS[executable]
-    if executable == "npx":
-        package, packages = _first_positional(rest, ("-p", "--package"), ("--cache", "--registry"))
+    generator = None
+    if executable in ("npx", "uvx"):
+        if executable == "npx":
+            package, packages = _first_positional(rest, ("-p", "--package"), ("--cache", "--registry"))
+        else:
+            if any(arg.split("=", 1)[0] in ("--with", "-w", "--with-requirements", "--with-editable") for arg in rest):
+                raise _error("`uvx --with` is not allowed (it installs extra packages).", "COMMAND_NOT_ALLOWED")
+            package, packages = _first_positional(rest, ("--from",), ("--python", "-p", "--index", "--index-url"))
         for name in packages or [package]:
-            _check_package(name, "npx")
-    elif executable == "uvx":
-        if any(arg.split("=", 1)[0] in ("--with", "-w", "--with-requirements", "--with-editable") for arg in rest):
-            raise _error("`uvx --with` is not allowed (it installs extra packages).", "COMMAND_NOT_ALLOWED")
-        package, packages = _first_positional(rest, ("--from",), ("--python", "-p", "--index", "--index-url"))
-        for name in packages or [package]:
-            _check_package(name, "uvx")
+            _check_package(name, executable)
+        runs = _package_name(packages[0] if packages else package)
+        generator = find_generator(executable, [], runs)
+        if generator and package in args:
+            # headless flags belong to the generator (after the package / binary), not to npx / uvx itself
+            split = args.index(package) + 1
+            args = args[:split] + apply_auto_flags(generator, args[split:])
     else:
         if not rest or rest[0].lower() not in subcommands:
             raise _error(f"`{executable} {rest[0] if rest else ''}` is not allowed. Allowed subcommands: "
@@ -258,16 +266,28 @@ def parse_command(spec: Any) -> Tuple[ScaffoldCommand, List[str]]:
         sub = rest[0].lower()
         if executable == "dotnet" and sub == "new" and len(rest) > 1 and rest[1].lower() in ("install", "uninstall"):
             raise _error("Installing dotnet templates is not allowed; use a built-in template.", "COMMAND_NOT_ALLOWED")
-        if executable in ("npm", "pnpm", "yarn") and sub in ("create", "init", "dlx"):
+        if executable in ("npm", "pnpm", "yarn", "bun") and sub in ("create", "init", "dlx"):
             target, _ = _first_positional(rest[1:])
             if sub == "dlx":
                 _check_package(target, f"{executable} dlx")
-            elif target:  # `npm init -y` has no initializer
+                generator = find_generator("npx", [], _package_name(target))
+            elif target and not (executable == "bun" and sub == "init"):   # `npm init -y` / `bun init`: none
                 _check_package(_initializer_package(target), f"{executable} {sub}")
+                generator = find_generator("npx", [], _initializer_package(target))
+        if executable == "composer" and sub == "create-project":
+            target, _ = _first_positional(rest[1:])
+            if not target or target.lower().split(":")[0] not in COMPOSER_PACKAGES:
+                raise _error(f"composer create-project may only use: {', '.join(sorted(COMPOSER_PACKAGES))}.",
+                             "COMMAND_NOT_ALLOWED")
+        if executable == "swift" and (len(rest) < 2 or rest[1].lower() != "init"):
+            raise _error("Only `swift package init` is allowed.", "COMMAND_NOT_ALLOWED")
         if executable in ("npm", "pnpm") and sub in ("install", "i", "add") and "--ignore-scripts" not in rest:
             args.append("--ignore-scripts")   # never run dependency install scripts on the server
+        if generator is None:
+            generator = find_generator(executable, rest)
+            args = [args[0]] + apply_auto_flags(generator, args[1:])
     args[0] = executable
-    return ScaffoldCommand(command=raw, cwd=cwd), args
+    return ScaffoldCommand(command=raw, cwd=cwd, generator=generator.id if generator else None), args
 
 
 def _command_env() -> Dict[str, str]:
@@ -341,29 +361,66 @@ def _tail(text: str) -> str:
     return text[-OUTPUT_TAIL_CHARS:]
 
 
-def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int] = None) -> ScaffoldResult:
+def _registry_version(runner: str, spec: str) -> Optional[str]:
+    """Version a package runner will use: the pinned one, or the registry's latest (best effort, no failure)."""
+    name = _package_name(spec)
+    pinned = spec.strip()[len(name):].lstrip("@=").split("[")[0]       # 'create-vite@7.1.0' -> '7.1.0'
+    if pinned and pinned.lower() != "latest":
+        return f"{name} {pinned}"
+    try:
+        import httpx
+        url = (f"https://registry.npmjs.org/{name.replace('/', '%2f')}/latest" if runner == "npx"
+               else f"https://pypi.org/pypi/{name}/json")
+        with httpx.Client(timeout=VERSION_LOOKUP_TIMEOUT_SECONDS) as client:
+            data = client.get(url).json()
+        version = data.get("version") if runner == "npx" else data.get("info", {}).get("version")
+        return f"{name} {version}" if version else None
+    except Exception:
+        return None
+
+
+def _command_version(command: ScaffoldCommand, args: List[str]) -> Optional[str]:
+    if args[0] in ("npx", "uvx"):
+        package, packages = _first_positional(args[1:], ("-p", "--package", "--from"),
+                                              ("--cache", "--registry", "--python", "--index", "--index-url"))
+        spec = packages[0] if packages else package
+        return _registry_version(args[0], spec) if spec else None
+    tool = available_toolchains().get(args[0])
+    return f"{args[0]} {tool}" if tool and tool != "installed" and not tool.lower().startswith(args[0]) else tool
+
+
+def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int] = None,
+                          initializers: Optional[Iterable[Any]] = None, default_name: str = "app") -> ScaffoldResult:
     """
-    Validates and runs the commands in order inside a fresh temporary folder (the repository root) and returns the
-    generated files as a validated structure. Raises AdoPushError (error_type COMMAND_NOT_ALLOWED, TOOL_NOT_INSTALLED,
-    COMMAND_FAILED, COMMAND_TIMEOUT, SCAFFOLD_EMPTY or VALIDATION_ERROR); nothing is invented as a fallback.
+    Validates and runs the online initializers and then the commands, in order, inside a fresh temporary folder (the
+    repository root), and returns the generated files as a validated structure. Raises AdoPushError (error_type
+    COMMAND_NOT_ALLOWED, TOOL_NOT_INSTALLED, COMMAND_FAILED, COMMAND_TIMEOUT, INITIALIZER_FAILED,
+    INITIALIZER_UNAVAILABLE, SCAFFOLD_EMPTY or VALIDATION_ERROR); nothing is invented as a fallback.
     """
     specs = list(commands or [])
-    if not specs:
-        raise _error("At least one scaffold command is required.", "VALIDATION_ERROR")
-    if len(specs) > MAX_COMMANDS:
-        raise _error(f"Too many scaffold commands ({len(specs)}); the limit is {MAX_COMMANDS}.", "VALIDATION_ERROR")
+    inits = [i if isinstance(i, Mapping) else (i.model_dump() if hasattr(i, "model_dump") else {}) for i in initializers or []]
+    if not specs and not inits:
+        raise _error("At least one scaffold command or initializer is required.", "VALIDATION_ERROR")
+    if len(specs) + len(inits) > MAX_COMMANDS:
+        raise _error(f"Too many scaffold steps ({len(specs) + len(inits)}); the limit is {MAX_COMMANDS}.",
+                     "VALIDATION_ERROR")
     parsed = [parse_command(spec) for spec in specs]          # validate everything before running anything
     for command, args in parsed:
         if not _resolve_executable(args[0]):
             installed = ", ".join(name for name in ALLOWED_COMMANDS if _resolve_executable(name)) or "none"
             raise _error(f"`{args[0]}` is not installed on the DevFoundry server, so `{command.command}` cannot run. "
-                         f"Installed scaffold tools: {installed}.", "TOOL_NOT_INSTALLED")
+                         f"Installed scaffold tools: {installed}. Java/Kotlin projects can use the online initializers "
+                         "(spring-boot, quarkus, micronaut) instead.", "TOOL_NOT_INSTALLED")
 
     timeout = timeout_seconds or command_timeout_seconds()
     env = _command_env()
     started = time.monotonic()
     outputs: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    executed: List[Any] = []
     with tempfile.TemporaryDirectory(prefix="devfoundry-scaffold-") as workspace:
+        for spec in inits:
+            executed.append(run_initializer(spec, workspace, default_name))
         for command, args in parsed:
             cwd = os.path.join(workspace, *([] if command.cwd == "." else command.cwd.split("/")))
             os.makedirs(cwd, exist_ok=True)
@@ -382,6 +439,13 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
             if proc.returncode != 0:
                 logger.warning(f"[Scaffold] `{command.command}` exited with {proc.returncode}")
                 raise _error(f"`{command.command}` failed with exit code {proc.returncode}.", "COMMAND_FAILED", output)
+            generator = next((g for g in GENERATORS if g.id == command.generator), None)
+            missing = missing_expected_files(cwd, generator) if generator else []
+            if missing:
+                warnings.append(f"`{command.command}` (in /{'' if command.cwd == '.' else command.cwd}) did not "
+                                f"produce the expected {', '.join(missing)}; check the generator options.")
+            command.version = _command_version(command, args)
+            executed.append(command)
 
         files, skipped = collect_files(workspace)
 
@@ -392,9 +456,9 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
                      "Use generator options that skip installing dependencies.", "VALIDATION_ERROR")
     structure = normalize_structure(files, allow_empty=True)
     duration = round(time.monotonic() - started, 1)
-    logger.info(f"[Scaffold] {len(parsed)} command(s) produced {len(structure)} files in {duration}s")
-    return ScaffoldResult(files=structure, commands=[c for c, _ in parsed], outputs=outputs, skipped=skipped,
-                          duration_seconds=duration)
+    logger.info(f"[Scaffold] {len(executed)} step(s) produced {len(structure)} files in {duration}s")
+    return ScaffoldResult(files=structure, commands=executed, outputs=outputs, skipped=skipped,
+                          duration_seconds=duration, warnings=warnings)
 
 
 def decode_file(item: Mapping[str, str]) -> bytes:

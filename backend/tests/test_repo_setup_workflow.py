@@ -178,12 +178,18 @@ def test_guards_prevent_out_of_order_and_duplicate_actions(db, ado):
     assert call(t, "save_repository_structure", files=STRUCTURE)["status"] == "error"
     assert call(t, "push_repository_structure")["status"] == "error"
 
-    call(t, "create_ado_project", project_name="Svc", project_description="d")
+    first = call(t, "create_ado_project", project_name="Svc", project_description="d")
+    # a repeated call (seen live: a model called the tool twice in one turn) returns the existing project as a success
+    # and creates nothing new, so the reply can never report a failure for a project that was created
     again = call(t, "create_ado_project", project_name="Svc", project_description="d")
-    assert again["error_type"] == "ALREADY_CREATED"
+    assert again["status"] == "success" and again["already_existed"] is True
+    assert again["id"] == first["id"] and again["url"] == first["url"]
+    assert [c[0] for c in ado].count("create_ado_project") == 1
 
     call(t, "create_ado_repository", project_id_or_name="Svc", repository_name="svc")
-    assert call(t, "create_ado_repository", project_id_or_name="Svc", repository_name="svc")["error_type"] == "ALREADY_CREATED"
+    repeat = call(t, "create_ado_repository", project_id_or_name="Svc", repository_name="svc")
+    assert repeat["status"] == "success" and repeat["already_existed"] is True
+    assert [c[0] for c in ado].count("create_ado_repository") == 1
     assert call(t, "push_repository_structure")["message"] == "There is no saved structure to push."
     assert call(t, "update_repository_structure", remove_paths=["/x"])["status"] == "error"   # nothing saved yet
 
@@ -290,7 +296,7 @@ def test_agent_registers_the_workflow_tools():
                "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE", "UPDATE_ADO_PROJECT"]:
         assert op in instructions
     # The structure comes from generator commands, never from files the model writes or from repo templates
-    assert "SCAFFOLD COMMAND RULES" in instructions and "NEVER write starter" in instructions
+    assert "SCAFFOLD RULES" in instructions and "NEVER write starter" in instructions
     assert "templates/" not in instructions.lower()
     push_schema = {t.name: t for t in agent.default_options["tools"]}["push_repository_structure"].parameters()
     assert "files" not in push_schema["properties"]                       # the model cannot choose what is pushed

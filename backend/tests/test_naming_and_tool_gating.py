@@ -125,24 +125,54 @@ def test_placeholder_proposals_are_not_stored(db):
 # Conversation title
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("current, llm_title, query, project_name, expected", [
-    # first message: the model's guess of the project name
+@pytest.mark.parametrize("current, llm_title, first_message, official_name, expected", [
+    # a confident product name from the model names the chat
     ("New Project", "Developer CLI Toolkit", "I want to build a CLI", None, "Developer CLI Toolkit"),
-    # first message without a usable guess: first words of the message
-    ("New Project", "placeholder", "I want to build a CLI for developers", None, "I want to build a"),
-    ("New Project", None, "Build a clinic booking app", None, "Build a clinic booking app"),
-    # later messages before a project name: unchanged (even if a model returns a title)
-    ("Developer CLI Toolkit", "Something Else", "add a feature", None, "Developer CLI Toolkit"),
-    # project name proposed / created / renamed: always the project name
-    ("Developer CLI Toolkit", None, "ok", "DevKit CLI", "DevKit CLI"),
-    ("I want to build a", None, "ok", "Developer CLI Toolkit", "Developer CLI Toolkit"),
-    # a placeholder project name never becomes the title, and a placeholder title gets replaced
-    ("Developer CLI Toolkit", None, "ok", "placeholder", "Developer CLI Toolkit"),
+    # no (confident) product name: stays "New Project" - the user's words never become the title (seen live)
+    ("New Project", None, "what are you up to nowadays?", None, "New Project"),
+    ("New Project", "placeholder", "I want to build a CLI for developers", None, "New Project"),
+    ("New Project", None, "hiii", None, "New Project"),
+    # a title copied from the first message by older versions is temporary: replaced, or reset to the default
+    ("what are you up to", None, "what are you up to nowadays?", None, "New Project"),
+    ("what are you up to", "Clinic Appointment Booking", "what are you up to nowadays?", None,
+     "Clinic Appointment Booking"),
+    # later messages: a named chat keeps its name (even if the model suggests another one)
+    ("Developer CLI Toolkit", "Something Else", "I want to build a CLI", None, "Developer CLI Toolkit"),
+    # the finalized Azure DevOps project name always wins, and follows renames
+    ("Developer CLI Toolkit", None, "I want to build a CLI", "DevKit CLI", "DevKit CLI"),
+    ("DevKit CLI", None, "I want to build a CLI", "DevKit CLI v2", "DevKit CLI v2"),
+    ("New Project", None, "hello", "Clinic-Booking", "Clinic-Booking"),
+    # placeholders never become titles; placeholder titles are temporary
+    ("Developer CLI Toolkit", None, "x", "placeholder", "Developer CLI Toolkit"),
     ("placeholder", "Library Lending", "I want a library app", None, "Library Lending"),
-    ("placeholder", None, "I want to build a command-line tool", None, "I want to build a"),
+    ("hiii", "School Management System", "hiii", None, "School Management System"),
 ])
-def test_conversation_title_rules(current, llm_title, query, project_name, expected):
-    assert cs.resolve_conversation_title(current, llm_title, query, project_name) == expected
+def test_conversation_title_rules(current, llm_title, first_message, official_name, expected):
+    assert cs.resolve_conversation_title(current, llm_title, first_message, official_name) == expected
+
+
+@pytest.mark.parametrize("title, confidence, expected", [
+    ("Clinic Appointment Booking", 0.85, "Clinic Appointment Booking"),
+    ("Clinic Appointment Booking", 0.7, "Clinic Appointment Booking"),
+    ("Management System", 0.6, None),                 # below the threshold
+    ("What Are You Up To", 0.0, None),                # small talk
+    ("placeholder", 0.95, None),
+    (None, 0.9, None),
+    ("School Management System", 9, "School Management System"),   # a 0-10 scale is tolerated
+])
+def test_title_needs_enough_confidence(title, confidence, expected):
+    from app.services.workflow_routing import RoutingDecision
+    decision = RoutingDecision(reasoning="r", action="respond", reply="x", title=title, title_confidence=confidence)
+    assert cs.inferred_title(decision) == expected
+
+
+def test_title_threshold_is_configurable(monkeypatch):
+    from app.services.workflow_routing import RoutingDecision
+    decision = RoutingDecision(reasoning="r", action="respond", reply="x", title="Clinic App", title_confidence=0.75)
+    monkeypatch.setenv("TITLE_CONFIDENCE_THRESHOLD", "0.9")
+    assert cs.inferred_title(decision) is None
+    monkeypatch.setenv("TITLE_CONFIDENCE_THRESHOLD", "0.5")
+    assert cs.inferred_title(decision) == "Clinic App"
 
 
 # ---------------------------------------------------------------------------
@@ -159,3 +189,41 @@ def test_conversation_title_rules(current, llm_title, query, project_name, expec
 ])
 def test_agent_json_error(text, ok):
     assert (cs.agent_json_error(text) is None) is ok
+
+
+# ---------------------------------------------------------------------------
+# Tech-change check: a change to a clearly weaker fit needs the user's confirmation
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+
+def assessment_output(current, requested, confirmed=False):
+    return json.dumps({"status": "COMPLETE", "workflow_stage": "TRD", "technical_requirements_document": {"x": 1},
+                       "change_notes": "Backend language: Python -> Go",
+                       "tech_change_assessment": {"requested_change": "Backend language: Python -> Go",
+                                                  "current_fit": current, "requested_fit": requested,
+                                                  "pros": ["Single binary"], "cons": ["No Typer/Rich ecosystem"],
+                                                  "recommendation": "Keep Python.", "user_confirmed": confirmed}})
+
+
+@pytest.mark.parametrize("current, requested, confirmed, needs", [
+    (8, 4, False, True),     # clearly worse -> confirm first
+    (8, 5, False, True),     # gap 3 = threshold
+    (8, 6, False, False),    # close enough -> apply directly
+    (6, 9, False, False),    # better -> apply directly
+    (8, 3, True, False),     # user already confirmed after the warning -> apply
+    ("8", "x", False, False),  # unusable scores -> never block
+])
+def test_tech_change_confirmation_threshold(current, requested, confirmed, needs):
+    assert (cs.tech_change_needing_confirmation(assessment_output(current, requested, confirmed)) is not None) is needs
+
+
+def test_tech_change_threshold_is_configurable(monkeypatch):
+    monkeypatch.setenv("TECH_CHANGE_CONFIRM_THRESHOLD", "5")
+    assert cs.tech_change_needing_confirmation(assessment_output(8, 4)) is None
+    assert cs.tech_change_needing_confirmation(assessment_output(9, 4)) is not None
+
+
+def test_no_assessment_means_no_confirmation():
+    assert cs.tech_change_needing_confirmation(json.dumps({"status": "COMPLETE", "technical_requirements_document": {}})) is None

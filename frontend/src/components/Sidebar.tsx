@@ -34,6 +34,8 @@ const STAGE_CONFIG: Record<string, { label: string; className: string }> = {
 
 type SidebarProps = {
   projects: Project[]
+  /** Chats with a request in progress (chats run in parallel) */
+  busyProjectIds?: Set<string>
   selectedProjectId: string | null
   onSelectProject: (projectId: string) => void
   onNewProject?: () => void
@@ -50,6 +52,7 @@ type SidebarProps = {
 
 export function Sidebar({
   projects,
+  busyProjectIds,
   selectedProjectId,
   onSelectProject,
   onNewProject,
@@ -267,6 +270,12 @@ export function Sidebar({
                       <span className={`sidebar-stage-badge ${stageConfig.className}`}>
                         <span className="sidebar-stage-dot" />
                         {stageConfig.label}
+                      </span>
+                    )}
+                    {busyProjectIds?.has(project.id) && (
+                      <span className="sidebar-busy" role="status" aria-label="Working on a reply">
+                        <span className="sidebar-busy-spinner" aria-hidden="true" />
+                        Working…
                       </span>
                     )}
                   </div>

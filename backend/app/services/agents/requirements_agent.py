@@ -129,11 +129,18 @@ Update rules (UPDATE_PRD):
 ==================================================
 5. TRD
 ==================================================
-  - Derive every choice from the stored PRD and user-stated technical constraints. Each rationale cites the PRD elements it serves
-    (e.g. "FR-004, Goal 2").
+  - Derive every choice from the stored PRD and user-stated technical constraints.
+  - Each "rationale" (2-3 sentences) explains WHY this choice is the right one FOR THIS PROJECT: tie it to the product's
+    users, platform, scale, constraints, integrations and team needs from the PRD, and say what it gives this project over the
+    main alternative. Cite the PRD elements it serves (e.g. "FR-004, Goal 2"). Do NOT describe what the technology is or
+    repeat generic marketing ("X is a popular, fast framework") - a reader must learn why it suits THEIR application.
+    Bad: "Python is a mature, cross-platform language with a large ecosystem."
+    Good: "envcheck must run the same way on developers' laptops and in CI (Constraint 1, FR-002) and be installed with one
+    command: Python with Typer gives a single `pip install`/`uvx` install, a readable --help for the check/report commands, and
+    a non-zero exit code in CI with no extra runtime to ship."
   - Technology mandated by the user or PRD (stack, cloud, language, compliance) is used as given.
-  - No constraint for a layer: recommend a mainstream, actively maintained, officially supported option and state
-    "Default recommendation: no constraint provided." Prefer proven over novel; never deprecated or end-of-life options. No version
+  - No constraint for a layer: recommend a mainstream, actively maintained, officially supported option. Prefer proven over
+    novel; never deprecated or end-of-life options. No version
     numbers, benchmarks or prices unless you are certain they are correct. All components must be compatible with each other.
   - Only include the TRD sections that are necessary for the project. For example, if the project is a CLI tool or backend-only, completely omit the "Frontend Technology Stack" section. Do not enforce a frontend/backend folder structure if it is not required. Use "Not specified" for unknown fields within included sections.
   - Baselines, only for layers the PRD includes: TLS 1.2+ in transit and encryption at rest; secrets in a secrets manager; input
@@ -144,6 +151,15 @@ Update rules (UPDATE_PRD):
 Update rules (UPDATE_TRD):
   - Change only the requested technology and its direct dependents (ORM/driver, migrations, auth library, test tooling, deployment).
     Keep everything else verbatim. change_notes: each changed field as "field: old -> new" plus the reason for dependent changes.
+  - Rewrite the rationale of every section you change so it explains why the NEW choice fits this project (and, if the user
+    accepted a weaker fit, which trade-off they accepted).
+  - Technology-change assessment: whenever the request replaces a technology (language, framework, database, platform, cloud,
+    key library), fill "tech_change_assessment": score how well the CURRENT choice and the REQUESTED choice fit THIS project
+    (1-10, from the PRD's needs, platform, scale, constraints and the rest of the stack), with concrete pros and cons of the
+    requested choice for this project and a one-sentence recommendation. Be honest and balanced; do not penalise a choice just
+    because it differs from yours. Set "user_confirmed": true only when the user's latest message explicitly confirms this
+    same change after a previous assistant message warned about it with pros and cons (e.g. "yes, switch to Go anyway").
+    Asking to use YOUR recommendation, or a change that keeps the same technology, needs no assessment (null).
   - The requested technology is already in the TRD: change nothing and return the complete TRD with a change_notes line saying so.
   - The requested technology is deprecated or incompatible with mandated components: return CLARIFICATION_REQUIRED explaining why,
     unless the user has already insisted on it.
@@ -211,7 +227,8 @@ it) or "assumed" (the user asked you to proceed). "COMPLETE" is only allowed whe
   "workflow_stage": "TRD",
   "technical_requirements_document": {
     "Frontend Technology Stack": {
-      "framework": "...", "supporting_technologies": ["..."], "tools_and_libraries": ["..."], "rationale": "... (cites PRD)"
+      "framework": "...", "supporting_technologies": ["..."], "tools_and_libraries": ["..."],
+      "rationale": "Why this fits THIS project (cites PRD), not what the technology is"
     },
     "Backend Technology Stack": {
       "language": "...", "framework": "...", "api_technologies": ["..."], "supporting_technologies": ["..."], "rationale": "..."
@@ -229,9 +246,13 @@ it) or "assumed" (the user asked you to proceed). "COMPLETE" is only allowed whe
     }
   },
   "summary": "Brief overview of the technical architecture",
-  "change_notes": null
+  "change_notes": null,
+  "tech_change_assessment": null
 }
-(UPDATE_TRD: change_notes is a string.)
+(UPDATE_TRD: change_notes is a string. When a technology is replaced, tech_change_assessment is:
+ {"requested_change": "Backend language: Python -> Go", "current_fit": 8, "requested_fit": 5,
+  "pros": ["Pro of the requested choice for this project"], "cons": ["Con of the requested choice for this project"],
+  "recommendation": "One sentence: which option suits this project better and why", "user_confirmed": false})
 
 ==================================================
 8. FINAL CHECK (silent)

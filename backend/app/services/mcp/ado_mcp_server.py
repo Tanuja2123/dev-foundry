@@ -188,7 +188,7 @@ def create_ado_project(project_name: str, project_description: str) -> Dict[str,
         "description": project_description,
         "capabilities": {
             "versioncontrol": {"sourceControlType": "Git"},
-            "processTemplate": {"templateTypeId": "6b724908-ef14-45cf-84f8-768b5384da45"}  # Agile default template
+            "processTemplate": {"templateTypeId": "6b724908-ef14-45cf-84f8-768b5384da45"}  # Scrum process (verified: Epic > Feature > Product Backlog Item)
         }
     }
 

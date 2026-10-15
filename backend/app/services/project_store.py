@@ -224,8 +224,10 @@ PROJECT_PROPOSAL_OUTDATED = "PROJECT_PROPOSAL_OUTDATED"      # TRD changed after
 ADO_PROJECT_OUTDATED = "ADO_PROJECT_OUTDATED"                # TRD changed after the ADO project was created/updated
 STRUCTURE_OUTDATED = "STRUCTURE_OUTDATED"                    # TRD changed after the repository structure was written
 STRUCTURE_CHANGES_NOT_PUSHED = "STRUCTURE_CHANGES_NOT_PUSHED"  # structure edited after it was pushed
+WORK_ITEMS_OUTDATED = "WORK_ITEMS_OUTDATED"                  # PRD changed after the work items (or their draft)
 
 OUTDATED_DESCRIPTIONS = {
+    WORK_ITEMS_OUTDATED: "the Azure Boards work items (or their draft) do not reflect the latest PRD",
     TRD_OUTDATED: "the TRD does not reflect the latest PRD changes",
     PROJECT_PROPOSAL_OUTDATED: "the project name/description proposal does not reflect the latest TRD",
     ADO_PROJECT_OUTDATED: "the Azure DevOps project name/description does not reflect the latest requirements",
@@ -248,7 +250,34 @@ def outdated_items(state: Dict[str, Any]) -> List[str]:
         items.append(STRUCTURE_OUTDATED)
     if repository.get("pushed_structure") is not None and repository.get("structure") != repository.get("pushed_structure"):
         items.append(STRUCTURE_CHANGES_NOT_PUSHED)
+    # Outdated = the draft is older than the PRD (redraft it). A current draft whose items are not created yet is not
+    # "outdated": its next step is "Create work items" (seen live: the chip kept saying "Update work items").
+    draft = project.get("work_items_proposal")
+    if ((draft and (project.get("work_items_proposal_prd_version") or 0) < prd_version)
+            or (not draft and project.get("work_items") and (project.get("work_items_prd_version") or 0) < prd_version)):
+        items.append(WORK_ITEMS_OUTDATED)
     return items
+
+
+def has_work_item_columns(project: Optional[Dict[str, Any]]) -> bool:
+    """True once migration 006 (work_items / work_items_proposal) was run."""
+    return bool(project) and "work_items_proposal" in project
+
+
+def work_items_status(project: Optional[Dict[str, Any]]) -> str:
+    """One line for the agents: draft / created work items."""
+    project = project or {}
+    created = project.get("work_items") or {}
+    draft = project.get("work_items_proposal") or {}
+    features = draft.get("features") or []
+    parts = []
+    if draft:
+        parts.append(f"draft with {len(features)} features and {sum(len(f.get('stories') or []) for f in features)} "
+                     f"stories (from PRD v{project.get('work_items_proposal_prd_version') or 0})")
+    if created:
+        parts.append(f"{len(created)} work items created in Azure Boards (reflect PRD v"
+                     f"{project.get('work_items_prd_version') or 0})")
+    return "; ".join(parts) or "none drafted yet"
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +330,8 @@ def describe_workflow_state(state: Dict[str, Any], include_requirements: bool = 
             lines.append(f"pushed_commit: {repository.get('commit_id')} on {repository.get('branch')}")
     else:
         lines.append("repository: none proposed yet")
+    if project.get("ado_project_id"):
+        lines.append(f"azure_boards_work_items: {work_items_status(project)}")
     lines.append(f"document_versions: prd={project.get('prd_version') or 0}, trd={project.get('trd_version') or 0} "
                  f"(trd based on prd {project.get('trd_prd_version') or 0})")
     outdated = outdated_items(state)

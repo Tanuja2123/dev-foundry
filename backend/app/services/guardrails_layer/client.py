@@ -306,6 +306,16 @@ async def check_output_guardrail(
         output_stage = data.get("output") or data
 
         ctx = _get_slm_context()
+
+        # Unknown web links are removed (and logged) instead of blocking the whole reply; dangerous schemes still block
+        url_specs = [g for g in output_stage.get("guardrails", []) if g.get("name") in ("URL Filter", "Restrict URLs")]
+        if url_specs:
+            allow_list = [domain for g in url_specs for key in ("url_allow_list", "allowed_domains")
+                          for domain in (g.get("config") or {}).get(key, [])]
+            text, removed_links = custom_checks.strip_disallowed_links(text, allow_list)
+            if removed_links:
+                logger.warning(f"[Guardrails Audit] Removed {len(removed_links)} link(s) outside the allow list: "
+                               f"{removed_links}")
         sanitized_text = text
 
         if redact_pii and "guardrails" in output_stage:

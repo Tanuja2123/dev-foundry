@@ -264,24 +264,32 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
 
             for idx in candidate_indices:
                 provider = self.providers[idx]
+                provider_messages = messages
+                provider_tokens = None
                 if provider.max_request_tokens:
                     if request_tokens is None:
                         request_tokens = estimate_request_tokens(messages, options)
+                    provider_tokens = request_tokens
                     if request_tokens + MIN_COMPLETION_TOKENS > provider.max_request_tokens:
-                        reason = (f"request ~{request_tokens} tokens + {MIN_COMPLETION_TOKENS} for the answer exceeds its "
-                                  f"{provider.max_request_tokens}-token request limit")
-                        errors.append(f"[{provider.name}]: skipped ({reason})")
-                        logger.info(f"[LLM Fallback] Skipping '{provider.name}': {reason}.")
-                        continue
+                        # Small per-request limit (Groq): send the newest part of the conversation that fits
+                        trimmed = trim_to_request_limit(messages, options, provider.max_request_tokens)
+                        if trimmed is None:
+                            reason = (f"request ~{request_tokens} tokens + {MIN_COMPLETION_TOKENS} for the answer exceeds "
+                                      f"its {provider.max_request_tokens}-token request limit even without history")
+                            errors.append(f"[{provider.name}]: skipped ({reason})")
+                            logger.info(f"[LLM Fallback] Skipping '{provider.name}': {reason}.")
+                            continue
+                        provider_messages = trimmed
+                        provider_tokens = estimate_request_tokens(trimmed, options)
+                        logger.info(f"[LLM Fallback] '{provider.name}': kept the newest {len(trimmed)} of "
+                                    f"{len(messages)} messages (~{provider_tokens} tokens) to fit its request limit")
                 effective_options = dict(options) if options is not None else {}
                 effective_options["model"] = provider.model
 
                 # Protect TPM limits: Groq on-demand counts prompt_tokens + max_tokens against its per-request limit
                 # (8,000 on the free tier). Give the answer all the room that is left; other providers are not capped.
                 if provider.max_request_tokens:
-                    if request_tokens is None:
-                        request_tokens = estimate_request_tokens(messages, options)
-                    safe_max = max(MIN_COMPLETION_TOKENS, provider.max_request_tokens - request_tokens - 100)
+                    safe_max = max(MIN_COMPLETION_TOKENS, provider.max_request_tokens - provider_tokens - 100)
                     req_max = effective_options.get("max_tokens") or effective_options.get("max_completion_tokens") or safe_max
                     effective_options["max_tokens"] = min(req_max, safe_max)
 
@@ -295,7 +303,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
 
                 try:
                     res = provider.client.get_response(
-                        messages=messages,
+                        messages=provider_messages,
                         stream=stream or stream_internally,
                         options=effective_options,
                         compaction_strategy=compaction_strategy,
@@ -365,7 +373,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                     is_primary=True,
                 )
             )
-            logger.info(f"[LLM Config] Configured Primary Provider: Azure OpenAI ({azure_deployment}; "
+            logger.info(f"[LLM Config] Configured provider: Azure OpenAI ({azure_deployment}; "
                         f"timeout {timeout:g}s, retries {retries})")
         except Exception as e:
             logger.warning(f"[LLM Config] Failed to initialize Azure OpenAI client: {e}")
@@ -395,7 +403,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                         max_request_tokens=groq_max_tokens,
                     )
                 )
-                logger.info(f"[LLM Config] Configured Secondary Provider: Groq ({groq_model}; timeout {timeout:g}s, "
+                logger.info(f"[LLM Config] Configured provider: Groq ({groq_model}; timeout {timeout:g}s, "
                             f"retries {retries}, max {groq_max_tokens} tokens per request)")
             except Exception as e:
                 logger.warning(f"[LLM Config] Failed to initialize Groq client ({groq_model}): {e}")
@@ -422,7 +430,7 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                     base_url=maq_base_url,
                 )
             )
-            logger.info(f"[LLM Config] Configured Tertiary Provider: MAQ AI ({maq_model}; timeout {timeout:g}s, "
+            logger.info(f"[LLM Config] Configured provider: MAQ AI ({maq_model}; timeout {timeout:g}s, "
                         f"retries {retries}, streamed: {providers[-1].stream})")
         except Exception as e:
             logger.warning(f"[LLM Config] Failed to initialize MAQ AI client: {e}")
@@ -433,4 +441,35 @@ def create_fallback_client() -> FallbackChatCompletionClient:
             "Please check .env configuration."
         )
 
+    # Fallback order: Azure OpenAI -> MAQ AI -> Groq by default. MAQ AI (131k-token context, no daily quota) takes the
+    # load when Azure is unavailable; Groq (8k tokens per request, 200k per day on the free tier) is the last resort.
+    order = provider_order()
+    providers.sort(key=lambda p: order.index(p.provider_id) if p.provider_id in order else len(order))
+    logger.info("[LLM Config] Fallback order: " + " -> ".join(p.name for p in providers))
     return FallbackChatCompletionClient(providers)
+
+
+DEFAULT_PROVIDER_ORDER = "azure_openai,maq_ai,groq"
+
+
+def provider_order() -> List[str]:
+    """LLM_PROVIDER_ORDER: comma-separated provider ids (azure_openai, maq_ai, groq) in fallback order."""
+    raw = os.getenv("LLM_PROVIDER_ORDER") or DEFAULT_PROVIDER_ORDER
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
+def trim_to_request_limit(messages: Sequence[Message], options: Optional[Mapping[str, Any]],
+                          limit: int) -> Optional[List[Message]]:
+    """
+    The newest messages that fit `limit` tokens (with room for the answer), for providers with a small per-request
+    limit (Groq). The oldest messages go first; the last message (the current request with its workflow context) is
+    always kept. A tool result whose call was dropped is dropped too. None when even the last message does not fit.
+    """
+    kept = list(messages or [])
+    while len(kept) > 1 and estimate_request_tokens(kept, options) + MIN_COMPLETION_TOKENS > limit:
+        kept.pop(0)
+        while len(kept) > 1 and str(getattr(kept[0], "role", "")) in ("tool", "Role.TOOL"):
+            kept.pop(0)
+    if estimate_request_tokens(kept, options) + MIN_COMPLETION_TOKENS > limit:
+        return None
+    return kept

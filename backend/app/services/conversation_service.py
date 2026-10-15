@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -16,15 +17,17 @@ from app.services.agents.requirements_agent import process_uploaded_document, ge
 from app.services.agents.repo_setup_agent import get_repo_setup_agent
 from app.services.mcp.ado_mcp_server import sanitize_ado_project_name
 from app.services import project_store as store
+from app.services import tech_fit
+from app.services.backlog_service import run_backlog_operation
 from app.services.repo_structure import layer_changes, render_structure_tree
 from app.services.scaffold_service import describe_toolchains
 from app.services.workflow_routing import (RoutingDecision, blocked_reply, effective_stage, next_steps,
                                            parse_routing_decision, routing_context, validate_decision,
-                                           apply_intent_rules)
+                                           apply_intent_rules, answers_different_product_question, allowed_operations)
+from app.utils.document_markdown import prd_json_to_markdown, trd_json_to_markdown
 from app.core.logger import logger
 
-from app.services.llm_client import AllProvidersFailedError, create_fallback_client
-from app.services.llm_client import create_fallback_client
+from app.services.llm_client import AllProvidersFailedError, create_fallback_client, estimate_request_tokens
 from app.services.guardrails_layer import (
     check_input_guardrail,
     check_output_guardrail,
@@ -313,6 +316,46 @@ def agent_json_error(text: str) -> Optional[str]:
     return None
 
 
+DEFAULT_TECH_CHANGE_CONFIRM_THRESHOLD = 3.0
+
+
+def tech_change_confirm_threshold() -> float:
+    """How much better (on the agent's 1-10 fit scale) the current technology must fit before a change needs confirmation."""
+    try:
+        return float(os.getenv("TECH_CHANGE_CONFIRM_THRESHOLD") or DEFAULT_TECH_CHANGE_CONFIRM_THRESHOLD)
+    except ValueError:
+        return DEFAULT_TECH_CHANGE_CONFIRM_THRESHOLD
+
+
+def tech_change_needing_confirmation(raw_output: str) -> Optional[Dict]:
+    """
+    The Requirements_Agent's assessment of a requested technology change, when the requested choice fits this project
+    clearly worse than the current one (gap >= threshold) and the user has not confirmed it yet. None otherwise.
+    """
+    data = parse_agent_json(raw_output) or {}
+    assessment = data.get("tech_change_assessment")
+    if data.get("status") != "COMPLETE" or not isinstance(assessment, dict) or assessment.get("user_confirmed") is True:
+        return None
+    try:
+        gap = float(assessment.get("current_fit")) - float(assessment.get("requested_fit"))
+    except (TypeError, ValueError):
+        return None
+    return assessment if gap >= tech_change_confirm_threshold() else None
+
+
+_PROCEED_ON_ASSUMPTIONS = re.compile(
+    r"(make|use|with|go with|fill in)\s+(any\s+|some\s+|reasonable\s+|sensible\s+)*assumptions|"
+    r"assume (the rest|anything|whatever)|just (generate|write|create|draft) (it|the prd)|"
+    r"proceed (anyway|without|with assumptions)|no more questions", re.IGNORECASE)
+
+
+def asked_to_proceed(user_query: str, history: Optional[List[Dict]] = None) -> bool:
+    """True when the user explicitly asked to write the PRD on assumptions (in this message or one of their last
+    three messages, e.g. a description ending "Make reasonable assumptions for anything else.")."""
+    recent_user = [m.get("text") or "" for m in (history or []) if m.get("role") == "user"][-3:]
+    return any(_PROCEED_ON_ASSUMPTIONS.search(text or "") for text in [user_query, *recent_user])
+
+
 def missing_readiness_items(raw_output: str) -> List[str]:
     """R1-R5 items the Requirements_Agent itself marked "missing" in a PRD it nevertheless returned as COMPLETE."""
     data = parse_agent_json(raw_output) or {}
@@ -321,15 +364,21 @@ def missing_readiness_items(raw_output: str) -> List[str]:
         return []
     return sorted(key for key, value in readiness.items() if str(value).strip().lower() == "missing")
 
-def persist_requirements_output(conversation_id: Optional[str], raw_output: str) -> None:
-    """Stores a completed PRD/TRD in the Project row of the conversation."""
+def document_not_saved_message(operation: Optional[str]) -> str:
+    document = "TRD" if "TRD" in (operation or "") else "PRD"
+    return (f"I couldn't save the updated {document} this time, so nothing has changed and the stored {document} is "
+            f"still the current one.\n\n---\n\nPlease ask again in a moment.")
+
+
+def persist_requirements_output(conversation_id: Optional[str], raw_output: str) -> bool:
+    """Stores a completed PRD/TRD in the Project row of the conversation. True when a document was saved."""
     data = parse_agent_json(raw_output)
     if not conversation_id or not data or data.get("status") != "COMPLETE":
-        return
+        return False
     prd = data.get("structured_project_response")
     trd = data.get("technical_requirements_document")
     if not prd and not trd:
-        return
+        return False
     try:
         project = store.ensure_project(conversation_id)
         stage = project.get("workflow_stage") or store.STAGE_REQUIREMENTS
@@ -353,8 +402,10 @@ def persist_requirements_output(conversation_id: Optional[str], raw_output: str)
                 fields["workflow_stage"] = store.STAGE_TRD_REVIEW
         store.update_project(project["project_id"], **fields)
         logger.info(f"[ProjectStore] Saved {', '.join(fields).upper()} for conversation '{conversation_id}'")
+        return True
     except store.StoreError as e:
         logger.error(f"[ProjectStore] Could not save requirements: {e}")
+        return False
 
 def persist_repo_setup_output(conversation_id: Optional[str], raw_output: str) -> None:
     """Stores project/repository proposals from the Repo_Setup_Agent. Created resources are stored by its tools."""
@@ -399,10 +450,16 @@ def follow_up_note(conversation_id: Optional[str]) -> str:
             "instead of moving the workflow forward.")
 
 def _format_commands(commands: List[Dict]) -> str:
+    """The generator steps as run: commands and online initializer requests, with their folder and the version used."""
     lines = []
     for item in commands or []:
         cwd = (item.get("cwd") or ".").strip()
-        lines.append(item.get("command", "") + (f"    # in {cwd}/" if cwd not in ("", ".") else ""))
+        notes = [f"in {cwd}/"] if cwd not in ("", ".") else []
+        if item.get("version"):
+            notes.append(str(item["version"]))
+        if item.get("initializer"):
+            notes.insert(0, f"{item['initializer']} online initializer")
+        lines.append(item.get("command", "") + (f"    # {', '.join(notes)}" if notes else ""))
     return "```bash\n" + "\n".join(lines) + "\n```"
 
 
@@ -427,9 +484,10 @@ def render_structure_for_display(state: Dict) -> Optional[str]:
         changes = layer_changes(scaffold, files)
         notes.update({path: "added" for path in changes["add"]})
         notes.update({path: "edited" for path in changes["edit"]})
-    if commands:
-        parts.append("Generated by running these commands (the files below are their exact output"
-                     + (", plus the changes you asked for" if notes or changes["delete"] else "") + "):")
+    if commands and repository.get("pushed_structure") is not None:
+        # Only once the structure exists in the repository: which commands created it (not shown during the review)
+        parts.append("Created by running these commands (their exact output is the first commit"
+                     + (", followed by the changes you asked for" if notes or changes["delete"] else "") + "):")
         parts.append(_format_commands(commands))
     parts.append(render_structure_tree(files, root_name=repository.get("repo_name"), notes=notes))
     if changes["delete"]:
@@ -442,6 +500,111 @@ def render_structure_for_display(state: Dict) -> Optional[str]:
                      f"then your requested changes ({counts}).")
     return "\n\n".join(parts)
 
+def stored_document_reply(document: Optional[str], workflow_state: Optional[Dict]) -> Optional[str]:
+    """
+    The stored PRD / TRD as a reply, when the user asks to see it. Rendered from the database by code, so the model can
+    never show a document that differs from the saved one. None when there is no such document (the model's reply stays).
+    """
+    project = (workflow_state or {}).get("project") or {}
+    if document == "PRD" and project.get("prd"):
+        body, name = prd_json_to_markdown(project["prd"]), "Product Requirements Document (PRD)"
+        step = ("Tell me what to change in the PRD, or continue with the next step." if project.get("trd") else
+                "Tell me what to change, or ask me to create the TRD when you're ready.")
+        version = project.get("prd_version")
+    elif document == "TRD" and project.get("trd"):
+        body, name = trd_json_to_markdown(project["trd"]), "Technical Requirements Document (TRD)"
+        step = ("Tell me what to change in the TRD, or continue with the next step." if project.get("project_name") else
+                "Tell me what to change, or ask me to proceed with repository setup when you're ready.")
+        version = project.get("trd_version")
+    else:
+        return None
+    label = f" (version {version})" if version else ""
+    return f"Here is the current, suggested **{name}**{label}:\n\n{body.strip()}\n\n---\n\n{step}"
+
+
+GUARDRAIL_ERROR_NAMES = {"ExecutionError", "ConfigError"}
+GUARDRAIL_UNAVAILABLE_MESSAGE = ("The safety check could not run just now, so your message was not processed and nothing "
+                                 "changed. Please try again in a minute.")
+_GUARDRAIL_REASONS = {
+    "Off Topic Prompts": "it doesn't seem related to planning or setting up a software project",
+    "NSFW Text": "it contains inappropriate content",
+}
+
+
+def guardrail_block_message(check: Any) -> str:
+    """User-facing text for a blocked message: short and honest; the details stay in the log."""
+    name = getattr(check, "guardrail_name", None) or ""
+    if name in GUARDRAIL_ERROR_NAMES:          # the guardrail model failed: not the user's fault
+        return GUARDRAIL_UNAVAILABLE_MESSAGE
+    reason = _GUARDRAIL_REASONS.get(name, "it looks like an attempt to change or reveal my instructions")
+    return (f"I can't help with that message because {reason}. I can help you plan software: describe a product, "
+            "ask about your PRD or TRD, or continue with the next step.")
+
+
+def normalize_reply(text: str) -> str:
+    """Models sometimes return escaped line breaks ("\\n") inside the reply; turn them into real ones."""
+    if text and "\\n" in text and text.count("\\n") > text.count("\n"):
+        return text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    return text
+
+
+_BLOCK_START = ("#", "-", "*", "+", "|", "`", ">")
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z\"'“(*_])")
+_ABBREVIATIONS = ("e.g.", "i.e.", "etc.", "vs.", "approx.", "Dr.", "Mr.", "Ms.", "No.")
+# Sentences that invite the user to act: a closing line, not content
+_CLOSING_STARTS = ("please review", "please tell", "please let", "tell me", "let me know", "feel free", "shall i",
+                   "would you", "do you want", "you can now", "when you're ready", "approve ")
+
+
+def _split_sentences(paragraph: str) -> List[str]:
+    """Sentences of one plain paragraph (does not split after e.g. / i.e. / etc.)."""
+    parts: List[str] = []
+    for piece in _SENTENCE_END.split(paragraph.strip()):
+        if parts and parts[-1].endswith(_ABBREVIATIONS):
+            parts[-1] += " " + piece
+        else:
+            parts.append(piece)
+    return [p for p in parts if p]
+
+
+def enforce_closing_line(text: str) -> str:
+    """
+    Every reply ends with a divider and one plain closing sentence. Fixes the common model slips: a trailing divider after
+    the closing sentence, a missing divider, or repeated dividers. Replies ending in a list, table, heading or code are
+    left as they are.
+    """
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", (text or "").strip()) if b.strip()]
+    while blocks and blocks[-1] == "---":
+        blocks.pop()
+    if not blocks:
+        return ""
+    closing = blocks[-1]
+    is_plain = "\n" not in closing and not closing.startswith(_BLOCK_START) and not re.match(r"^\d+\.\s", closing)
+    if not is_plain:
+        return "\n\n".join(blocks)
+    # The closing line is ONE sentence: a final paragraph with several sentences keeps all but the last one in the body
+    # (seen live: a one-paragraph answer ending "If you have a project in mind, just let me know!" had no divider).
+    sentences = _split_sentences(closing)
+    if len(sentences) > 1:
+        blocks[-1:] = [" ".join(sentences[:-1]), sentences[-1]]
+        closing = blocks[-1]
+    if len(blocks) < 2:
+        return "\n\n".join(blocks)
+    body = blocks[:-1]
+    had_divider = bool(body) and body[-1] == "---"
+    while body and body[-1] == "---":
+        body.pop()
+    previous = body[-1] if body else ""
+    previous_is_closing = (bool(previous) and "\n" not in previous and not previous.startswith(_BLOCK_START)
+                           and len(previous) < 300 and len(_split_sentences(previous)) == 1
+                           and (previous.rstrip().endswith("?") or previous.lower().startswith(_CLOSING_STARTS)))
+    if previous_is_closing and (had_divider or closing.lower().startswith(_CLOSING_STARTS)):
+        # two closing lines around the divider (a question or invitation, then another sentence): keep only the first
+        # (seen live: "Please review the name and description ... project." --- "Let me know any adjustments ...")
+        closing = body.pop()
+    return "\n\n".join(body + ["---", closing])
+
+
 def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
     """Replaces the synthesizer's placeholder with the code-rendered tree (appends it if the placeholder is missing)."""
     if not tree_markdown:
@@ -450,11 +613,43 @@ def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
         return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
     return text.rstrip() + "\n\n" + tree_markdown
 
-def compact_history_message(role: str, text: str, max_chars: int = 350) -> Optional[str]:
+DEFAULT_HISTORY_TOKEN_BUDGET = 60_000
+
+
+def history_token_budget() -> int:
     """
-    Compacts past conversation messages to prevent exceeding LLM token and rate limits
-    (e.g. Groq 8000 TPM limit) while preserving essential conversational context.
-    Filters out transient framework error messages so they don't pollute subsequent turns.
+    CHAT_HISTORY_TOKEN_BUDGET: how much of the conversation (in tokens) every agent receives. The default fits the MAQ AI
+    model (131,072-token context) next to the prompts, the stored PRD/TRD/structure and the answer, so a whole project
+    chat is one session for the model. Groq (8,000 tokens per request) gets the newest part that fits (llm_client).
+    """
+    try:
+        return max(2_000, int(os.getenv("CHAT_HISTORY_TOKEN_BUDGET") or DEFAULT_HISTORY_TOKEN_BUDGET))
+    except ValueError:
+        return DEFAULT_HISTORY_TOKEN_BUDGET
+
+
+def history_within_budget(messages: List[Message], budget: Optional[int] = None) -> List[Message]:
+    """The newest messages (in order) whose total size fits the budget; only very long projects lose their oldest
+    messages. The stored PRD/TRD are always added separately, so nothing decided is ever lost."""
+    budget = history_token_budget() if budget is None else budget
+    kept: List[Message] = []
+    total = 0
+    for message in reversed(messages):
+        size = estimate_request_tokens([message], None)
+        if kept and total + size > budget:
+            logger.info(f"[History] Conversation longer than {budget} tokens: sending the newest {len(kept)} of "
+                        f"{len(messages)} messages")
+            break
+        kept.append(message)
+        total += size
+    return list(reversed(kept))
+
+
+def compact_history_message(role: str, text: str, max_chars: Optional[int] = None) -> Optional[str]:
+    """
+    A past message for the LLM context: kept in full (the whole project chat is one session for the model; the size is
+    limited by history_within_budget, never by cutting messages). Transient framework / provider error messages are
+    dropped so they don't pollute later turns. `max_chars` truncates only when explicitly given.
     """
     if not text:
         return None
@@ -464,7 +659,7 @@ def compact_history_message(role: str, text: str, max_chars: int = 350) -> Optio
             or "(Reference: " in text):
         return None
 
-    if len(text) <= max_chars:
+    if max_chars is None or len(text) <= max_chars:
         return text
 
     half = max_chars // 2
@@ -512,6 +707,12 @@ AVAILABLE CHILD AGENTS AND OPERATIONS:
      structure, or bring the structure in line with the latest TRD (STRUCTURE_OUTDATED).
    - PUSH_REPOSITORY_STRUCTURE: push the approved structure to the main branch (explicit approval only); if it was pushed
      before, only the changes are pushed as a follow-up commit.
+3. Backlog_Agent (Azure Boards work items; only once the Azure DevOps project exists, see allowed_operations)
+   - GENERATE_WORK_ITEMS_PROPOSAL: draft the backlog from the PRD (epic, features, one story per requirement with
+     acceptance criteria), or redraft it after the PRD changed (WORK_ITEMS_OUTDATED, "update the work items").
+   - UPDATE_WORK_ITEMS_PROPOSAL: change the draft (rename/merge/split features, reword stories, acceptance criteria).
+   - CREATE_WORK_ITEMS: create / sync the drafted work items in Azure Boards (explicit approval only, e.g. "the work
+     items look good, create them", "yes, create them in Azure Boards").
 
 WORKFLOW STAGES (in order):
 REQUIREMENTS -> PRD_REVIEW -> TRD_REVIEW -> PROJECT_REVIEW -> REPOSITORY_REVIEW -> STRUCTURE_REVIEW -> COMPLETE
@@ -534,6 +735,9 @@ ROUTING RULES:
    - Changes to features, users, roles or flows -> UPDATE_PRD.
    Updating one document never updates the next one automatically: the state block then lists "outdated" items and the
    user is offered to update them.
+   - If your previous reply asked the user to confirm a technology change (it listed fit scores, pros and cons), a
+     confirmation ("yes", "switch anyway", "go ahead with it") is UPDATE_TRD (user_intent change_request); declining ("no",
+     "keep the current one") is respond: confirm that nothing changed.
 3. Outdated items (see "outdated" in the state block) are updated only when the user asks for it:
    - "update the TRD accordingly" (TRD_OUTDATED) -> UPDATE_TRD.
    - project name/description (PROJECT_PROPOSAL_OUTDATED, before creation) -> UPDATE_PROJECT_PROPOSAL;
@@ -553,7 +757,20 @@ ROUTING RULES:
 6. COMPLETE: the structure was pushed. Further structure changes -> UPDATE_REPOSITORY_STRUCTURE (pushed later as a follow-up
    commit after explicit approval); project rename/description -> UPDATE_ADO_PROJECT; otherwise respond directly.
 7. Never "re-push" when nothing changed: if the user asks to push again and the state shows no unpushed changes, respond.
+7b. Work items / backlog / user stories / Azure Boards / sprint planning requests -> Backlog_Agent (rule 3 of the
+   agents list). They never change the workflow stage, so they can be used in any stage once the ADO project exists.
+   Changes to the work items DRAFT are UPDATE_WORK_ITEMS_PROPOSAL, not UPDATE_PRD; a change to the product's features
+   is still UPDATE_PRD (the draft is then flagged as outdated).
 8. Greetings, general questions, status questions, or a request to skip/cancel a step -> respond directly.
+   - A request to see the current PRD or TRD ("where is the PRD?", "show me the TRD") -> respond with show_document
+     "PRD" or "TRD". The system shows the stored document; NEVER write a PRD or TRD yourself in reply.
+   - One chat holds ONE project. If the state block shows that this chat already has a PRD and the user describes a
+     DIFFERENT product (not a change to the current one), set different_product to true (the system then asks whether
+     to start a New Project or replace this PRD). Only if the user explicitly asks to replace the PRD here ->
+     GENERATE_PRD when allowed, otherwise UPDATE_PRD (different_product false).
+     After that question ("Shall I continue with the current project?"), "yes" / "continue" means the CURRENT project:
+     different_product is false and the rest of the message is acted on for the current project (e.g. "yes, create
+     the TRD" -> GENERATE_TRD; a bare "yes" -> respond, confirming you continue and offering its next step).
 9. If you cannot tell whether the user is approving, asking for a change, or asking for the next step, respond with ONE short
    clarifying question instead of delegating.
 
@@ -566,9 +783,10 @@ DECISION FIELDS:
 - action: "delegate" or "respond".
 - agent + operation: required when delegating (operation must be in allowed_operations).
 - reply: required when responding. Friendly, concise Markdown that ends with the clear next step the user can take.
-- title: ONLY for the very first user message of a new conversation (there are no previous messages): your best guess of
-  the project's name in 2-5 words, based on what the user described (e.g. "Clinic Appointment Booking"). Never a
-  placeholder. Otherwise null (later the conversation title follows the project name automatically).
+- show_document: "PRD" or "TRD" only when the user asks to see that document (rule 8); otherwise null.
+- different_product: true only for a different product described in a chat that already has a PRD (rule 8).
+- title: the name of the PRODUCT the user wants to build, in 2-5 words, based on the whole conversation (e.g. "School Management System", "Clinic Appointment Booking"). Null when no specific product has been described yet: greetings, small talk and questions about you ("what can you do?", "what are you up to?", "what kind of name is DevFoundry?") never produce a title. Never the user's own words, never a question, never a placeholder.
+- title_confidence: 0.0-1.0, how clearly the conversation describes ONE specific product (0.0 small talk / questions about DevFoundry, 0.3 vague wish, 0.6 a category without purpose, 0.8 a concrete product, 1.0 a detailed description). The chat is only named from 0.7.
 """
 
         orchestrator = Agent(
@@ -585,22 +803,24 @@ DECISION FIELDS:
         state_note = "\n\n" + routing_context(workflow_state)
 
         # Convert history into Agent Framework Messages with compacting & error filtering
-        message_list = []
-        for msg in history:
-            role = msg.get("role", "user")
-            text = msg.get("text", "")
-            compact_text = compact_history_message(role, text)
-            if compact_text:
-                message_list.append(Message(role=role, contents=[compact_text]))
+        def to_messages(items: List[Dict]) -> List[Message]:
+            converted = []
+            for msg in items:
+                role = msg.get("role", "user")
+                compact_text = compact_history_message(role, msg.get("text", ""))
+                if compact_text:
+                    converted.append(Message(role=role, contents=[compact_text]))
+            return converted
 
         new_msg = Message(role="user", contents=[user_query])
-        message_list.append(new_msg)
+        # The whole project chat is one session for the model, limited only by the token budget (no window)
+        message_list = history_within_budget(to_messages(history)) + [new_msg]
 
         # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
         logger.info(f"[Orchestrator] Running Orchestrator Agent (Provider: {provider_name}, Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
-        # Sliding window for Orchestrator: up to 8 recent history messages + latest query with state
-        recent_orch_history = message_list[-9:-1] if len(message_list) > 1 else []
+        # Orchestrator: the whole conversation (within the token budget) + latest query with state
+        recent_orch_history = message_list[:-1]
         orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
         orchestrator_response = await orchestrator.run(
             messages=orchestrator_messages,
@@ -612,10 +832,31 @@ DECISION FIELDS:
                     f"{decision.agent or ''} {decision.operation or ''} | intent={decision.user_intent}, "
                     f"tech={decision.mentions_technology} | {decision.reasoning}")
 
-        # The model's title guess is only used for a new conversation; afterwards the project name decides the title
-        title_prefix = ""
-        if not history and decision.title and not store.is_placeholder_name(decision.title):
-            title_prefix = f"TITLE: {decision.title.strip()}\n\n"
+        # Emit a title prefix when the model is confident the chat describes a product and no ADO project exists yet
+        has_official_project = bool(((workflow_state or {}).get("project") or {}).get("ado_project_id"))
+        title = None if has_official_project else inferred_title(decision)
+        logger.info(f"[Title] suggestion={decision.title!r} confidence={decision.title_confidence} "
+                    f"-> {'used' if title else 'ignored'} (threshold {title_confidence_threshold()})")
+        title_prefix = f"TITLE: {title}\n\n" if title else ""
+
+        # The user is answering the "different product" question: their answer decides ("yes, create the TRD" means the
+        # current project), so the earlier product description in the history must not trigger the question again.
+        if answers_different_product_question(history):
+            if decision.different_product:
+                logger.info("[Routing Guard] Answer to the different-product question: continuing with the current project")
+                decision.different_product = False
+            if decision.operation not in ("GENERATE_PRD", "UPDATE_PRD") and len(history) >= 2:
+                # Continuing with the current project: the other product's description and the question are not part
+                # of it, so the child agents must not see them (seen live: the TRD agent asked which product to use).
+                message_list = history_within_budget(to_messages(history[:-2])) + [new_msg]
+
+        # "yes, switch anyway" after a technology-change confirmation question is always a TRD update
+        if (tech_fit.is_confirmation_turn(history) and tech_fit.looks_affirmative(user_query)
+                and decision.operation != "UPDATE_TRD" and "UPDATE_TRD" in allowed_operations(stage, workflow_state)):
+            logger.info("[Routing Guard] Confirmation of the technology change -> UPDATE_TRD")
+            decision = RoutingDecision(reasoning="user confirmed the warned technology change", user_intent="change_request",
+                                       mentions_technology=True, action="delegate", agent="Requirements_Agent",
+                                       operation="UPDATE_TRD")
 
         # 2. Workflow guard: the operation must be allowed in the current stage
         corrected = apply_intent_rules(decision, stage, workflow_state)
@@ -632,6 +873,18 @@ DECISION FIELDS:
         operation = decision.operation
         response_text = decision.reply or blocked_reply(stage, "")
 
+        # Technology-change fit check: a dedicated step BEFORE any TRD update (threshold checked in code, question
+        # written by code), so a clearly worse choice is never applied without the user's explicit confirmation.
+        confirmed_request: Optional[str] = None
+        fit_checked = False
+        if route_agent == "Requirements_Agent" and operation == "UPDATE_TRD":
+            fit_checked = True
+            gate_reply, confirmed_request = await tech_fit.gate(client, user_query, history, workflow_state or {})
+            if gate_reply:
+                route_agent = None                      # answered directly below; the TRD is not touched
+                response_text = gate_reply
+                decision.show_document = None
+
         if route_agent == "Requirements_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Requirements_Agent ({operation})")
 
@@ -641,14 +894,25 @@ DECISION FIELDS:
                 workflow_context_note += "\n\n" + store.describe_workflow_state(
                     workflow_state, include_prd=True, include_trd=include_trd
                 )
+            if operation == "GENERATE_PRD" and asked_to_proceed(user_query, history):
+                workflow_context_note += (
+                    "\n[Proceed on assumptions] The user explicitly asked you to make reasonable assumptions: write the "
+                    "PRD now (status COMPLETE), mark gaps \"assumed\" in readiness, list every assumption in "
+                    "\"Assumptions\", and do NOT ask clarifying questions.")
+            if confirmed_request:
+                workflow_context_note += (
+                    "\n[Confirmed technology change] After a fit warning, the user explicitly confirmed this change: "
+                    f"\"{confirmed_request.strip()[:500]}\". Apply it now, set tech_change_assessment.user_confirmed to "
+                    "true, and write the rationale honestly, naming the trade-off the user accepted.")
 
-            # Prepare message list for Requirements_Agent with clear workflow context (sliding window of up to 6 recent messages)
-            recent_req_history = message_list[-7:-1] if len(message_list) > 1 else []
+            # Requirements_Agent: the whole conversation (token budget) + the latest message with its workflow context
+            recent_req_history = message_list[:-1]
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
             req_messages = recent_req_history + [context_user_msg]
 
             # 1. Requirements Agent Input Guardrail Check
-            req_input_check = await check_requirements_agent_input(context_user_msg.text)
+            # Only the user's own words are checked: the appended workflow context (stored PRD/TRD) is system data
+            req_input_check = await check_requirements_agent_input(user_query)
             if not req_input_check.allowed:
                 logger.warning(
                     f"[Requirements_Agent Guardrail Block] Input blocked by '{req_input_check.guardrail_name}': {req_input_check.blocked_reason}"
@@ -657,7 +921,7 @@ DECISION FIELDS:
                     "workflow_stage": "PRD",
                     "status": "CLARIFICATION_REQUIRED",
                     "clarification_questions": [{
-                        "question": f"The requirements request could not be processed due to a security policy violation ({req_input_check.guardrail_name}). Please adjust your request.",
+                        "question": guardrail_block_message(req_input_check),
                         "choices": [],
                         "reason": req_input_check.blocked_reason or "Guardrail violation"
                     }],
@@ -692,7 +956,9 @@ DECISION FIELDS:
                     })
 
             # Readiness guard: a new PRD is only accepted when the agent's own readiness check has no missing item
-            missing = missing_readiness_items(child_raw_json) if operation == "GENERATE_PRD" else []
+            # ...unless the user explicitly asked to proceed on assumptions (then gaps go to "Assumptions", not questions)
+            missing = (missing_readiness_items(child_raw_json)
+                       if operation == "GENERATE_PRD" and not asked_to_proceed(user_query, history) else [])
             if missing:
                 logger.warning(f"[Readiness Guard] PRD written although {', '.join(missing)} missing; asking again")
                 retry_messages = req_messages + [
@@ -722,7 +988,23 @@ DECISION FIELDS:
                 else:
                     logger.error("[JSON Guard] Requirements_Agent output still not valid JSON; nothing was saved")
 
-            persist_requirements_output(conversation_id, child_raw_json)
+            # Second line of defence (the agent's own assessment), only when the dedicated fit check did not run
+            if operation == "UPDATE_TRD" and not fit_checked:
+                assessment = tech_change_needing_confirmation(child_raw_json)
+                if assessment:
+                    logger.info(f"[Tech Change Check] '{assessment.get('requested_change')}' fits worse "
+                                f"({assessment.get('requested_fit')} vs {assessment.get('current_fit')}); asking the user to confirm")
+                    child_raw_json = json.dumps({"status": "CONFIRMATION_REQUIRED", "workflow_stage": "TRD",
+                                                 "tech_change_assessment": assessment})
+
+            saved = persist_requirements_output(conversation_id, child_raw_json)
+            child_status = (parse_agent_json(child_raw_json) or {}).get("status")
+            # Only a SAVED document is ever shown (seen live: a COBOL TRD was displayed but never saved)
+            unsaved_document = (not saved and conversation_id is not None
+                                and child_status not in ("CLARIFICATION_REQUIRED", "CONFIRMATION_REQUIRED"))
+            if unsaved_document:
+                logger.error(f"[ProjectStore] {operation} output was not saved (status={child_status!r}); "
+                             "not showing it")
             follow_ups = follow_up_note(conversation_id)
 
             # 3. Follow-Up Flow: Child Agent -> Orchestrator Synthesizer -> User
@@ -740,14 +1022,22 @@ CASE 1: If status is "CLARIFICATION_REQUIRED":
   "known_so_far" in one short sentence.
 - Present the questions as a numbered list in the given order: the question in **bold**; when it has "choices", list them as
   bullets indented under the question. Do not show the "reason" field verbatim; you may use it to phrase the question clearly.
-- End with: "You can answer in one message (for example "1: ..., 2: ..."), or say **"make reasonable assumptions"** and I'll
-  draft the document with the assumptions clearly listed."
+- Closing sentence: "You can answer in one message (for example "1: ..., 2: ..."), or say **"make reasonable assumptions"** and
+  I'll draft the document with the assumptions clearly listed."
+
+CASE 1b: If status is "CONFIRMATION_REQUIRED" (tech_change_assessment):
+- Say that before changing the TRD you want to double-check: the requested change (requested_change) fits this project less
+  well than the current choice. Nothing has been changed yet.
+- **Fit for this project:** current choice current_fit/10, requested choice requested_fit/10.
+- **Pros of the requested choice** (bulleted list) and **Cons of the requested choice** (bulleted list), from the assessment.
+- **Recommendation:** the recommendation sentence.
+- Closing sentence: ask whether they still want to switch (they can say e.g. "yes, switch anyway") or keep the current choice.
 
 CASE 2: If status is "COMPLETE" and workflow_stage is "PRD" (or contains structured_project_response):
-- Start with ONE introductory sentence before the first heading, e.g. "Here is the **Product Requirements Document (PRD)**
-  based on your project description:" (say "based on the uploaded document" if the requirements came from an attached file).
-  For an updated PRD (change_notes present) say "Here is the **updated Product Requirements Document (PRD)**:" and then
-  summarize what changed in one short "**What changed:**" paragraph based on change_notes.
+- Start with ONE introductory sentence before the first heading, e.g. "Here is the suggested **Product Requirements Document
+  (PRD)** based on your project description:" (say "based on the uploaded document" if the requirements came from an attached
+  file). For an updated PRD (change_notes present) say "Here is the updated, suggested **Product Requirements Document (PRD)**:"
+  and then summarize what changed in one short "**What changed:**" paragraph based on change_notes.
 - Present the complete PRD with a Markdown heading per section, in this order (skip a section only if it is missing):
   * **Objective**, **Problem Statement** (paragraphs)
   * **Target Users**, **Goals** (bulleted lists)
@@ -756,12 +1046,12 @@ CASE 2: If status is "COMPLETE" and workflow_stage is "PRD" (or contains structu
   * **Non-Goals**, **Constraints** (bulleted lists; write "None stated" when empty)
   * **Assumptions** (bulleted list; only when not empty, introduced with "These were assumed - please confirm or correct them:")
   * **Open Questions** (bulleted list; only when not empty, introduced with "Still open - you can answer these anytime:")
-- Naturally offer the next logical workflow step by concluding with:
-  "**Would you like me to create a Technical Requirements Document (TRD) as well?**"
+- Closing sentence: "Would you like me to create the Technical Requirements Document (TRD) next?"
 
 CASE 3: If status is "COMPLETE" and workflow_stage is "TRD" (or contains technical_requirements_document):
-- Start with ONE introductory sentence before the first heading, e.g. "Here is the **Technical Requirements Document (TRD)**
-  based on the approved PRD:" (or "Here is the **updated Technical Requirements Document (TRD)**:" when change_notes is present).
+- Start with ONE introductory sentence before the first heading, e.g. "Here is the suggested **Technical Requirements Document
+  (TRD)** based on the approved PRD:" (or "Here is the updated, suggested **Technical Requirements Document (TRD)**:" when
+  change_notes is present).
 - Present the comprehensive technical stack recommendations using clean Markdown headings:
   * **Frontend Technology Stack** (Framework, Supporting Technologies, Tools & Libraries, Rationale)
   * **Backend Technology Stack** (Language, Framework, API Technologies, Supporting Technologies, Rationale)
@@ -771,8 +1061,10 @@ CASE 3: If status is "COMPLETE" and workflow_stage is "TRD" (or contains technic
 - Under each heading use ONE flat bullet per field, e.g. "- **Framework:** React" and "- **Supporting Technologies:** Redux Toolkit, React Router".
   Do not nest lists. Put the rationale in its own short paragraph starting with "**Rationale:**".
 - If change_notes is present, start with a short "**What changed:**" paragraph based on change_notes (including when nothing needed to change).
-- Conclude by asking if the user would like to make any modifications to these technology choices, or if they are ready to proceed with repository setup.
+- Closing sentence: ask whether they want to change any of these technology choices or proceed with repository setup.
 
+CLOSING RULE (every case): the content ends, then a divider line "---" on its own line, then exactly ONE plain sentence (no
+bullet, no heading, no bold label) telling the user what they can do next. Nothing after that sentence.
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
 Put a blank line before and after every heading, divider (---) and list; never put "---" at the end of a text line.
 {follow_ups}
@@ -783,11 +1075,15 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
-            synthesis_result = await synthesizer_agent.run(
-                messages=[Message(role="user", contents=["Please present this update to the user."])])
-            synth_duration = round((time.time() - synth_start) * 1000, 1)
-            response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
-            logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
+            if unsaved_document:
+                response_text = document_not_saved_message(operation)
+            else:
+                synthesis_result = await synthesizer_agent.run(
+                    messages=[Message(role="user", contents=["Please present this update to the user."])])
+                synth_duration = round((time.time() - synth_start) * 1000, 1)
+                response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
+                response_text = enforce_closing_line(response_text)
+                logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
 
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
@@ -802,8 +1098,8 @@ Put a blank line before and after every heading, divider (---) and list; never p
             if operation in SCAFFOLD_OPERATIONS:
                 workflow_context_note += "\n" + describe_toolchains()
 
-            # Prepare message list for Repo_Setup_Agent with clear workflow context (sliding window of up to 4 recent messages)
-            recent_repo_history = message_list[-5:-1] if len(message_list) > 1 else []
+            # Repo_Setup_Agent: the whole conversation (token budget) + the latest message with its workflow context
+            recent_repo_history = message_list[:-1]
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
             repo_messages = recent_repo_history + [context_user_msg]
 
@@ -841,11 +1137,12 @@ CASE 1: If status is "ERROR":
 - Guide the user on what corrective steps are needed or offer to retry.
 
 CASE 2: If status is "COMPLETE" and workflow_stage is "PROJECT_REVIEW" (or contains project_proposal):
-- Present the proposed Azure DevOps project details using clean Markdown:
-  * **Proposed Project Name**
-  * **Project Description**
-- Explain that this proposal is based on the project requirements and architecture.
-- Clearly invite the user to review: they can request modifications to the name/description or explicitly approve it to proceed with creating the Azure DevOps project.
+- Output exactly two headings and their content, nothing else above or between them (no "Proposed Azure DevOps Project" title,
+  no extra explanation lines):
+  "### Proposed Project Name" followed by the name on its own line, then
+  "### Project Description" followed by the description paragraph.
+- Closing sentence, e.g.: "Please review the name and description and tell me what to change, or approve them to create the
+  Azure DevOps project."
 
 CASE 3: If status is "COMPLETE" and workflow_stage is "PROJECT_CREATED":
 - Announce that the Azure DevOps project has been created successfully!
@@ -854,7 +1151,7 @@ CASE 3: If status is "COMPLETE" and workflow_stage is "PROJECT_CREATED":
   * **Project ID**: [id]
   * **Project URL**: [link](url)
 - Present the next step: the suggested repository name (**Suggested Repository Name**: repository_proposal.repo_name).
-- Conclude by asking: "**Shall I create the repository with this name, or would you prefer a different name?**"
+- Closing sentence: "Shall I create the repository with this name, or would you prefer a different name?"
 
 CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW":
 - Present the **Proposed Repository Name** (repository_proposal.repo_name).
@@ -862,14 +1159,19 @@ CASE 4: If status is "COMPLETE" and workflow_stage is "REPOSITORY_REVIEW":
 
 CASE 5: If status is "COMPLETE" and workflow_stage is "REPOSITORY_CREATED":
 - Announce that the (empty) Azure DevOps Git repository has been created successfully, with **Repository Name**, **Repository ID** and **Repository URL** ([link](url)).
-- Explain in one or two sentences that the starter structure was generated by running the stack's official generator commands
-  (structure.summary), then output the placeholder line (see STRUCTURE RULE). The system shows the exact commands and files.
-- Invite the user to review it: they can approve it to push it to the main branch, ask for specific extra files/folders (pushed
-  as a second commit after the generator output), or ask for a different stack / generator (the structure is regenerated).
+- Explain in one or two sentences that the starter structure was generated with the stack's official tools (structure.summary,
+  in plain words - do NOT mention or list any commands), then output the placeholder line (see STRUCTURE RULE).
+- Closing sentence: they can approve it to push it to the main branch, ask for extra files/folders, or ask for a different stack.
 
 CASE 6: If status is "COMPLETE" and workflow_stage is "STRUCTURE_REVIEW":
 - Briefly state what changed (structure.summary), then output the placeholder line (see STRUCTURE RULE).
 - Invite the user to request further changes or approve pushing it to the main branch.
+
+CASE 6b: If status is "COMPLETE" and workflow_stage is "STRUCTURE_OPTIONS":
+- Explain that the requested stack (requested_stack) cannot be generated on the DevFoundry server right now (reason), so
+  nothing was generated yet (if a repository was just created, say it exists and is still empty).
+- List the options as a numbered list: **label** — description in plain words (do not show commands).
+- Closing sentence: ask the user to choose an option (or name another stack). Do NOT output the structure placeholder line.
 
 CASE 7: If status is "COMPLETE" and workflow_stage is "STRUCTURE_PUSHED":
 - Announce that the approved structure was pushed to the branch, as push.commits describes: one line per commit with its
@@ -883,9 +1185,11 @@ CASE 8: If status is "COMPLETE" and workflow_stage is "ADO_PROJECT_UPDATED":
 
 STRUCTURE RULE (CASES 1, 5, 6, 7):
 - Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs. The system replaces it with
-  the exact stored structure and the commands that generated it (also in CASE 1 when a structure exists).
-- NEVER draw the folder tree, list the files or repeat the generator commands yourself.
+  the exact stored structure (and, once it has been pushed, the commands that created it).
+- NEVER draw the folder tree, list the files or mention / repeat any generator commands yourself.
 
+CLOSING RULE (every case): the content ends, then a divider line "---" on its own line, then exactly ONE plain sentence (no
+bullet, no heading, no bold label) telling the user what they can do next. Nothing after that sentence.
 Do NOT output raw JSON. Output only clean, beautifully formatted Markdown text.
 Put a blank line before and after every heading, divider (---) and list; never put "---" at the end of a text line.
 {follow_ups}
@@ -900,11 +1204,20 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
-            response_text = insert_structure_tree(response_text, structure_tree)
+            response_text = enforce_closing_line(insert_structure_tree(response_text, structure_tree))
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
+
+        elif route_agent == "Backlog_Agent":
+            logger.info(f"[Routing Decision] -> Delegating to Backlog_Agent ({operation})")
+            response_text = enforce_closing_line(await run_backlog_operation(
+                client, operation, user_query, message_list, workflow_state or {}))
 
         else:
             logger.info("[Routing Decision] -> Handled directly by Orchestrator (Path A Generic/Conversational)")
+            stored_document = stored_document_reply(decision.show_document, workflow_state)
+            if stored_document:
+                logger.info(f"[Routing Decision] Showing the stored {decision.show_document}")
+            response_text = enforce_closing_line(stored_document or normalize_reply(response_text))
 
         return title_prefix + response_text
 
@@ -938,42 +1251,111 @@ def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
         return []
 
 DEFAULT_TITLE = "New Project"
-DEFAULT_TITLES = {"new project", "new conversation", "new chat", ""}
+DEFAULT_TITLES = {"new project", "new conversation", "new chat", "untitled", ""}
+
+_GREETING_PATTERN = re.compile(
+    r"^[\s!.,?:;\"'`~-]*(hi+|hello+|hey+|heyy+|heya+|hiya+|greetings|good\s+(morning|afternoon|evening|day)|"
+    r"howdy|sup|yo|what'?s\s+up|how\s+are\s+you|test|testing)[\s!.,?:;\"'`~-]*$",
+    re.IGNORECASE,
+)
+
+
+def is_conversational_or_greeting(text: Optional[str]) -> bool:
+    """True if text is empty, a casual greeting, or pleasantry that should never become a project title."""
+    val = (text or "").strip()
+    if not val:
+        return False
+    return bool(_GREETING_PATTERN.match(val))
 
 
 def _title_from_query(user_query: str) -> Optional[str]:
-    """Fallback title from the first words of the user's first message (used when the model gave none)."""
+    """The title older versions derived from the first words of the user's message (now only used to recognise and
+    replace such titles; a message is never turned into a title any more)."""
     first_line = (user_query.split("[Attached File Content]")[0].strip().split("\n") or [""])[0].strip()
-    title = " ".join(first_line.split()[:5])
+    if is_conversational_or_greeting(first_line):
+        return None
+    words = first_line.split()
+    if len(words) < 2 and len(first_line) < 5:
+        return None
+    title = " ".join(words[:5])
     if len(title) > 36:
         title = title[:33] + "..."
     return title or None
 
 
-def resolve_conversation_title(current_title: Optional[str], llm_title: Optional[str], user_query: str,
-                               project_name: Optional[str]) -> str:
+DEFAULT_TITLE_CONFIDENCE_THRESHOLD = 0.7
+
+
+def title_confidence_threshold() -> float:
+    """How sure the Orchestrator must be that the chat describes a specific product before it names the chat."""
+    try:
+        return float(os.getenv("TITLE_CONFIDENCE_THRESHOLD") or DEFAULT_TITLE_CONFIDENCE_THRESHOLD)
+    except ValueError:
+        return DEFAULT_TITLE_CONFIDENCE_THRESHOLD
+
+
+def inferred_title(decision: Any) -> Optional[str]:
+    """The Orchestrator's product name for the chat, only when it is confident enough (never a placeholder)."""
+    title = (getattr(decision, "title", None) or "").strip()
+    try:
+        confidence = float(getattr(decision, "title_confidence", 0) or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence > 1:                      # tolerate a 0-10 or 0-100 scale
+        confidence = confidence / 10 if confidence <= 10 else confidence / 100
+    if not title or store.is_placeholder_name(title) or confidence < title_confidence_threshold():
+        return None
+    return title
+
+
+def resolve_conversation_title(current_title: Optional[str], llm_title: Optional[str], first_user_message: str,
+                               official_name: Optional[str]) -> str:
     """
     The conversation (sidebar) title:
-    1. Once the project has a name (proposed, created or renamed), the title is always that name.
-    2. Before that, a new conversation gets the model's best guess of the project name from the first message
-       (or the first words of the conversation's first message); later messages don't change it.
-    Placeholder values ("placeholder", "<project name>", "TBD"...) are never used.
+    1. Once the Azure DevOps project is created (the name the user finalized), the title is ALWAYS that name, and it
+       follows every rename of the project.
+    2. Before that, the Orchestrator's name for the product (e.g. "School Management System"), which it only returns once
+       the chat clearly describes a product (title_confidence >= TITLE_CONFIDENCE_THRESHOLD). It replaces only a
+       temporary title: the default, a placeholder, a greeting, or one copied from the first message by older versions.
+    3. Otherwise "New Project". The user's own words never become the title.
     """
-    if not store.is_placeholder_name(project_name):
-        return project_name.strip()
+    if not store.is_placeholder_name(official_name):
+        return official_name.strip()
+
     current = (current_title or "").strip()
-    if current.lower() in DEFAULT_TITLES or store.is_placeholder_name(current):
-        if not store.is_placeholder_name(llm_title):
-            return llm_title.strip()
-        fallback = _title_from_query(user_query)
-        if not store.is_placeholder_name(fallback):
-            return fallback
-        return DEFAULT_TITLE
-    return current
+    is_transient = (
+        not current
+        or current.lower() in DEFAULT_TITLES
+        or store.is_placeholder_name(current)
+        or is_conversational_or_greeting(current)
+        or current == _title_from_query(first_user_message or "")
+    )
+    if not store.is_placeholder_name(llm_title) and is_transient:
+        return llm_title.strip()
+    return DEFAULT_TITLE if is_transient else current
+
+
+_conversation_locks: Dict[str, asyncio.Lock] = {}
 
 
 async def process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None,
                                *, user_id: str) -> ChatResponse:
+    """
+    Different conversations run in parallel. Requests for the SAME conversation run one after another, because each
+    reads the conversation history and writes it back (two at once would lose a message).
+    """
+    key = str(conversation_id or "").strip()
+    if not key or key.lower() in ("null", "none"):
+        return await _process_chat_request(conversation_id, user_query, file, user_id=user_id)
+    lock = _conversation_locks.setdefault(key, asyncio.Lock())
+    if lock.locked():
+        logger.info(f"[Conversation] '{key}' is busy with another message; this one waits for it")
+    async with lock:
+        return await _process_chat_request(conversation_id, user_query, file, user_id=user_id)
+
+
+async def _process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None,
+                                *, user_id: str) -> ChatResponse:
     overall_start = time.time()
 
     # If conversation_id is not provided, create a new conversation for this initial message
@@ -1005,10 +1387,7 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
         logger.warning(
             f"[Orchestrator Guardrail Block] User input blocked by '{input_check.guardrail_name}': {input_check.blocked_reason}"
         )
-        friendly_error = (
-            f"Your request could not be processed because it violates our safety policy "
-            f"({input_check.guardrail_name}). Please adjust your message and try again."
-        )
+        friendly_error = guardrail_block_message(input_check)
         content_array.append({"role": "user", "text": user_query})
         content_array.append({"role": "assistant", "text": friendly_error})
         supabase = get_supabase_client()
@@ -1032,6 +1411,7 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
             f"[Orchestrator Guardrail Block] Synthesized response blocked by '{output_check.guardrail_name}': {output_check.blocked_reason}"
         )
         response_text = (
+            GUARDRAIL_UNAVAILABLE_MESSAGE if output_check.guardrail_name in GUARDRAIL_ERROR_NAMES else
             "I apologize, but the generated response was blocked by our security and safety filters. "
             "Please try rephrasing your request."
         )
@@ -1051,8 +1431,9 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
         logger.debug(f"[Supabase] Project check skipped: {e}")
     current_title = conv.get("title") or DEFAULT_TITLE
     first_user_message = next((m.get("text") or "" for m in content_array if m.get("role") == "user"), user_query)
-    new_title = resolve_conversation_title(current_title, llm_title, first_user_message,
-                                           (project_row or {}).get("project_name"))
+    # The project name becomes the title once the user approved it and the Azure DevOps project exists
+    official_name = (project_row or {}).get("project_name") if (project_row or {}).get("ado_project_id") else None
+    new_title = resolve_conversation_title(current_title, llm_title, first_user_message, official_name)
     if new_title != current_title:
         try:
             get_supabase_client().table("Conversation").update({"title": new_title}).eq("conv_id", conversation_id).execute()
