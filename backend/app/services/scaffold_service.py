@@ -25,6 +25,7 @@ from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from app.core.logger import logger
+from app.services import progress
 from app.services.mcp.ado_git_push import AdoPushError, Base64Content, MAX_FILE_BYTES, MAX_FILES
 from app.services.repo_structure import normalize_structure
 from app.services.scaffold_catalog import (ALLOWED_COMMANDS, COMPOSER_PACKAGES, DEFAULT_ALLOWED_PACKAGES, EXTRA_ENV,
@@ -425,6 +426,7 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
             cwd = os.path.join(workspace, *([] if command.cwd == "." else command.cwd.split("/")))
             os.makedirs(cwd, exist_ok=True)
             logger.info(f"[Scaffold] Running `{' '.join(args)}` in /{'' if command.cwd == '.' else command.cwd}")
+            progress.detail(f"Running `{' '.join(args)[:120]}`")
             try:
                 proc = subprocess.run([_resolve_executable(args[0]), *args[1:]], cwd=cwd, env=env, shell=False,
                                       stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",

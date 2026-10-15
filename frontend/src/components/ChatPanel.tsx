@@ -13,21 +13,25 @@ import {
 import { ACCEPTED_REQUIREMENT_FILES } from '../constants'
 import type { ChatMessage, Project, Suggestion } from '../types'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import { getChatProgress, type ChatProgress } from '../api/chat'
 
 // The input grows with its content up to this height, then scrolls.
 const COMPOSER_MAX_HEIGHT = 280
 // Show the "Jump to latest" button once the user is this far (px) above the bottom of the chat.
 const JUMP_TO_LATEST_THRESHOLD = 240
 
+// Shown until the backend reports the real step (GET /api/chat/progress/{id})
 function pendingStatus(seconds: number) {
   if (seconds < 4) return 'Understanding your request'
   if (seconds < 12) return 'Coordinating with specialist agents'
-  if (seconds < 30) return 'Preparing the response'
-  return 'Still working, Azure DevOps steps can take up to a minute'
+  return 'Working on it'
 }
 
-function PendingResponse() {
+const PROGRESS_POLL_MS = 2000
+
+function PendingResponse({ conversationId }: { conversationId?: string }) {
   const [elapsed, setElapsed] = useState(0)
+  const [progress, setProgress] = useState<ChatProgress | null>(null)
 
   useEffect(() => {
     const started = Date.now()
@@ -36,6 +40,30 @@ function PendingResponse() {
     }, 1000)
     return () => window.clearInterval(timer)
   }, [])
+
+  // The real step ("Writing the TRD", "Running `npx create-vite`…"), polled while the reply is on its way
+  useEffect(() => {
+    if (!conversationId) return
+    const controller = new AbortController()
+    let stopped = false
+    const poll = async () => {
+      try {
+        const current = await getChatProgress(conversationId, controller.signal)
+        if (!stopped && current.running) setProgress(current)
+      } catch {
+        // progress is best effort: keep the generic status
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), PROGRESS_POLL_MS)
+    return () => {
+      stopped = true
+      controller.abort()
+      window.clearInterval(timer)
+    }
+  }, [conversationId])
+
+  const status = progress?.step || pendingStatus(elapsed)
 
   return (
     <article className="bubble bubble-assistant bubble-pending" role="status" aria-live="polite">
@@ -48,9 +76,10 @@ function PendingResponse() {
           <span />
           <span />
         </span>
-        <span className="pending-status">{pendingStatus(elapsed)}…</span>
+        <span className="pending-status">{status}…</span>
         <span className="pending-elapsed">{elapsed}s</span>
       </div>
+      {progress?.detail && <div className="pending-detail">{progress.detail}</div>}
     </article>
   )
 }
@@ -200,7 +229,7 @@ export function ChatPanel({
             )
           })
         )}
-        {sending && <PendingResponse />}
+        {sending && <PendingResponse conversationId={project.id || undefined} />}
         <div ref={messagesEndRef} />
         </div>
         {showJumpToLatest && (

@@ -276,6 +276,20 @@ def test_create_stores_the_items_and_marks_the_draft_synced(db, monkeypatch):
     assert [s["label"] for s in wr.next_steps(_state())] == ["Create work items"]
 
 
+def test_creating_again_says_nothing_was_created():
+    # seen live: "Create the work items again" -> "(0 created, 19 unchanged)" read as if they had been created
+    backlog, _ = ado_boards.normalize_backlog(DRAFT, PRD)
+    result = {"status": "success", "items": {"EPIC": {"id": 1}}, "created": [], "updated": [],
+              "unchanged": ["EPIC", "F1"], "not_in_prd": [], "types": {}, "backlog_url": "https://b"}
+    reply = backlog_service.render_create_reply(backlog, result)
+    assert reply.startswith("These work items already exist in Azure Boards and match the current draft, so nothing "
+                            "was created again (no duplicates).")
+    assert "The work items are in Azure Boards" not in reply
+    result.update(created=["F2"])                                        # something new -> the usual summary
+    assert backlog_service.render_create_reply(backlog, result).startswith(
+        "The work items are in Azure Boards (1 created, 2 unchanged)")
+
+
 def test_partial_creation_is_kept_but_not_marked_synced(db, monkeypatch):
     store.update_project(store.get_project(CONV)["project_id"], work_items_proposal=DRAFT)
     monkeypatch.setattr(ado_boards, "create_work_items", lambda project, b, existing: {

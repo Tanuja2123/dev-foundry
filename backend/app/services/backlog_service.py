@@ -151,6 +151,9 @@ def render_create_reply(backlog: Dict[str, Any], result: Dict[str, Any]) -> str:
         error = result.get("error") or {}
         parts.append(f"Some work items could not be created ({summary} so far): {error.get('message')} Ask me to "
                      "create the work items again to continue; the ones already created will not be duplicated.")
+    elif not created and not updated:
+        parts.append(f"These work items already exist in Azure Boards and match the current draft, so nothing was "
+                     f"created again (no duplicates). [Open the backlog]({result.get('backlog_url')})")
     else:
         parts.append(f"The work items are in Azure Boards ({summary}): one {names['epic']}, "
                      f"{names['feature']}s and one {names['story']} per requirement, with acceptance criteria. "

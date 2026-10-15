@@ -45,14 +45,19 @@ Then fill in `.env`:
 | `LOCAL_SLM_MODEL` | Local SLM model name (default: `qwen-3.8-27b`) | Optional |
 | `GUARDRAILS_API_KEY` | Guardrails SLM API key (defaults to `LOCAL_SLM_API_KEY` / `MAQ_AI_API_KEY`) | Optional |
 | `GUARDRAILS_BASE_URL` | Guardrails SLM endpoint (default: `https://llm.maqsoftware.net/v1`) | Optional |
-| `GUARDRAILS_MODEL` | Guardrails SLM model name (default: `qwen-3.8-27b`) | Optional |
+| `GUARDRAILS_MODEL` | Guardrails model name (default: `qwen-3.8-27b`). It replaces the model written in the guardrail config files, so a local Ollama model works (e.g. `qwen2.5:3b` with `GUARDRAILS_BASE_URL=http://localhost:11434/v1` and `GUARDRAILS_API_KEY=ollama`). The connection is an Agent Framework `OpenAIChatCompletionClient` | Optional |
 | `GUARDRAILS_ALLOWED_DOMAINS` | Comma-separated domain allowlist for URL filter | Optional |
 | `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
 | `LLM_PROVIDER_ORDER` | Fallback order of the LLM providers (default `azure_openai,maq_ai,groq`): MAQ AI takes the load when Azure is unavailable, Groq (small free-tier quotas) is the last resort | Optional |
 | `MAQ_AI_API_KEY` / `MAQ_AI_BASE_URL` / `MAQ_AI_MODEL` | First fallback (internal SLM gateway, `qwen-3.8-27b`, 131k-token context). Requests are streamed so slow answers are not cut off by the gateway's 120 s limit | Optional |
-| `GROQ_API_KEY` / `GROQ_MODEL` | Last fallback. `GROQ_MODEL` may list several models, tried in order (default `openai/gpt-oss-20b,openai/gpt-oss-120b`; each has its own free-tier quota) | Optional |
+| `GROQ_API_KEY` / `GROQ_API_KEY_2`… | One or more Groq keys (comma separated, or `GROQ_API_KEY_2`, `_3`…). Each key is a separate Groq account with its own free quotas; when one is used up, requests move to the next key, then to MAQ AI | Optional |
+| `GUARDRAILS_PROVIDER_ORDER` / `GUARDRAILS_GROQ_MODELS` | Models for the guardrail checks: default Groq `qwen/qwen3.8-27b` (one per key, ~0.5 s per check) then MAQ AI. Jailbreak / prompt-injection checks must run on one of them; NSFW / off-topic are skipped (logged) if none answers | Optional |
+| `GROQ_API_KEY` / `GROQ_MODEL` | Groq models. `GROQ_MODEL` may list several models, tried in order (default `openai/gpt-oss-20b,openai/gpt-oss-120b`; each has its own free-tier quota) | Optional |
+| `ORCHESTRATOR_PROVIDER_ORDER` | Provider order for the Orchestrator's routing decision only (default `azure_openai,groq,maq_ai`: a small, fast call; the agents keep `LLM_PROVIDER_ORDER`) | Optional |
+| `GUARDRAILS_TIMEOUT_SECONDS` | Time limit per guardrail model call (default `30`, no retries). If the guardrail model is unavailable, the main input check blocks with a "try again" message; the secondary requirements checks are skipped (logged) | Optional |
 | `CHAT_HISTORY_TOKEN_BUDGET` | How much of the conversation every agent receives (default `60000` tokens). Messages are never cut; the whole project chat is one session for the model, and only very long projects drop their oldest messages (the stored PRD/TRD are always included) | Optional |
-| `<PROVIDER>_TIMEOUT_SECONDS` / `<PROVIDER>_MAX_RETRIES` | Per-provider limits, `<PROVIDER>` = `AZURE_OPENAI` (120 s, 1 retry), `GROQ` (60 s, 2), `MAQ_AI` (900 s, 0). `GROQ_MAX_REQUEST_TOKENS` (8000): for larger requests Groq gets the newest messages that fit | Optional |
+| `STREAM_STALL_SECONDS` | A streamed MAQ AI answer that produces no new text for this long is stopped and the next provider is tried (default `120`) | Optional |
+| `<PROVIDER>_TIMEOUT_SECONDS` / `<PROVIDER>_MAX_RETRIES` | Per-provider limits, `<PROVIDER>` = `AZURE_OPENAI` (120 s, 1 retry), `GROQ` (60 s, 0), `MAQ_AI` (600 s for the whole answer, 0). `GROQ_MAX_REQUEST_TOKENS` (8000): for larger requests Groq gets the newest messages that fit | Optional |
 | `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project, code and work items read & write scopes | Yes (for ADO project, repo and work item creation) |
 
 > **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  

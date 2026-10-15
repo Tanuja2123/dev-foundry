@@ -40,6 +40,8 @@ app = FastAPI(
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api/chat/progress/"):       # polled every 2 s while a chat runs: not logged
+        return await call_next(request)
     start_time = time.time()
     logger.info(f"--> [API] {request.method} {request.url.path}")
     response = await call_next(request)

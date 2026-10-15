@@ -156,6 +156,18 @@ def test_chats_run_in_parallel_but_one_chat_runs_its_messages_in_order(monkeypat
     assert events.index("start b:3") < events.index("end a:1")          # other chat: in parallel
 
 
+def test_a_reply_that_does_not_show_the_saved_document_is_replaced():
+    meta = "Please share the update you'd like me to present, and I'll format it as a clear user-facing message."
+    assert not cs.presents_document(meta)
+    shown = cs.stored_document_reply("TRD", {"project": {"prd": PRD, "trd": TRD, "trd_version": 1}})
+    assert not cs.presents_document(shown) or "Technical Requirements Document" in shown
+    long_doc = "Here is the suggested **Technical Requirements Document (TRD)**:\n\n" + "\n".join(
+        f"- **Field {i}:** value with enough words to look like a document section" for i in range(12))
+    assert cs.presents_document(long_doc)
+    import inspect
+    assert "presents_document(response_text)" in inspect.getsource(cs._execute_agent_pipeline)
+
+
 def test_history_is_sent_in_full_within_a_token_budget():
     from agent_framework import Message
     long_message = "Build a clinic app. " + "Patients book appointments and receptionists manage schedules. " * 30

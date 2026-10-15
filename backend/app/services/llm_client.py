@@ -9,6 +9,7 @@ from agent_framework import Message
 from agent_framework.openai import OpenAIChatCompletionClient
 from agent_framework._types import ChatResponse, ResponseStream, ChatResponseUpdate
 from app.core.logger import logger
+from app.services import progress
 
 
 # Per-provider HTTP limits. Without them the OpenAI SDK waits up to 600 s per attempt and retries twice, honouring a
@@ -17,18 +18,22 @@ from app.core.logger import logger
 PROVIDER_LIMIT_DEFAULTS = {
     # provider_id: (env prefix, read timeout seconds, retries after the first attempt)
     "azure_openai": ("AZURE_OPENAI", 120.0, 1),
-    "groq": ("GROQ", 60.0, 2),          # 429 per-minute limits ask for waits of a few seconds: cheap to retry
-    # The SLM can be slow: allow 15 minutes. Its gateway sits behind Cloudflare, which aborts a request after 120 s
-    # without any response bytes (HTTP 524), so MAQ AI requests are streamed (see STREAMING_PROVIDERS) - tokens keep
-    # the connection alive however long the answer takes. No automatic retry: a retry would start over from scratch.
-    "maq_ai": ("MAQ_AI", 900.0, 0),
+    # No SDK retries: a 429 (per-minute or daily quota) moves straight to the next model / key / provider and pauses
+    # that model until its quota resets (see _rate_limit_wait), instead of waiting 17-34 s (seen live).
+    "groq": ("GROQ", 60.0, 0),
+    # The SLM can be slow: allow 10 minutes for the WHOLE answer (enforced by read_stream_with_watchdog, which also
+    # gives up after STREAM_STALL_SECONDS without new text). Its gateway sits behind Cloudflare, which aborts a request
+    # after 120 s without any response bytes (HTTP 524), so MAQ AI requests are streamed (see STREAMING_PROVIDERS).
+    # No automatic retry: a retry would start over from scratch.
+    "maq_ai": ("MAQ_AI", 600.0, 0),
 }
 STREAMING_PROVIDERS = {"maq_ai"}          # disable with MAQ_AI_STREAM=false
 CONNECT_TIMEOUT_SECONDS = 10.0
 
 # Groq's free tier allows 8,000 tokens per request (prompt + completion) and per minute, per model. Requests that
 # cannot fit are skipped instead of being sent and rejected with HTTP 413. Override with GROQ_MAX_REQUEST_TOKENS.
-DEFAULT_GROQ_MODELS = "openai/gpt-oss-20b,openai/gpt-oss-120b"
+# Each model has its own free quota (8k tokens/min, 200k/day, 1k requests/day); qwen3.8-27b is the model MAQ AI runs.
+DEFAULT_GROQ_MODELS = "openai/gpt-oss-20b,qwen/qwen3.8-27b,openai/gpt-oss-120b"
 DEFAULT_GROQ_MAX_REQUEST_TOKENS = 8000
 MIN_COMPLETION_TOKENS = 1000
 
@@ -131,6 +136,60 @@ def load_environment():
     load_dotenv(override=True)
 
 
+# Quota pauses shared by every client in this process (clients are created per request): quota_key -> paused until
+_QUOTA_PAUSED_UNTIL: Dict[str, float] = {}
+DEFAULT_RATE_LIMIT_PAUSE_SECONDS = 60.0
+
+
+def _rate_limit_wait(exc: Exception) -> Optional[float]:
+    """Seconds until a rate-limited (HTTP 429) model can be used again; None if the error is not a rate limit."""
+    import re
+    text = " ".join(str(exc).split())
+    response = getattr(exc, "response", None)
+    status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+    if status != 429 and "429" not in text and "rate limit" not in text.lower():
+        return None
+    headers = getattr(response, "headers", None) or {}
+    for name in ("retry-after", "x-ratelimit-reset-tokens", "x-ratelimit-reset-requests"):
+        value = headers.get(name) if hasattr(headers, "get") else None
+        seconds = _duration_seconds(value) if value else None
+        if seconds:
+            return seconds
+    match = re.search(r"try again in ((?:\d+h)?(?:\d+m)?[\d.]+s|\d+m|\d+h)", text)
+    return (_duration_seconds(match.group(1)) if match else None) or DEFAULT_RATE_LIMIT_PAUSE_SECONDS
+
+
+def _duration_seconds(value: str) -> Optional[float]:
+    """'20m16.9s' / '7.2s' / '120' / '1h2m' -> seconds."""
+    import re
+    value = str(value).strip()
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    parts = re.findall(r"([\d.]+)(h|ms|m|s)", value)
+    if not parts:
+        return None
+    factor = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+    return sum(float(number) * factor[unit] for number, unit in parts)
+
+
+def groq_api_keys() -> List[str]:
+    """
+    Groq API keys in order: GROQ_API_KEY (one key, or several separated by commas) followed by GROQ_API_KEY_2,
+    GROQ_API_KEY_3, ... Each key is a separate Groq account with its own free quotas; when the first account's quota
+    is used up, requests move on to the next account automatically. Duplicates are ignored.
+    """
+    keys = [k.strip() for k in (os.getenv("GROQ_API_KEY") or "").split(",") if k.strip()]
+    for index in range(2, 10):
+        keys += [k.strip() for k in (os.getenv(f"GROQ_API_KEY_{index}") or "").split(",") if k.strip()]
+    return list(dict.fromkeys(keys))
+
+
+def pause_seconds_left(quota_key: str) -> float:
+    return max(0.0, _QUOTA_PAUSED_UNTIL.get(quota_key, 0.0) - time.time())
+
+
 class ProviderSpec:
     """Represents a configured LLM provider in the fallback hierarchy."""
 
@@ -143,8 +202,10 @@ class ProviderSpec:
         base_url: Optional[str] = None,
         is_primary: bool = False,
         max_request_tokens: Optional[int] = None,
+        quota_key: Optional[str] = None,
     ):
         self.provider_id = provider_id
+        self.quota_key = quota_key or f"{provider_id}:{model}"     # one quota per account (API key) and model
         self.name = name
         self.client = client
         self.model = model
@@ -264,6 +325,17 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
 
             for idx in candidate_indices:
                 provider = self.providers[idx]
+                paused = pause_seconds_left(provider.quota_key)
+                if paused:
+                    errors.append(f"[{provider.name}]: skipped (quota exhausted, resets in {paused:.0f}s)")
+                    logger.info(f"[LLM Fallback] Skipping '{provider.name}': quota exhausted, resets in {paused:.0f}s.")
+                    groq = [p for p in self.providers if p.provider_id == "groq"]
+                    if provider.provider_id == "groq" and groq and all(pause_seconds_left(p.quota_key) for p in groq):
+                        soonest = min(pause_seconds_left(p.quota_key) for p in groq)
+                        logger.warning(f"[LLM Quota] Every Groq key/model is out of quota (first one back in "
+                                       f"{soonest / 60:.0f} min). Requests use MAQ AI meanwhile; add another key as "
+                                       "GROQ_API_KEY_2 in .env for more Groq capacity.")
+                    continue
                 provider_messages = messages
                 provider_tokens = None
                 if provider.max_request_tokens:
@@ -300,6 +372,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                     f"MaxTokens: {effective_options.get('max_tokens')}{', streamed' if stream_internally else ''})..."
                 )
                 started = time.time()
+                progress.detail(f"Using {provider.name}")
 
                 try:
                     res = provider.client.get_response(
@@ -315,7 +388,9 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                     if asyncio.iscoroutine(res):
                         res = await res
                     if stream_internally:
-                        res = await res.get_final_response()
+                        res = await read_stream_with_watchdog(res, provider)
+                    if is_empty_response(res):
+                        raise RuntimeError("empty response (no text and no tool call)")
                     logger.info(f"[LLM Dispatch] '{provider.name}' answered in {time.time() - started:.1f}s")
 
                     provider.mark_success()
@@ -326,6 +401,11 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                 except Exception as exc:
                     err_summary = _short_error(exc)
                     provider.mark_failed(exc)
+                    wait = _rate_limit_wait(exc)
+                    if wait:
+                        _QUOTA_PAUSED_UNTIL[provider.quota_key] = time.time() + wait
+                        logger.warning(f"[LLM Fallback] '{provider.name}' rate limited: paused for {wait:.0f}s, "
+                                       "moving on without waiting")
                     errors.append(f"[{provider.name}] after {time.time() - started:.1f}s: {err_summary}")
                     logger.warning(
                         f"[LLM Fallback] Provider '{provider.name}' failed after {time.time() - started:.1f}s "
@@ -343,8 +423,9 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
         return _execute_with_fallback()
 
 
-def create_fallback_client() -> FallbackChatCompletionClient:
-    """Builds the configured FallbackChatCompletionClient according to available environment variables."""
+def create_fallback_client(order: Optional[List[str]] = None) -> FallbackChatCompletionClient:
+    """Builds the configured FallbackChatCompletionClient according to available environment variables.
+    `order` overrides the provider order (default: LLM_PROVIDER_ORDER)."""
     load_environment()
     providers: List[ProviderSpec] = []
 
@@ -378,13 +459,13 @@ def create_fallback_client() -> FallbackChatCompletionClient:
         except Exception as e:
             logger.warning(f"[LLM Config] Failed to initialize Azure OpenAI client: {e}")
 
-    # 2. Secondary: Groq (GROQ_MODEL may list several models, comma separated, tried in order)
-    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    # 2. Groq: every API key (= one Groq account, own quotas) x every model (own quota per model), tried in order
     groq_base_url = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").strip()
     groq_models = [m.strip() for m in (os.getenv("GROQ_MODEL", "") or DEFAULT_GROQ_MODELS).split(",") if m.strip()]
     groq_max_tokens = _env_int("GROQ_MAX_REQUEST_TOKENS", DEFAULT_GROQ_MAX_REQUEST_TOKENS) or None
 
-    if groq_key:
+    for key_index, groq_key in enumerate(groq_api_keys()):
+        account = "" if key_index == 0 else f"#{key_index + 1} "
         for groq_model in dict.fromkeys(groq_models):
             try:
                 client = OpenAIChatCompletionClient(
@@ -396,14 +477,15 @@ def create_fallback_client() -> FallbackChatCompletionClient:
                 providers.append(
                     ProviderSpec(
                         provider_id="groq",
-                        name=f"Groq ({groq_model.split('/')[-1]})",
+                        name=f"Groq {account}({groq_model.split('/')[-1]})",
                         client=client,
                         model=groq_model,
                         base_url=groq_base_url,
                         max_request_tokens=groq_max_tokens,
+                        quota_key=f"groq:{key_index}:{groq_model}",
                     )
                 )
-                logger.info(f"[LLM Config] Configured provider: Groq ({groq_model}; timeout {timeout:g}s, "
+                logger.info(f"[LLM Config] Configured provider: Groq {account}({groq_model}; timeout {timeout:g}s, "
                             f"retries {retries}, max {groq_max_tokens} tokens per request)")
             except Exception as e:
                 logger.warning(f"[LLM Config] Failed to initialize Groq client ({groq_model}): {e}")
@@ -443,18 +525,105 @@ def create_fallback_client() -> FallbackChatCompletionClient:
 
     # Fallback order: Azure OpenAI -> MAQ AI -> Groq by default. MAQ AI (131k-token context, no daily quota) takes the
     # load when Azure is unavailable; Groq (8k tokens per request, 200k per day on the free tier) is the last resort.
-    order = provider_order()
+    order = order or provider_order()
     providers.sort(key=lambda p: order.index(p.provider_id) if p.provider_id in order else len(order))
     logger.info("[LLM Config] Fallback order: " + " -> ".join(p.name for p in providers))
     return FallbackChatCompletionClient(providers)
 
 
 DEFAULT_PROVIDER_ORDER = "azure_openai,maq_ai,groq"
+# The Orchestrator makes one small structured routing decision per message: Groq answers it in 1-3 s, while the busy
+# MAQ AI gateway took up to ~3 minutes (seen live). Heavy agents keep LLM_PROVIDER_ORDER.
+DEFAULT_ORCHESTRATOR_PROVIDER_ORDER = "azure_openai,groq,maq_ai"
 
 
 def provider_order() -> List[str]:
     """LLM_PROVIDER_ORDER: comma-separated provider ids (azure_openai, maq_ai, groq) in fallback order."""
     raw = os.getenv("LLM_PROVIDER_ORDER") or DEFAULT_PROVIDER_ORDER
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
+DEFAULT_STREAM_STALL_SECONDS = 120.0
+
+
+class StreamStalledError(RuntimeError):
+    """A streamed answer stopped producing text (or exceeded the provider's total time)."""
+
+
+def stream_stall_seconds() -> float:
+    """STREAM_STALL_SECONDS: a streamed answer with no new text for this long is abandoned (default 120)."""
+    return max(10.0, _env_float("STREAM_STALL_SECONDS", DEFAULT_STREAM_STALL_SECONDS))
+
+
+def provider_total_seconds(provider_id: str) -> float:
+    """The whole answer must arrive within the provider's timeout (<PREFIX>_TIMEOUT_SECONDS), not just each chunk."""
+    prefix, default_timeout, _ = PROVIDER_LIMIT_DEFAULTS.get(provider_id, ("X", 900.0, 0))
+    return _env_float(f"{prefix}_TIMEOUT_SECONDS", default_timeout)
+
+
+async def read_stream_with_watchdog(stream: Any, provider: Any) -> Any:
+    """
+    Reads a streamed answer to the end with two limits (seen live: a MAQ AI answer streamed for 27 minutes, because the
+    HTTP read timeout only covers the gap between chunks): no new update for stream_stall_seconds(), and the whole
+    answer within the provider's total time. Either one closes the stream and raises StreamStalledError, so the
+    fallback chain moves on and the user is told instead of waiting.
+    """
+    stall, total = stream_stall_seconds(), provider_total_seconds(getattr(provider, "provider_id", ""))
+    started = time.time()
+    updates = 0
+    if not hasattr(stream, "__aiter__"):                 # not iterable update by update: only the total deadline
+        try:
+            return await asyncio.wait_for(stream.get_final_response(), timeout=total)
+        except asyncio.TimeoutError:
+            raise StreamStalledError(f"no complete answer within {total:.0f}s")
+    iterator = stream.__aiter__()
+    while True:
+        remaining = total - (time.time() - started)
+        if remaining <= 0:
+            await _close_quietly(stream)
+            raise StreamStalledError(f"no complete answer within {total:.0f}s")
+        try:
+            await asyncio.wait_for(iterator.__anext__(), timeout=min(stall, remaining))
+            updates += 1
+            if updates % 50 == 0:
+                progress.detail(f"{getattr(provider, 'name', 'The model')} is writing… "
+                                f"({time.time() - started:.0f}s)")
+        except StopAsyncIteration:
+            break
+        except asyncio.TimeoutError:
+            await _close_quietly(stream)
+            if time.time() - started >= total:
+                raise StreamStalledError(f"no complete answer within {total:.0f}s")
+            raise StreamStalledError(f"the stream stalled: no new text for {stall:.0f}s "
+                                     f"(after {time.time() - started:.0f}s, {updates} updates)")
+    return await stream.get_final_response()
+
+
+async def _close_quietly(stream: Any) -> None:
+    try:
+        await stream.close()
+    except Exception:
+        pass
+
+
+def is_empty_response(response: Any) -> bool:
+    """True for a response with no text and no tool call (seen live from MAQ AI: an empty TRD answer)."""
+    messages = getattr(response, "messages", None)
+    if messages is None:
+        return False
+    for message in messages:
+        for content in getattr(message, "contents", None) or []:
+            kind = str(getattr(content, "type", "") or "")
+            if kind.startswith("function") or kind in ("tool_call", "tool_result"):
+                return False
+            if kind == "text" and (getattr(content, "text", "") or "").strip():
+                return False
+    return True
+
+
+def orchestrator_provider_order() -> List[str]:
+    """ORCHESTRATOR_PROVIDER_ORDER: provider order for the Orchestrator's routing decision only."""
+    raw = os.getenv("ORCHESTRATOR_PROVIDER_ORDER") or DEFAULT_ORCHESTRATOR_PROVIDER_ORDER
     return [p.strip().lower() for p in raw.split(",") if p.strip()]
 
 
