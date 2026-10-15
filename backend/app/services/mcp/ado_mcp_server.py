@@ -266,6 +266,43 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
 
     try:
         with httpx.Client(timeout=30.0) as client:
+            # 1. Check existing repositories to reuse/rename the empty default repository created by Azure DevOps
+            try:
+                list_url = f"{org_url}/{encoded_project}/_apis/git/repositories?api-version=7.1"
+                list_res = client.get(list_url, headers=headers)
+                if list_res.status_code == 200:
+                    repos = list_res.json().get("value", [])
+                    # If a repository already has this name, return it idempotently
+                    for r in repos:
+                        if r.get("name") == repository_name:
+                            logger.info(f"[ADO MCP] Repository '{repository_name}' already exists in project '{project_id_or_name}'.")
+                            return {
+                                "status": "success",
+                                "name": repository_name,
+                                "id": r.get("id", ""),
+                                "url": r.get("webUrl") or r.get("remoteUrl") or f"{org_url}/{project_id_or_name}/_git/{repository_name}"
+                            }
+
+                    # If an empty default repository exists (e.g. auto-created with the project, no branch/commits), rename it
+                    for r in repos:
+                        if r.get("defaultBranch") is None:
+                            patch_url = f"{org_url}/{encoded_project}/_apis/git/repositories/{r['id']}?api-version=7.1"
+                            patch_res = client.patch(patch_url, json={"name": repository_name}, headers=headers)
+                            if patch_res.status_code == 200:
+                                data = patch_res.json()
+                                repo_id = data.get("id", "")
+                                repo_url = data.get("webUrl") or data.get("remoteUrl") or f"{org_url}/{project_id_or_name}/_git/{repository_name}"
+                                logger.info(f"[ADO MCP] Renamed empty default repository '{r.get('name')}' to '{repository_name}'.")
+                                return {
+                                    "status": "success",
+                                    "name": repository_name,
+                                    "id": repo_id,
+                                    "url": repo_url
+                                }
+            except Exception as e:
+                logger.debug(f"[ADO MCP] Checking/renaming existing repository skipped: {e}")
+
+            # 2. Otherwise create a new repository as fallback
             response = client.post(url, json=payload, headers=headers)
             
             if response.status_code in (200, 201):
