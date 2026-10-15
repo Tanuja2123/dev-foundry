@@ -41,9 +41,10 @@ def get_guardrails_slm_config() -> Dict[str, str]:
         or "https://indiaai.maqsoftware.net/v1"
     ).strip()
 
+    # GUARDRAILS_API_KEY first: a guardrail endpoint of its own (e.g. local Ollama) must never receive the MAQ AI key
     api_key = (
-        os.getenv("MAQ_AI_API_KEY")
-        or os.getenv("GUARDRAILS_API_KEY")
+        os.getenv("GUARDRAILS_API_KEY")
+        or os.getenv("MAQ_AI_API_KEY")
         or os.getenv("LOCAL_SLM_API_KEY")
         or os.getenv("LOCAL_SLM_APIKEY")
         or ""

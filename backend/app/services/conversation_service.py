@@ -17,7 +17,7 @@ from app.services.agents.requirements_agent import process_uploaded_document, ge
 from app.services.agents.repo_setup_agent import get_repo_setup_agent
 from app.services.mcp.ado_mcp_server import sanitize_ado_project_name
 from app.services import project_store as store
-from app.services import tech_fit
+from app.services import progress, tech_fit
 from app.services.backlog_service import run_backlog_operation
 from app.services.repo_structure import layer_changes, render_structure_tree
 from app.services.scaffold_service import describe_toolchains
@@ -27,7 +27,8 @@ from app.services.workflow_routing import (RoutingDecision, blocked_reply, effec
 from app.utils.document_markdown import prd_json_to_markdown, trd_json_to_markdown
 from app.core.logger import logger
 
-from app.services.llm_client import AllProvidersFailedError, create_fallback_client, estimate_request_tokens
+from app.services.llm_client import (AllProvidersFailedError, FallbackChatCompletionClient, create_fallback_client,
+                                    estimate_request_tokens, orchestrator_provider_order)
 from app.services.guardrails_layer import (
     check_input_guardrail,
     check_output_guardrail,
@@ -500,6 +501,78 @@ def render_structure_for_display(state: Dict) -> Optional[str]:
                      f"then your requested changes ({counts}).")
     return "\n\n".join(parts)
 
+def partial_success_reply(before: Optional[Dict], after: Optional[Dict], reference: str) -> Optional[str]:
+    """
+    What a turn really changed (compared with the state before it), rendered by code, for when the final reply step
+    failed after tools had already acted. None when nothing changed (then "Nothing was changed" is true).
+    """
+    if not after or after.get("error"):
+        return None
+    b_project, a_project = (before or {}).get("project") or {}, after.get("project") or {}
+    b_repo, a_repo = (before or {}).get("repository") or {}, after.get("repository") or {}
+    done: List[str] = []
+    if a_project.get("ado_project_id") and not b_project.get("ado_project_id"):
+        done.append(f"The Azure DevOps project **{a_project.get('project_name')}** was created "
+                    f"([open it]({a_project.get('ado_project_url')})).")
+    if (a_project.get("prd_version") or 0) > (b_project.get("prd_version") or 0):
+        done.append(f"The PRD was saved (version {a_project.get('prd_version')}). Ask me to show the PRD to see it.")
+    if (a_project.get("trd_version") or 0) > (b_project.get("trd_version") or 0):
+        done.append(f"The TRD was saved (version {a_project.get('trd_version')}). Ask me to show the TRD to see it.")
+    if a_repo.get("ado_repo_id") and a_repo.get("ado_repo_id") != b_repo.get("ado_repo_id"):
+        done.append(f"The repository **{a_repo.get('repo_name')}** was created.")
+    pushed_now = a_repo.get("commit_id") and a_repo.get("commit_id") != b_repo.get("commit_id")
+    structure_changed = (a_repo.get("structure_version") or 0) > (b_repo.get("structure_version") or 0) or (
+        a_repo.get("structure") and not b_repo.get("structure"))
+    if pushed_now:
+        done.append(f"The structure was pushed to `{a_repo.get('branch') or 'main'}` (commit "
+                    f"`{str(a_repo.get('commit_id'))[:7]}`).")
+    if len(a_project.get("work_items") or {}) > len(b_project.get("work_items") or {}):
+        done.append(f"{len(a_project.get('work_items'))} work items now exist in Azure Boards.")
+    if not done and not structure_changed:
+        return None
+    parts = ["Part of your request was completed, but the AI service is busy, so I couldn't write the full reply "
+             f"(Reference: {reference}). Here is what was saved:"]
+    parts.append("\n".join(f"- {item}" for item in done) if done else "")
+    if structure_changed and not pushed_now:
+        tree = render_structure_for_display(after)
+        if tree:
+            parts.append(tree)
+        parts.append("---")
+        parts.append("Nothing has been pushed yet: review the structure, then say **push to main** or tell me what "
+                     "to change.")
+    else:
+        parts.append("---")
+        parts.append("Tell me how you'd like to continue.")
+    return "\n\n".join(p for p in parts if p)
+
+
+_PUSH_REQUEST = re.compile(r"\b(push\w*|commit\w*|publish\w*)\b", re.IGNORECASE)
+
+
+def structure_was_shown(history: List[Dict], repository: Dict) -> bool:
+    """True when an earlier reply showed the current structure version (the tree is rendered with its version)."""
+    marker = f"(version {repository.get('structure_version')},"
+    return any(m.get("role") == "assistant" and marker in (m.get("text") or "") for m in history or [])
+
+
+def push_review_reply(user_query: str, history: List[Dict], state: Optional[Dict]) -> Optional[str]:
+    """
+    A push needs (1) a message that actually asks to push and (2) the current structure shown to the user before
+    (seen live: "approved, create the repo" pushed a structure the user never saw). Returns the structure to review
+    instead of pushing, or None when the push may go ahead.
+    """
+    repository = (state or {}).get("repository") or {}
+    if not repository.get("structure"):
+        return None                               # nothing to show; the agent explains
+    asked = bool(_PUSH_REQUEST.search(user_query or ""))
+    if asked and structure_was_shown(history, repository):
+        return None
+    tree = render_structure_for_display(state) or ""
+    intro = ("Before pushing, here is exactly what would be pushed to `main`:" if asked else
+             "Nothing has been pushed yet. Here is the repository structure for your review:")
+    return f"{intro}\n\n{tree}\n\n---\n\nReview it, then say **push to main** (or tell me what to change)."
+
+
 def stored_document_reply(document: Optional[str], workflow_state: Optional[Dict]) -> Optional[str]:
     """
     The stored PRD / TRD as a reply, when the user asks to see it. Rendered from the database by code, so the model can
@@ -522,7 +595,7 @@ def stored_document_reply(document: Optional[str], workflow_state: Optional[Dict
     return f"Here is the current, suggested **{name}**{label}:\n\n{body.strip()}\n\n---\n\n{step}"
 
 
-GUARDRAIL_ERROR_NAMES = {"ExecutionError", "ConfigError"}
+GUARDRAIL_ERROR_NAMES = {"ServiceUnavailable", "ExecutionError", "ConfigError"}
 GUARDRAIL_UNAVAILABLE_MESSAGE = ("The safety check could not run just now, so your message was not processed and nothing "
                                  "changed. Please try again in a minute.")
 _GUARDRAIL_REASONS = {
@@ -539,6 +612,13 @@ def guardrail_block_message(check: Any) -> str:
     reason = _GUARDRAIL_REASONS.get(name, "it looks like an attempt to change or reveal my instructions")
     return (f"I can't help with that message because {reason}. I can help you plan software: describe a product, "
             "ask about your PRD or TRD, or continue with the next step.")
+
+
+def presents_document(reply: str) -> bool:
+    """Whether a synthesized reply actually shows a PRD/TRD (headings and some length), not a meta answer."""
+    text = reply or ""
+    return len(text) >= 400 and ("Requirements Document" in text or "(PRD)" in text or "(TRD)" in text) \
+        and text.count("\n") >= 5
 
 
 def normalize_reply(text: str) -> str:
@@ -753,7 +833,9 @@ ROUTING RULES:
    - STRUCTURE_REVIEW: changes to folders/files -> UPDATE_REPOSITORY_STRUCTURE; rejecting the generated approach without
      naming a technology ("start over", "use another generator") -> GENERATE_REPOSITORY_STRUCTURE; a different language,
      framework or library is a technology change -> UPDATE_TRD (rule 2), after which the structure is offered for update;
-     explicit approval to push (optionally with a commit message) -> PUSH_REPOSITORY_STRUCTURE.
+     explicit approval to push (optionally with a commit message) -> PUSH_REPOSITORY_STRUCTURE. Only a message that
+     asks to PUSH (or commit) is a push request; "approved" / "looks good" / "create the repo" alone is not - respond.
+     An approval confirms only the step it answers; it never moves two steps.
 6. COMPLETE: the structure was pushed. Further structure changes -> UPDATE_REPOSITORY_STRUCTURE (pushed later as a follow-up
    commit after explicit approval); project rename/description -> UPDATE_ADO_PROJECT; otherwise respond directly.
 7. Never "re-push" when nothing changed: if the user asks to push again and the state shows no unpushed changes, respond.
@@ -789,10 +871,14 @@ DECISION FIELDS:
 - title_confidence: 0.0-1.0, how clearly the conversation describes ONE specific product (0.0 small talk / questions about DevFoundry, 0.3 vague wish, 0.6 a category without purpose, 0.8 a concrete product, 1.0 a detailed description). The chat is only named from 0.7.
 """
 
+        # Small requests (the routing decision, the technology fit check) use the fast order Azure -> Groq -> MAQ AI;
+        # the agents that write documents keep `client` (Azure -> MAQ AI -> Groq)
+        small_client = (create_fallback_client(order=orchestrator_provider_order())
+                        if isinstance(client, FallbackChatCompletionClient) else client)
         orchestrator = Agent(
             name="Orchestrator",
             instructions=main_agent_prompt,
-            client=client,
+            client=small_client,
         )
 
         requirements_agent = get_requirements_agent(client)
@@ -822,6 +908,7 @@ DECISION FIELDS:
         # Orchestrator: the whole conversation (within the token budget) + latest query with state
         recent_orch_history = message_list[:-1]
         orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
+        progress.step("Deciding the next step")
         orchestrator_response = await orchestrator.run(
             messages=orchestrator_messages,
             options={"response_format": RoutingDecision}
@@ -869,6 +956,14 @@ DECISION FIELDS:
             logger.warning(f"[Routing Guard] {decision.operation} is not allowed in stage {stage}; answering directly")
             decision = RoutingDecision(reasoning="blocked by workflow guard", action="respond",
                                        reply=blocked_reply(stage, blocked))
+        # A push needs an explicit push request about a structure the user has seen; otherwise show it first
+        if decision.action == "delegate" and decision.operation == "PUSH_REPOSITORY_STRUCTURE":
+            review = push_review_reply(user_query, history, workflow_state)
+            if review:
+                logger.warning("[Routing Guard] PUSH_REPOSITORY_STRUCTURE needs an explicit push request after the "
+                               "structure was shown; showing the structure instead")
+                decision = RoutingDecision(reasoning="push needs review", user_intent=decision.user_intent,
+                                           action="respond", reply=review)
         route_agent = decision.agent if decision.action == "delegate" else None
         operation = decision.operation
         response_text = decision.reply or blocked_reply(stage, "")
@@ -879,7 +974,8 @@ DECISION FIELDS:
         fit_checked = False
         if route_agent == "Requirements_Agent" and operation == "UPDATE_TRD":
             fit_checked = True
-            gate_reply, confirmed_request = await tech_fit.gate(client, user_query, history, workflow_state or {})
+            progress.step("Checking how well the technology fits this project")
+            gate_reply, confirmed_request = await tech_fit.gate(small_client, user_query, history, workflow_state or {})
             if gate_reply:
                 route_agent = None                      # answered directly below; the TRD is not touched
                 response_text = gate_reply
@@ -932,6 +1028,7 @@ DECISION FIELDS:
                 # Invoke Requirements Child Agent
                 logger.info(f"[Requirements_Agent] Processing request with operation: {operation}...")
                 child_start = time.time()
+                progress.step(OPERATION_STEPS.get(operation, "Working on your request"))
                 child_response = await requirements_agent.run(messages=req_messages)
                 child_duration = round((time.time() - child_start) * 1000, 1)
                 child_raw_json = child_response.messages[-1].text if child_response.messages else ""
@@ -1078,12 +1175,21 @@ Put a blank line before and after every heading, divider (---) and list; never p
             if unsaved_document:
                 response_text = document_not_saved_message(operation)
             else:
+                progress.step("Preparing the reply")
                 synthesis_result = await synthesizer_agent.run(
                     messages=[Message(role="user", contents=["Please present this update to the user."])])
                 synth_duration = round((time.time() - synth_start) * 1000, 1)
                 response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
                 response_text = enforce_closing_line(response_text)
                 logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
+                if saved and child_status == "COMPLETE" and not presents_document(response_text):
+                    # Seen live: the model answered "Please share the update you'd like me to present..." although
+                    # the TRD was saved. The user always sees the saved document.
+                    document = "TRD" if (parse_agent_json(child_raw_json) or {}).get("technical_requirements_document") else "PRD"
+                    logger.warning(f"[Orchestrator] The reply did not present the saved {document}; showing it from "
+                                   "the database")
+                    response_text = (stored_document_reply(document, store.get_workflow_state(conversation_id))
+                                     or response_text)
 
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
@@ -1108,6 +1214,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
             child_start = time.time()
             # Built per operation: only the tools this operation allows (none for proposals)
             repo_setup_agent = get_repo_setup_agent(client, conversation_id, operation)
+            progress.step(OPERATION_STEPS.get(operation, "Working on your request"))
             child_response = await repo_setup_agent.run(messages=repo_messages)
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
@@ -1200,6 +1307,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
+            progress.step("Preparing the reply")
             synthesis_result = await synthesizer_agent.run(
                 messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
@@ -1209,6 +1317,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
 
         elif route_agent == "Backlog_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Backlog_Agent ({operation})")
+            progress.step(OPERATION_STEPS.get(operation, "Working on the work items"))
             response_text = enforce_closing_line(await run_backlog_operation(
                 client, operation, user_query, message_list, workflow_state or {}))
 
@@ -1231,6 +1340,15 @@ Put a blank line before and after every heading, divider (---) and list; never p
         reference = uuid.uuid4().hex[:8]
         if isinstance(e, AllProvidersFailedError):
             logger.error(f"[Agent Pipeline] [ref {reference}] No AI model could answer:\n  " + "\n  ".join(e.errors))
+            # Seen live: the repository was created and its structure generated, then only the reply step failed and
+            # the user was told "Nothing was changed". Report what was really done, from the stored state.
+            before = locals().get("workflow_state")
+            if conversation_id and before is not None:
+                partial = partial_success_reply(before, store.get_workflow_state(conversation_id), reference)
+                if partial:
+                    logger.warning(f"[Agent Pipeline] [ref {reference}] The reply failed after changes were saved; "
+                                   "showing them from the database")
+                    return partial
             return SERVICE_UNAVAILABLE_MESSAGE.format(reference=reference)
         logger.exception(f"[Agent Pipeline] [ref {reference}] Unexpected error: {type(e).__name__}: {e}")
         return UNEXPECTED_ERROR_MESSAGE.format(reference=reference)
@@ -1249,6 +1367,20 @@ def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
     except Exception as e:
         logger.error(f"[Suggestions] Could not compute suggestions: {e}")
         return []
+
+# What the dashboard shows while an operation runs (progress.step)
+OPERATION_STEPS = {
+    "GENERATE_PRD": "Writing the PRD", "UPDATE_PRD": "Updating the PRD",
+    "GENERATE_TRD": "Writing the TRD", "UPDATE_TRD": "Updating the TRD",
+    "GENERATE_PROJECT_PROPOSAL": "Proposing the Azure DevOps project", "UPDATE_PROJECT_PROPOSAL": "Updating the project proposal",
+    "CREATE_PROJECT": "Creating the Azure DevOps project", "UPDATE_ADO_PROJECT": "Updating the Azure DevOps project",
+    "GENERATE_REPOSITORY_PROPOSAL": "Suggesting a repository name", "UPDATE_REPOSITORY_PROPOSAL": "Updating the repository name",
+    "CREATE_REPOSITORY": "Creating the repository and generating its structure",
+    "GENERATE_REPOSITORY_STRUCTURE": "Generating the repository structure",
+    "UPDATE_REPOSITORY_STRUCTURE": "Updating the repository structure", "PUSH_REPOSITORY_STRUCTURE": "Pushing to Azure DevOps",
+    "GENERATE_WORK_ITEMS_PROPOSAL": "Drafting the work items", "UPDATE_WORK_ITEMS_PROPOSAL": "Updating the work items draft",
+    "CREATE_WORK_ITEMS": "Creating the work items in Azure Boards",
+}
 
 DEFAULT_TITLE = "New Project"
 DEFAULT_TITLES = {"new project", "new conversation", "new chat", "untitled", ""}
@@ -1351,7 +1483,11 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
     if lock.locked():
         logger.info(f"[Conversation] '{key}' is busy with another message; this one waits for it")
     async with lock:
-        return await _process_chat_request(conversation_id, user_query, file, user_id=user_id)
+        progress.start(key, user_id)             # live progress for the dashboard (GET /api/chat/progress/{id})
+        try:
+            return await _process_chat_request(conversation_id, user_query, file, user_id=user_id)
+        finally:
+            progress.finish(key)
 
 
 async def _process_chat_request(conversation_id: Optional[str], user_query: str, file: Optional[UploadFile] = None,
@@ -1382,6 +1518,7 @@ async def _process_chat_request(conversation_id: Optional[str], user_query: str,
             user_query = user_query + f"\n\n[Attached File Content]:\n{file_info}"
 
     # 1. Orchestrator Input Guardrail Boundary
+    progress.step("Checking your message")
     input_check = await check_input_guardrail(user_query)
     if not input_check.allowed:
         logger.warning(
@@ -1405,6 +1542,7 @@ async def _process_chat_request(conversation_id: Optional[str], user_query: str,
     response_text = await generate_chat_response(user_query, content_array, conversation_id)
 
     # 2. Orchestrator Output Guardrail Boundary (redacts PII / blocks restricted URLs)
+    progress.step("Final safety check")
     output_check = await check_output_guardrail(response_text)
     if not output_check.allowed:
         logger.warning(

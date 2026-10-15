@@ -2,14 +2,6 @@
   "version": 1,
   "output": {
     "version": 1,
-    "guardrails": [
-      {
-        "name": "Hallucinated Functions / Tool Misuse",
-        "config": {
-          "model": "qwen-3.8-27b",
-          "confidence_threshold": 0.8
-        }
-      }
-    ]
+    "guardrails": []
   }
 }

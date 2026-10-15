@@ -85,6 +85,23 @@ export async function continueChat(
   return response.json() as Promise<ChatApiResponse>
 }
 
+export type ChatProgress = {
+  running: boolean
+  step?: string
+  detail?: string
+  elapsed_seconds?: number
+  step_seconds?: number
+}
+
+/** What a running chat turn is doing right now (polled while waiting for the reply). */
+export async function getChatProgress(conversationId: string, signal?: AbortSignal): Promise<ChatProgress> {
+  const response = await authFetch(`${apiBaseUrl()}/api/chat/progress/${conversationId}`, { signal })
+  if (!response.ok) {
+    return { running: false }
+  }
+  return response.json() as Promise<ChatProgress>
+}
+
 export async function deleteConversation(conversationId: string): Promise<void> {
   const response = await authFetch(`${apiBaseUrl()}/api/conversation/${conversationId}`, {
     method: 'DELETE',

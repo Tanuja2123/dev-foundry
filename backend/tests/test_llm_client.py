@@ -59,12 +59,13 @@ def test_every_provider_gets_explicit_timeout_and_retries(env):
     env.setenv("MAQ_AI_TIMEOUT_SECONDS", "45")
     client = lc.create_fallback_client()
     limits = {p.name: (p.client.client.timeout.read, p.client.client.max_retries) for p in client.providers}
-    assert limits == {"Azure OpenAI": (120.0, 1), "Groq (gpt-oss-20b)": (60.0, 2), "Groq (gpt-oss-120b)": (60.0, 2),
-                      "MAQ AI (SLM)": (45.0, 0)}
+    # Groq: no SDK retries - a 429 moves straight on to the next model / provider (no 17-34 s waits)
+    assert limits == {"Azure OpenAI": (120.0, 1), "Groq (gpt-oss-20b)": (60.0, 0), "Groq (qwen3.8-27b)": (60.0, 0),
+                      "Groq (gpt-oss-120b)": (60.0, 0), "MAQ AI (SLM)": (45.0, 0)}
     # default order: Azure OpenAI -> MAQ AI -> Groq (MAQ AI takes the load; Groq's daily quota is the last resort)
     assert [p.name for p in client.providers] == ["Azure OpenAI", "MAQ AI (SLM)", "Groq (gpt-oss-20b)",
-                                                  "Groq (gpt-oss-120b)"]
-    assert [p.stream for p in client.providers] == [False, True, False, False]   # only MAQ AI is streamed
+                                                  "Groq (qwen3.8-27b)", "Groq (gpt-oss-120b)"]
+    assert [p.stream for p in client.providers] == [False, True, False, False, False]   # only MAQ AI is streamed
     assert all(p.client.client.timeout.connect == 10.0 for p in client.providers)
 
 
@@ -75,7 +76,34 @@ def test_provider_order_is_configurable(env):
     env.setenv("MAQ_AI_API_KEY", "k")
     env.setenv("LLM_PROVIDER_ORDER", "groq, azure_openai, maq_ai")
     client = lc.create_fallback_client()
-    assert [p.provider_id for p in client.providers] == ["groq", "groq", "azure_openai", "maq_ai"]
+    assert [p.provider_id for p in client.providers] == ["groq", "groq", "groq", "azure_openai", "maq_ai"]
+
+
+def test_an_empty_answer_falls_back_to_the_next_provider():
+    from types import SimpleNamespace
+    from agent_framework import Message
+    empty = SimpleNamespace(messages=[Message(role="assistant", contents=[""])])
+    full = SimpleNamespace(messages=[Message(role="assistant", contents=["the TRD"])])
+    assert lc.is_empty_response(empty) and not lc.is_empty_response(full)
+    assert not lc.is_empty_response("plain string")
+    first = provider("MAQ", empty, provider_id="maq_ai")
+    second = provider("Groq", full)
+    client = lc.FallbackChatCompletionClient([first, second])
+    asyncio.run(client.get_response([Message(role="user", contents=["hi"])]))
+    assert first.client.calls == 1 and second.client.calls == 1
+
+
+def test_orchestrator_has_its_own_fast_provider_order(env):
+    env.setenv("AZURE_OPENAI_APIKEY", "k")
+    env.setenv("AZURE_OPENAI_ENDPOINT", "https://x.openai.azure.com")
+    env.setenv("GROQ_API_KEY", "k")
+    env.setenv("MAQ_AI_API_KEY", "k")
+    assert lc.orchestrator_provider_order() == ["azure_openai", "groq", "maq_ai"]
+    client = lc.create_fallback_client(order=lc.orchestrator_provider_order())
+    assert [p.provider_id for p in client.providers] == ["azure_openai", "groq", "groq", "groq", "maq_ai"]
+    assert [p.provider_id for p in lc.create_fallback_client().providers] == ["azure_openai", "maq_ai", "groq", "groq", "groq"]
+    env.setenv("ORCHESTRATOR_PROVIDER_ORDER", "maq_ai,groq")
+    assert lc.orchestrator_provider_order() == ["maq_ai", "groq"]
 
 
 def test_long_conversations_are_trimmed_for_groq_instead_of_skipping_it():
@@ -198,3 +226,32 @@ def test_only_groq_gets_a_max_tokens_clamp_sized_to_the_room_left():
     run(lc.FallbackChatCompletionClient([azure]), text="short question")
     assert 6000 < seen["groq"]["max_tokens"] < 8000          # all the room left, not a fixed 1500
     assert "max_tokens" not in seen["azure"]                  # no cap: long PRD/TRD answers are not cut off
+
+
+@pytest.fixture(autouse=True)
+def _clear_quota_pauses():
+    lc._QUOTA_PAUSED_UNTIL.clear()
+    yield
+    lc._QUOTA_PAUSED_UNTIL.clear()
+
+
+def test_a_rate_limited_model_is_paused_and_skipped_without_waiting():
+    class RateLimited(Exception):
+        status_code = 429
+    limited = provider("Groq (20b)", RateLimited("Error code: 429 - tokens per day. Please try again in 20m16.9s."),
+                       max_request_tokens=8000)
+    backup = provider("MAQ", "maq-answer", provider_id="maq_ai")
+    client = lc.FallbackChatCompletionClient([limited, backup])
+    assert run(client) == "maq-answer"
+    assert 1200 < lc.pause_seconds_left(limited.quota_key) <= 1217
+    assert run(client) == "maq-answer" and limited.client.calls == 1          # paused: not called again
+
+
+def test_several_groq_keys_become_separate_accounts(env):
+    env.setenv("GROQ_API_KEY", "key-a, key-b")
+    env.setenv("GROQ_API_KEY_2", "key-c,key-a")
+    env.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    assert lc.groq_api_keys() == ["key-a", "key-b", "key-c"]
+    client = lc.create_fallback_client()
+    assert [p.name for p in client.providers] == ["Groq (gpt-oss-20b)", "Groq #2 (gpt-oss-20b)", "Groq #3 (gpt-oss-20b)"]
+    assert len({p.quota_key for p in client.providers}) == 3

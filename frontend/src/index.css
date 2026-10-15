@@ -1885,6 +1885,14 @@ code {
   color: var(--ms-text-secondary);
 }
 
+.pending-detail {
+  margin-top: 4px;
+  padding-left: 30px;
+  font-size: 0.78rem;
+  color: var(--ms-text-muted);
+  overflow-wrap: anywhere;
+}
+
 .pending-elapsed {
   margin-left: auto;
   font-size: 0.78rem;

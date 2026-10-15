@@ -13,6 +13,7 @@ from app.services.conversation_service import (
     get_conversation_by_id,
     get_suggestions,
 )
+from app.services import progress
 from app.services.projects_service import get_projects_overview, update_project_name
 from app.core.logger import logger
 
@@ -62,6 +63,13 @@ def remove_conversation(conversation_id: str, user: CurrentUser = Depends(get_cu
         raise _not_found(conversation_id)
     return {"status": "success", "conversation_id": conversation_id}
 
+
+
+@router.get("/chat/progress/{conversation_id}")
+def chat_progress(conversation_id: str, user: CurrentUser = Depends(get_current_user)) -> dict:
+    """What a running chat turn is doing right now (polled by the dashboard while it waits)."""
+    current = progress.get(conversation_id, user.user_id)
+    return {"running": current is not None, **(current or {})}
 
 
 @router.post("/chat", response_model=ChatResponse)
