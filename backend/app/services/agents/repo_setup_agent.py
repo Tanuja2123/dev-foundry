@@ -47,10 +47,22 @@ class ScaffoldCommandInput(BaseModel):
                                               "(e.g. 'backend'); '.' is the repository root. Created if missing.")
 
 
+class InitializerInput(BaseModel):
+    name: str = Field(description="Online initializer: 'spring-boot', 'quarkus' or 'micronaut' (see the scaffold catalog).")
+    folder: str = Field(default=".", description="Folder relative to the repository root for the project "
+                                                 "(e.g. 'backend'); '.' is the repository root.")
+    options: Dict[str, str] = Field(default_factory=dict,
+                                    description="Initializer options as name/value strings, e.g. {\"build\": \"maven\", "
+                                                "\"language\": \"java\", \"java_version\": \"21\", "
+                                                "\"dependencies\": \"web,data-jpa,postgresql\"}.")
+
+
 def scaffold_commit_message(commands: List[Dict[str, str]]) -> str:
-    """Commit message of the generator-output commit: lists the commands that produced it."""
-    lines = [f"$ {c['command']}" + (f"   (in {c['cwd']}/)" if c.get("cwd") not in (None, "", ".") else "")
-             for c in commands or []]
+    """Commit message of the generator-output commit: lists the commands (and the versions they used)."""
+    lines = []
+    for c in commands or []:
+        line = f"$ {c['command']}" + (f"   (in {c['cwd']}/)" if c.get("cwd") not in (None, "", ".") else "")
+        lines.append(line + (f"   [{c['version']}]" if c.get("version") else ""))
     return SCAFFOLD_COMMIT_MESSAGE + ("\n\nGenerated with:\n" + "\n".join(lines) if lines else "")
 
 
@@ -100,7 +112,14 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         except store.StoreError as e:
             return _error(str(e))
         if project and project.get("ado_project_id"):
-            return _error("An Azure DevOps project was already created for this conversation.", "ALREADY_CREATED")
+            # Idempotent: a repeated call (models sometimes call the tool twice in one turn) returns the existing
+            # project as a success, so the reply never reports a failure for a project that was created.
+            logger.info(f"[Repo_Setup_Agent] create_ado_project: '{project.get('project_name')}' already exists; "
+                        "returning it (nothing new created)")
+            return {"status": "success", "already_existed": True, "name": project.get("project_name"),
+                    "description": project.get("project_description"), "id": project.get("ado_project_id"),
+                    "url": project.get("ado_project_url"),
+                    "message": "The Azure DevOps project for this conversation exists; nothing new was created."}
 
         approved_name = (project or {}).get("project_name")
         if not store.is_placeholder_name(approved_name):
@@ -208,8 +227,11 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         if not project or not project.get("ado_project_id"):
             return _error("Create the Azure DevOps project before creating a repository.")
         if repository and repository.get("ado_repo_id") and repository.get("repo_name") == repository_name:
-            return _error(f"Repository '{repository_name}' was already created ({repository.get('ado_repo_url')}).",
-                          "ALREADY_CREATED")
+            # Idempotent, like create_ado_project: a repeated call returns the existing repository as a success
+            logger.info(f"[Repo_Setup_Agent] create_ado_repository: '{repository_name}' already exists; returning it")
+            return {"status": "success", "already_existed": True, "name": repository_name,
+                    "id": repository.get("ado_repo_id"), "url": repository.get("ado_repo_url"),
+                    "message": f"Repository '{repository_name}' exists; nothing new was created."}
         proposed = repository.get("repo_name") if repository and repository.get("status") == store.REPO_PROPOSED else None
         if not store.is_placeholder_name(proposed):
             if repository_name and repository_name.strip() != proposed:
@@ -259,15 +281,18 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
     @tool(
         name="scaffold_repository_structure",
         description=(
-            "Generate the repository structure by RUNNING the stack's official generator / init commands (in order, "
-            "non-interactively, without a shell) in an empty temporary folder that is the repository root, and save EXACTLY "
-            "the files they produce for review (replaces the saved structure; nothing is pushed). Returns the generated "
-            "paths, or an error with the command output so the commands can be fixed. "
-            f"At most {MAX_COMMANDS} commands."
+            "Generate the repository structure with the stack's OFFICIAL generators: online initializers (Spring Boot, "
+            "Quarkus, Micronaut; run first) and/or CLI generator commands (in order, non-interactively, without a shell), in "
+            "an empty temporary folder that is the repository root. Saves EXACTLY the files they produce for review "
+            "(replaces the saved structure; nothing is pushed). Returns the generated paths and any warnings, or an error "
+            f"with the output so the call can be fixed. At most {MAX_COMMANDS} steps in total."
         )
     )
     def tool_scaffold_repository_structure(
-        commands: Annotated[List[ScaffoldCommandInput], Field(description="Generator commands in execution order.")],
+        commands: Annotated[Optional[List[ScaffoldCommandInput]],
+                            Field(description="CLI generator commands in execution order (run after the initializers).")] = None,
+        initializers: Annotated[Optional[List[InitializerInput]],
+                                Field(description="Online initializers (no local toolchain needed), run first.")] = None,
     ) -> Dict[str, Any]:
         """TOOL 3b — SCAFFOLD REPOSITORY STRUCTURE (runs the commands, stores their exact output)."""
         try:
@@ -277,7 +302,8 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         previous = repository.get("scaffold_structure")
         previous_changes = layer_changes(previous, repository.get("structure") or []) if previous else None
         try:
-            result = run_scaffold_commands(commands)
+            result = run_scaffold_commands(commands or [], initializers=initializers or [],
+                                           default_name=repository.get("repo_name") or "app")
         except AdoPushError as e:
             return _error(e.message, e.error_type, e.details)
         command_list = [c.to_dict() for c in result.commands]
@@ -289,6 +315,8 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         response.update(commands=command_list, duration_seconds=result.duration_seconds)
         if result.skipped:
             response["skipped"] = result.skipped
+        if result.warnings:
+            response["warnings"] = result.warnings
         if previous_changes and any(previous_changes.values()):
             response["previous_requested_changes"] = previous_changes
             response["note"] = ("The structure was regenerated, so earlier requested changes are no longer applied. "
@@ -466,8 +494,9 @@ Your responsibility is to handle Azure DevOps (ADO) project and repository setup
 - Each request ends with a "[Current Workflow State (database)]" block. It is the source of truth for what already exists:
   the approved PRD/TRD (approved_prd_json / approved_trd_json), the project proposal, whether the ADO project and repository
   were created, the generator commands of the saved structure (scaffold_commands), every saved file with its origin
-  ([generated] = generator output, [added] / [edited] = requested changes) and the scaffold tools installed on the server
-  (scaffold_toolchains).
+  ([generated] = generator output, [added] / [edited] = requested changes). Structure operations also get a
+  "[Scaffold catalog]" block: the ONLY generators that can run (CLI generators with reference commands, online initializers)
+  and the stacks whose toolchain is NOT installed on the server.
 - The PRD and TRD can be updated by the user at any time (by the Requirements_Agent). The state block lists "outdated"
   items when an artifact no longer reflects the latest documents (e.g. ADO_PROJECT_OUTDATED, STRUCTURE_OUTDATED).
   Always base names, descriptions and structures on the LATEST approved_prd_json / approved_trd_json.
@@ -478,9 +507,10 @@ Your responsibility is to handle Azure DevOps (ADO) project and repository setup
 1. create_ado_project(project_name, project_description): creates the ADO project.
 2. update_ado_project(project_name?, project_description?): renames / re-describes the ALREADY CREATED ADO project.
 3. create_ado_repository(project_id_or_name, repository_name): creates an EMPTY Git repository (no files).
-4. scaffold_repository_structure(commands: [{command, cwd}]): RUNS the stack's official generator / init commands in an empty
-   temporary folder that is the repository root and saves EXACTLY the files they produce as the structure for review
-   (replaces the saved structure). Returns the generated paths, or an error with the command output.
+4. scaffold_repository_structure(commands?: [{command, cwd}], initializers?: [{name, folder, options}]): RUNS the stack's
+   official generators (online initializers first, then CLI commands) in an empty temporary folder that is the repository
+   root and saves EXACTLY the files they produce as the structure for review (replaces the saved structure). Returns the
+   generated paths and warnings, or an error with the output.
 5. update_repository_structure(upsert_files, remove_paths): applies ONLY the user's explicitly requested changes on top of the
    generated structure (everything else stays exactly as generated).
 6. save_repository_structure(files): saves a hand-written COMPLETE file list. ONLY when the user explicitly supplies the
@@ -496,14 +526,18 @@ Rules:
   names or descriptions, and never use placeholders such as "placeholder", "<project name>" or "TBD".
 - NEVER call create_ado_project without an explicit CREATE_PROJECT operation from the Orchestrator.
 - NEVER call create_ado_repository without an explicit CREATE_REPOSITORY operation from the Orchestrator.
-- The base structure ALWAYS comes from scaffold_repository_structure (see "5. SCAFFOLD COMMAND RULES"). NEVER write starter,
+- The base structure ALWAYS comes from scaffold_repository_structure (see "5. SCAFFOLD RULES"). NEVER write starter,
   config, manifest or framework files yourself, and never add files the user did not explicitly ask for.
 - Call update_repository_structure only for changes the user explicitly asked for (files, folders, modules, CI workflows...).
 - Call update_ado_project only during UPDATE_ADO_PROJECT.
 - NEVER call push_repository_structure without an explicit PUSH_REPOSITORY_STRUCTURE operation (the user approved the shown structure).
-- If scaffold_repository_structure returns COMMAND_NOT_ALLOWED, COMMAND_FAILED, COMMAND_TIMEOUT or VALIDATION_ERROR, read the
-  message and command output, fix the commands and call it again (at most 2 retries). If it returns TOOL_NOT_INSTALLED, choose
-  commands of an installed toolchain that fits the TRD, or report the error. NEVER fall back to writing the files yourself.
+- If scaffold_repository_structure returns COMMAND_NOT_ALLOWED, COMMAND_FAILED, COMMAND_TIMEOUT, VALIDATION_ERROR or
+  INITIALIZER_FAILED, read the message and output, fix the call and try again (at most 2 retries). If it returns warnings
+  (expected files missing), check the options and fix them the same way. INITIALIZER_UNAVAILABLE: report it (the service is
+  down), do not switch stacks on your own. NEVER fall back to writing the files yourself.
+- NEVER replace the stack the user / TRD chose with another one on your own. If the chosen stack cannot be generated here
+  (its toolchain is listed as NOT available, or TOOL_NOT_INSTALLED), do not scaffold: return STRUCTURE_OPTIONS (section 6)
+  and let the user decide.
 - If save/update returns a VALIDATION_ERROR, fix the files and call it again (at most 2 retries). Never retry a failed create or push.
 - If any tool returns status "error", report it as an error. NEVER claim success for a step whose tool returned an error.
 - NEVER print the repository structure tree yourself; the system renders it from the saved structure.
@@ -557,7 +591,9 @@ E. UPDATE_REPOSITORY_PROPOSAL:
 F. CREATE_REPOSITORY:
 - Triggered ONLY when the user explicitly approves the proposed repository name.
 - Call `create_ado_repository` with the ADO project name (project_name from the workflow state) and the approved repository name.
-- If it succeeds, call `scaffold_repository_structure` with the generator commands for the approved TRD (see section 5).
+- If it succeeds, call `scaffold_repository_structure` with the generators for the approved TRD (see section 5). If the TRD's
+  stack cannot be generated on this server, do not call it: return STRUCTURE_OPTIONS (the repository stays empty until the
+  user chooses).
 - Return status "COMPLETE", workflow_stage "REPOSITORY_CREATED", repository details (name, id, url), the structure (version,
   files_count, the commands exactly as run, and a summary of what the generators created), and next_action state
   "STRUCTURE_REVIEW" with allowed_operations: ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].
@@ -573,6 +609,8 @@ G. GENERATE_REPOSITORY_STRUCTURE:
 - Take the user's message into account together with the LATEST TRD: pick the commands that fit (the TRD is the source of truth
   for technologies; if the user names a technology the TRD does not have, still follow the user and mention in the summary
   that the TRD should be updated to match).
+- If the user just chose one of the STRUCTURE_OPTIONS offered earlier, use exactly that option.
+- If the requested stack cannot be generated on this server, return STRUCTURE_OPTIONS instead of scaffolding.
 - Call `scaffold_repository_structure` (it replaces the saved structure). If the user explicitly asked for extra files or folders
   (now, or earlier - see previous_requested_changes in the tool result) that still fit the new stack, add them afterwards with
   ONE `update_repository_structure` call.
@@ -611,45 +649,31 @@ I. PUSH_REPOSITORY_STRUCTURE:
   ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].
 
 ==================================================
-5. SCAFFOLD COMMAND RULES
+5. SCAFFOLD RULES
 ==================================================
-- Read approved_trd_json: the kind of application (CLI tool, web frontend, API/service, full stack, library, mobile app...)
-  and its languages/frameworks. If the TRD leaves something open, choose the stack's most common default.
-- Use the stack's OFFICIAL generator / initializer: it creates the real starter files (manifest, configs, entry point,
-  placeholder files). You only choose commands; you never write those files.
-- Use only executables listed in scaffold_toolchains. Allowed: npx, npm (create/init/install/pkg), pnpm, yarn, uv
-  (init/add/remove/lock), uvx, dotnet (new/sln/add), go (mod/get), cargo (new/init/add), poetry (new/init/add).
-  npx / uvx / npm create may only run allow-listed generator packages (create-vite, create-next-app, @angular/cli,
-  @nestjs/cli, create-react-router, create-astro, sv, create-vue, nuxi, create-expo-app, express-generator, typescript,
-  django, ...).
+- Read approved_trd_json (and the PRD when given): the kind of application (CLI tool, web frontend, API/service, full stack,
+  library, mobile, desktop, infrastructure) and its languages/frameworks. If the TRD leaves something open, choose the stack's
+  most common default.
+- Use ONLY the generators in the "[Scaffold catalog]" block, with their reference commands / options; the user may choose ANY
+  stack, so follow the TRD's stack even if another one would be simpler. You only choose generators; you never write the files.
+- Java / Kotlin / Groovy (Spring Boot, Quarkus, Micronaut) use the online `initializers` argument (no JDK needed), e.g.
+  {"name": "spring-boot", "folder": "backend", "options": {"build": "maven", "language": "java", "java_version": "21",
+  "dependencies": "web,data-jpa,postgresql,validation"}}. Leave boot/platform versions out to get the latest stable one.
 - The temporary folder IS the repository root:
-  * ONE application (e.g. a CLI tool, a single API, a single web app, a library): generate directly into the root with '.'
-    as the target. Do NOT create frontend/ or backend/ folders.
-  * SEVERAL parts (e.g. React frontend + FastAPI backend): one folder per part named after its role (frontend/ and backend/,
-    or web/ and api/), each created by its own generator; run follow-up commands for a part with cwd set to its folder.
-- Commands run without a terminal: pass every option a generator would otherwise ask for (--yes, --template, --typescript,
-  --vcs none / --skip-git, --defaults ...). Do not install dependencies into node_modules or a virtualenv (slow, and those
-  folders are ignored): prefer --skip-install, --no-restore, `uv add --no-sync`, `npm install --package-lock-only`.
-- Dependencies the TRD names (e.g. a CLI library) are added with the package manager (`uv add --no-sync typer`,
-  `npm install commander --package-lock-only`, `dotnet add package <name>`), never by editing a manifest yourself.
+  * ONE application (e.g. a CLI tool, a single API, a single web app, a library): generate directly into the root ('.').
+    Do NOT create frontend/ or backend/ folders.
+  * SEVERAL parts (e.g. React frontend + Spring Boot backend): one folder per part named after its role (frontend/ and
+    backend/, or web/ and api/), each created by its own generator; run follow-up commands for a part with cwd = its folder.
+- Commands run without a terminal; the system adds the known headless / skip-install flags automatically, but still pass every
+  option a generator would otherwise ask for (template, language, name ...). Never install dependencies into node_modules or a
+  virtualenv: prefer `uv add --no-sync`, `npm install --package-lock-only`.
+- Dependencies the TRD names are added with the package manager (`uv add --no-sync typer`, `npm install commander
+  --package-lock-only`, `dotnet add package <name>`) or the initializer's dependencies option, never by editing files.
 - ONE command per entry: no '&&', pipes, redirects, quotes, environment variables or 'cd' (use cwd). No version ranges with
-  '<' / '>' ; use the plain package name, an extra (fastapi[standard]) or '==<version>'. No URLs or absolute paths.
-- Reference commands (adapt names and options to the TRD; <name> = the repository name):
-  * Python CLI: `uv init --package --vcs none --name <name> .` then `uv add --no-sync <cli library, e.g. typer or click>`
-  * Python API (FastAPI): `uv init --app --vcs none --name <name> <folder or .>` then `uv add --no-sync fastapi[standard]`
-    (cwd = that folder)
-  * Django: `uvx --from django django-admin startproject <name_with_underscores> <folder or .>`
-  * Node.js / TypeScript CLI: `npm init -y`, `npm install commander --package-lock-only`,
-    `npm install typescript @types/node --save-dev --package-lock-only`, `npx --yes -p typescript tsc --init`
-  * React / Vue / Svelte / vanilla web app: `npx --yes create-vite@latest <folder or .> --template react-ts`
-    (react, vue-ts, vue, svelte-ts, vanilla-ts ...)
-  * Next.js: `npx --yes create-next-app@latest <folder or .> --ts --eslint --app --src-dir --tailwind --import-alias @/* --use-npm --skip-install --yes`
-  * Angular: `npx --yes @angular/cli@latest new <name> --directory <folder or .> --defaults --skip-install --skip-git`
-  * NestJS: `npx --yes @nestjs/cli@latest new <name> --directory <folder or .> --package-manager npm --skip-install --skip-git`
-  * .NET: `dotnet new webapi -o <folder> --no-restore` (console, classlib, blazor ...); Go: `go mod init <module>`;
-    Rust: `cargo init --name <name> --vcs none`
-- After the tool returns, check the generated paths: if the result clearly misses the TRD's main framework or put a
-  single application into a subfolder, fix the commands and run the tool again.
+  '<' / '>'; use the plain package name, an extra (fastapi[standard]) or '==<version>'. No URLs or absolute paths. Always use
+  the latest generator versions (`@latest`); never pin old versions.
+- After the tool returns, check the generated paths and warnings: if the result misses the TRD's main framework or put a single
+  application into a subfolder, fix the call and run the tool again.
 
 ==================================================
 6. OUTPUT CONTRACT (STRICT JSON ONLY)
@@ -775,6 +799,24 @@ You MUST return valid JSON matching the exact schema for the operation. Do NOT i
     "allowed_operations": [...]
   }
 }
+
+--- For a stack that cannot be generated here (STRUCTURE_OPTIONS) ---
+{
+  "status": "COMPLETE",
+  "workflow_stage": "STRUCTURE_OPTIONS",
+  "requested_stack": "<the stack the TRD / user asked for>",
+  "reason": "<why it cannot be generated here, e.g. the Flutter SDK is not installed on the DevFoundry server>",
+  "options": [
+    {"label": "<short label>", "description": "<what would be generated and how (generator / initializer)>"}
+  ],
+  "next_action": {
+    "state": "STRUCTURE_REVIEW",
+    "allowed_operations": ["GENERATE_REPOSITORY_STRUCTURE"]
+  }
+}
+Options: 2-4 of the closest stacks that CAN be generated (same language family / same kind of application first), plus,
+always last, {"label": "Install the toolchain", "description": "an administrator installs <tool> on the DevFoundry server,
+then ask again"}.
 
 --- For ERROR ---
 {

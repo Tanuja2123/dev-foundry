@@ -48,10 +48,12 @@ Then fill in `.env`:
 | `GUARDRAILS_MODEL` | Guardrails SLM model name (default: `qwen-3.8-27b`) | Optional |
 | `GUARDRAILS_ALLOWED_DOMAINS` | Comma-separated domain allowlist for URL filter | Optional |
 | `AZURE_DEVOPS_ORG_NAME` | Azure DevOps organization name or URL | Yes (for ADO project & repo creation) |
-| `GROQ_API_KEY` / `GROQ_MODEL` | Fallback provider. `GROQ_MODEL` may list several models, tried in order (default `openai/gpt-oss-20b,openai/gpt-oss-120b`; each has its own free-tier quota) | Optional |
-| `MAQ_AI_API_KEY` / `MAQ_AI_BASE_URL` / `MAQ_AI_MODEL` | Last fallback (internal SLM gateway). Requests are streamed so slow answers are not cut off by the gateway's 120 s limit | Optional |
-| `<PROVIDER>_TIMEOUT_SECONDS` / `<PROVIDER>_MAX_RETRIES` | Per-provider limits, `<PROVIDER>` = `AZURE_OPENAI` (120 s, 1 retry), `GROQ` (60 s, 2), `MAQ_AI` (900 s, 0). `GROQ_MAX_REQUEST_TOKENS` (8000): larger requests skip Groq | Optional |
-| `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project/code read & write scopes | Yes (for ADO project & repo creation) |
+| `LLM_PROVIDER_ORDER` | Fallback order of the LLM providers (default `azure_openai,maq_ai,groq`): MAQ AI takes the load when Azure is unavailable, Groq (small free-tier quotas) is the last resort | Optional |
+| `MAQ_AI_API_KEY` / `MAQ_AI_BASE_URL` / `MAQ_AI_MODEL` | First fallback (internal SLM gateway, `qwen-3.8-27b`, 131k-token context). Requests are streamed so slow answers are not cut off by the gateway's 120 s limit | Optional |
+| `GROQ_API_KEY` / `GROQ_MODEL` | Last fallback. `GROQ_MODEL` may list several models, tried in order (default `openai/gpt-oss-20b,openai/gpt-oss-120b`; each has its own free-tier quota) | Optional |
+| `CHAT_HISTORY_TOKEN_BUDGET` | How much of the conversation every agent receives (default `60000` tokens). Messages are never cut; the whole project chat is one session for the model, and only very long projects drop their oldest messages (the stored PRD/TRD are always included) | Optional |
+| `<PROVIDER>_TIMEOUT_SECONDS` / `<PROVIDER>_MAX_RETRIES` | Per-provider limits, `<PROVIDER>` = `AZURE_OPENAI` (120 s, 1 retry), `GROQ` (60 s, 2), `MAQ_AI` (900 s, 0). `GROQ_MAX_REQUEST_TOKENS` (8000): for larger requests Groq gets the newest messages that fit | Optional |
+| `AZURE_DEVOPS_PAT` | Azure DevOps Personal Access Token (PAT) with project, code and work items read & write scopes | Yes (for ADO project, repo and work item creation) |
 
 > **Without Supabase credentials**, the backend uses an in-memory conversation store (resets on restart).  
 > **If Azure OpenAI encounters any errors or credentials fail**, the chat service automatically falls back to Local SLM (`LOCAL_SLM_API_KEY`).  
@@ -124,6 +126,7 @@ Database migrations, run in this order in the Supabase SQL editor:
 3. `backend/db/migrations/003_users_and_ownership.sql`: the `AppUser` table, the Conversation → Project link and the database hardening. **Switch the backend to the service-role key first.**
 4. `backend/db/migrations/004_assign_existing_conversations.sql`: assigns the old `default_user` conversations to one account and makes the owner mandatory. Set your email in the file and run it **after signing in once**.
 5. `backend/db/migrations/005_scaffold_commands.sql`: stores the generator commands and their exact output (`Repository.scaffold_commands`, `Repository.scaffold_structure`). Without it, the generated files and the requested changes are pushed as one commit.
+6. `backend/db/migrations/006_work_items.sql`: the Azure Boards work items draft and the created items (`Project.work_items_proposal`, `Project.work_items` and their PRD versions). Without it, the work items step answers with a request to run this migration.
 
 # Azure DevOps Repository Setup
 
@@ -138,6 +141,7 @@ After the PRD and TRD are approved, the Repo Setup Agent works through these ste
    - ask for specific extra files or folders (they are layered on top of the generated files and marked "(added)"), or
    - reject the approach / ask for another stack, framework or template: the TRD is updated and the structure is generated again with new commands. Requested files that still fit are re-added.
 6. **Push:** the first push commits the generator output exactly as produced (commit 1, its message lists the commands), then the requested changes (commit 2, only if there are any). Later changes are pushed as one follow-up commit with only the differences.
+7. **Azure Boards work items** (any time after the project exists): the Backlog agent drafts one Epic, Features and one story per PRD requirement (FR-001…) with acceptance criteria. After review and explicit approval, the work items are created in the project's Azure Boards with the project's own types (Scrum: Product Backlog Item, Agile: User Story, Basic: Issue) and parent links. When the PRD changes, the work items are flagged as out of date; syncing again adds new items and updates changed ones, and never deletes or duplicates.
 
 The structure shown in chat and the files pushed are guaranteed to be the same. Both come from the `Repository` row in Supabase: the tree is drawn by code, and the push tool reads that row instead of taking files from the model.
 
@@ -150,6 +154,23 @@ The Repo Setup Agent reads the TRD and the CLIs installed on the server, and cho
 | Python CLI | `uv init --package --vcs none --name <repo> .` then `uv add --no-sync typer` |
 | React + FastAPI | `npx --yes create-vite@latest frontend --template react-ts`, `uv init --app --vcs none --name backend backend`, `uv add --no-sync fastapi[standard]` (in `backend/`) |
 | Next.js / Angular / NestJS / .NET | `create-next-app`, `@angular/cli new`, `@nestjs/cli new`, `dotnet new ...` |
+| Java / Kotlin (Spring Boot, Quarkus, Micronaut) | **Online initializers** (start.spring.io, code.quarkus.io, launch.micronaut.io): the official project zip in ~2–3 s, **no JDK on the server** |
+| React + Spring Boot | Spring Initializr into `backend/` + `npx --yes create-vite@latest frontend --template react-ts` |
+| C / C++ | `uvx conan new cmake_exe -d name=<repo> -d version=0.1` (runs through `uv`, nothing to install) |
+| Flutter / Dart | `flutter create --org com.example --project-name <name> .`, `dart create -t console <name>` |
+| Go / Rust | `go mod init <module>` + `go get <deps>`, `cargo init --name <name> --vcs none` + `cargo add <deps>` |
+| PHP (Laravel, Symfony, Slim…) | `composer create-project laravel/laravel .` (no install, no scripts) |
+| Elixir / Phoenix | `mix new <name>`, `mix phx.new <name> --no-install` |
+| Java / Kotlin via CLI | `mvn archetype:generate ...`, `gradle init --type java-application ...` (the online initializers are faster) |
+| Deno, Bun, Pulumi | `deno init`, `bun init --yes`, `pulumi new typescript --generate-only` |
+| Ruby (Rails), Swift | In the catalog, but not installed here (see *Scaffolding toolchains*): the agent offers the closest alternatives |
+
+All generators are described in one place, `backend/app/services/scaffold_catalog.py`: the allowed commands, the headless
+and skip-install flags added automatically, the files each generator must produce, and the reference command the agent
+sees. The agent only gets the generators that can actually run here. When the stack you chose can't be generated (its
+toolchain isn't installed), the agent doesn't switch stacks on its own: it lists options (the closest stacks that can be
+generated, or installing the toolchain) and waits for you. Generators always run at `@latest`, and the version actually
+used (e.g. `create-vite 9.2.1`, `Spring Boot 4.1.1`) is shown and written into the generator commit message.
 
 `backend/app/services/scaffold_service.py` runs them in an empty temporary folder (the repository root) and reads back
 every file byte for byte: empty files stay empty, images are kept as binary (pushed base64-encoded), and installer
@@ -157,7 +178,9 @@ folders (`node_modules`, `.venv`, `.git`, `obj`...) are skipped. No file content
 application is generated at the repository root, several parts get one folder each.
 
 Safety: no shell is used; only allow-listed executables and subcommands (`npx`, `npm create/init/install/pkg`, `pnpm`, `yarn`,
-`uv init/add/remove/lock`, `uvx`, `dotnet new/sln/add`, `go mod/get`, `cargo new/init/add`, `poetry new/init/add`) and
+`uv init/add/remove/lock`, `uvx`, `dotnet new/sln/add`, `go mod/get`, `cargo new/init/add`, `flutter create`, `dart create`,
+`composer create-project/require`, `mix new/phx.new`, `mvn archetype:generate`, `gradle init`, `deno init/add`,
+`bun init/create/add`, `pulumi new`; full list in `scaffold_catalog.ALLOWED_COMMANDS`) and
 allow-listed generator packages run; arguments cannot contain shell operators, URLs, absolute paths or `..`; `npm install`
 never runs dependency scripts; the commands get a minimal environment **without** the PAT, Supabase or OpenAI keys, and a
 timeout. Generators still download and run their npm/PyPI package on the backend host, so in a deployment run the backend
@@ -183,6 +206,27 @@ in a container or sandbox.
   - `backend/app/services/agents/repo_setup_agent.py`: the agent and its tools.
   - `backend/app/services/mcp/ado_git_push.py`: the push, using the Azure DevOps Git *Pushes - Create* API.
 
+### Scaffolding toolchains (no admin rights needed)
+
+The structure can only be generated for stacks whose CLI is installed on the machine that runs the backend.
+`node`/`npx`, `uv` and the .NET SDK are the base requirements. Everything else is installed **for the current user** by one
+script, without administrator rights, installers or UAC prompts. It uses official portable archives in
+`%LOCALAPPDATA%\DevFoundry\toolchains` and adds them to the user PATH:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File backend\scripts\install_toolchains.ps1              # all (~5 GB, 15-30 min)
+powershell -ExecutionPolicy Bypass -File backend\scripts\install_toolchains.ps1 -Only go,rust # a subset
+powershell -ExecutionPolicy Bypass -File backend\scripts\install_toolchains.ps1 -Force        # update to the latest versions
+```
+
+It installs Bun, Deno, Go, Rust (GNU toolchain, needs no Visual Studio), Dart, Flutter, Java (Microsoft OpenJDK LTS), Maven,
+Gradle, PHP + Composer, Erlang + Elixir (+ Hex and the Phoenix generator) and Pulumi. **Restart the backend afterwards** so it
+sees the new PATH. At startup the backend detects the installed tools in the background, and the agent only gets the
+generators that can run.
+
+Not installed: **Ruby/Rails**, because `gem install rails` needs the RubyInstaller DevKit (an installer), and **Swift**, which
+has no practical Windows toolchain. For these stacks the agent offers the closest stacks that can be generated.
+
 ## Environment variables (root `.env`)
 
 | Variable | Required | Purpose |
@@ -191,10 +235,12 @@ in a container or sandbox.
 | `AZURE_DEVOPS_PAT` | yes | Personal access token with the scopes listed below |
 | `ADO_SCAFFOLD_COMMIT_MESSAGE` | no | Default commit message. The default is `chore: initial project scaffold`. |
 | `ADO_SCAFFOLD_DEFAULT_BRANCH` | no | Branch to create in the empty repository. The default is `main`. |
-| `SCAFFOLD_COMMAND_TIMEOUT_SECONDS` | no | Time limit per generator command. The default is `240`. |
+| `TECH_CHANGE_CONFIRM_THRESHOLD` / `TECH_ADDITION_MIN_FIT` | no | Technology-change check before every TRD update: a replacement is confirmed with the user when it fits at least `3` points (1-10) worse than the current choice; an addition or removal when its own fit is `4` or lower. |
+| `TITLE_CONFIDENCE_THRESHOLD` | no | How sure (0-1) the Orchestrator must be that the chat describes a specific product before it names the chat. The default is `0.7`; below it the chat stays "New Project". After the Azure DevOps project is created, the chat title is always the project name. |
+| `SCAFFOLD_COMMAND_TIMEOUT_SECONDS` | no | Time limit per generator command. The default is `600` (first runs of Maven, Gradle, Pulumi and `go get` download their caches). |
 | `SCAFFOLD_ALLOWED_PACKAGES` | no | Extra generator packages `npx` / `uvx` / `npm create` may run (comma separated), e.g. `create-my-template` |
 
-The PAT needs **Project and Team (Read, write & manage)** to create projects and **Code (Read & write)** to create repositories and push.
+The PAT needs **Project and Team (Read, write & manage)** to create projects, **Code (Read & write)** to create repositories and push, and **Work Items (Read & write)** to create the Azure Boards work items.
 
 ## Tests
 

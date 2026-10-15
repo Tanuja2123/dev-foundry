@@ -1,5 +1,7 @@
 import os
+import threading
 import time
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,12 +13,29 @@ load_dotenv()
 
 from app.api.routes.conversations import router as conversation_router  # noqa: E402
 from app.core.logger import logger  # noqa: E402
+from app.services.scaffold_service import available_toolchains  # noqa: E402
+
+
+def _detect_toolchains() -> None:
+    try:
+        logger.info(f"[Scaffold] Toolchains available: {', '.join(available_toolchains()) or 'none'}")
+    except Exception as exc:  # detection is retried on the first scaffold request
+        logger.warning(f"[Scaffold] Toolchain detection failed: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Detect the installed scaffold toolchains in the background: JVM tools and Flutter take up to ~20 s to report
+    # their version, which would otherwise delay the first repository-structure request.
+    threading.Thread(target=_detect_toolchains, name="toolchain-warmup", daemon=True).start()
+    yield
 
 
 app = FastAPI(
     title="DevFoundry Backend",
     version="0.1.0",
     description="Backend APIs for conversation history and chat orchestration.",
+    lifespan=lifespan,
 )
 
 @app.middleware("http")

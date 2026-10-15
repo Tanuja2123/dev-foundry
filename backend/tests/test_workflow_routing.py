@@ -202,9 +202,9 @@ def test_next_steps_follow_the_workflow(db):
     pushed = [{"path": "/README.md", "content": "# c\n"}]
     store.update_repository(repo["repo_id"], status=store.REPO_PUSHED, pushed_structure=pushed)
     store.update_project(project["project_id"], workflow_stage=store.STAGE_COMPLETE)
-    assert wr.next_steps(state()) == []
+    assert labels(wr.next_steps(state())) == ["Plan work items"]          # Azure Boards (migration 006)
     store.save_structure(repo["repo_id"], [{"path": "/README.md", "content": "# c v2\n"}], 1, trd_version=1)
-    assert labels(wr.next_steps(state())) == ["Push the changes"]
+    assert labels(wr.next_steps(state())) == ["Push the changes", "Plan work items"]
 
 
 def test_next_steps_put_outdated_items_first_and_hold_the_workflow(db):

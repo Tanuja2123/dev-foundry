@@ -61,8 +61,37 @@ def test_every_provider_gets_explicit_timeout_and_retries(env):
     limits = {p.name: (p.client.client.timeout.read, p.client.client.max_retries) for p in client.providers}
     assert limits == {"Azure OpenAI": (120.0, 1), "Groq (gpt-oss-20b)": (60.0, 2), "Groq (gpt-oss-120b)": (60.0, 2),
                       "MAQ AI (SLM)": (45.0, 0)}
-    assert [p.stream for p in client.providers] == [False, False, False, True]   # only MAQ AI is streamed
+    # default order: Azure OpenAI -> MAQ AI -> Groq (MAQ AI takes the load; Groq's daily quota is the last resort)
+    assert [p.name for p in client.providers] == ["Azure OpenAI", "MAQ AI (SLM)", "Groq (gpt-oss-20b)",
+                                                  "Groq (gpt-oss-120b)"]
+    assert [p.stream for p in client.providers] == [False, True, False, False]   # only MAQ AI is streamed
     assert all(p.client.client.timeout.connect == 10.0 for p in client.providers)
+
+
+def test_provider_order_is_configurable(env):
+    env.setenv("AZURE_OPENAI_APIKEY", "k")
+    env.setenv("AZURE_OPENAI_ENDPOINT", "https://x.openai.azure.com")
+    env.setenv("GROQ_API_KEY", "k")
+    env.setenv("MAQ_AI_API_KEY", "k")
+    env.setenv("LLM_PROVIDER_ORDER", "groq, azure_openai, maq_ai")
+    client = lc.create_fallback_client()
+    assert [p.provider_id for p in client.providers] == ["groq", "groq", "azure_openai", "maq_ai"]
+
+
+def test_long_conversations_are_trimmed_for_groq_instead_of_skipping_it():
+    from agent_framework import Message
+    history = [Message(role="user" if i % 2 == 0 else "assistant", contents=["word " * 800]) for i in range(20)]
+    latest = Message(role="user", contents=["the current request with its workflow context"])
+    trimmed = lc.trim_to_request_limit(history + [latest], None, 8000)
+    assert trimmed[-1] is latest and len(trimmed) < 21                  # newest kept, oldest dropped
+    assert lc.estimate_request_tokens(trimmed, None) + lc.MIN_COMPLETION_TOKENS <= 8000
+    assert lc.trim_to_request_limit([Message(role="user", contents=["word " * 9000])], None, 8000) is None
+
+    groq = provider("Groq (20b)", "groq-answer", max_request_tokens=8000)
+    client = lc.FallbackChatCompletionClient([groq])
+    with pytest.raises(lc.AllProvidersFailedError):                     # one huge message alone: skipped
+        run(client, text="word " * 9000)
+    assert groq.client.calls == 0
 
 
 def test_groq_model_chain_from_env(env):

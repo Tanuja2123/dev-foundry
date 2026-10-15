@@ -66,15 +66,56 @@ def test_orchestrator_output_pii_blocking():
 
 def test_orchestrator_output_url_filter_unauthorized():
     """
-    Tripwire test: Restrict URLs / URL Filter rule trips on untrusted domains.
+    Links to untrusted domains are removed; the rest of the reply (e.g. a PRD) is still shown.
     """
     async def _run():
         unauthorized_output = "Here are the requirements. Also visit https://malicious-phishing-site.xyz/login for more."
         result = await check_output_guardrail(unauthorized_output)
 
+        assert result.allowed is True
+        assert "malicious-phishing-site" not in result.response_text
+        assert result.response_text == "Here are the requirements. Also visit (link removed) for more."
+
+    asyncio.run(_run())
+
+
+def test_orchestrator_output_dangerous_link_schemes_block_the_reply():
+    async def _run():
+        result = await check_output_guardrail("Click [here](javascript:alert(document.cookie)) to continue.")
         assert result.allowed is False
-        assert result.blocked_reason is not None
-        assert "URL" in (result.guardrail_name or "") or "allow list" in str(result.blocked_reason).lower()
+
+    asyncio.run(_run())
+
+
+def test_orchestrator_output_keeps_allowed_links_and_markdown_labels():
+    async def _run():
+        text = ("Repository: https://dev.azure.com/org/Clinic/_git/clinic-app. Spring project: "
+                "GET https://start.spring.io/starter.zip?type=maven-project&dependencies=web. "
+                "Docs: [FastAPI docs](https://fastapi.tiangolo.com/tutorial/) and https://myorg.visualstudio.com/x")
+        result = await check_output_guardrail(text)
+        assert result.allowed is True
+        assert "https://dev.azure.com/org/Clinic/_git/clinic-app" in result.response_text
+        assert "https://start.spring.io/starter.zip" in result.response_text
+        assert "https://myorg.visualstudio.com/x" in result.response_text
+        assert "Docs: FastAPI docs and" in result.response_text           # unknown link removed, label kept
+        assert "tiangolo" not in result.response_text
+
+    asyncio.run(_run())
+
+
+def test_orchestrator_output_full_prd_reply_is_never_blocked():
+    """Regression: the PRD must always reach the user (tech names, versions, IDs and examples are not PII or URLs)."""
+    async def _run():
+        prd = (
+            "Here is the current, suggested **Product Requirements Document (PRD)** (version 1):\n\n"
+            "## Objective\nLet 2,000 patients book appointments with 10 doctors from mobile and desktop browsers.\n\n"
+            "## Functional Requirements\n- **FR-001** The system shall send a reminder 24 hours before (p95 under 300 ms).\n"
+            "- **FR-002** Admins manage schedules in sprint S2; item A4 tracks it.\n\n"
+            "## Technology\nNext.js 15, Node.js 22 / Express 5, D3.js v7, ASP.NET Core 9, Socket.IO 4, PostgreSQL 16, "
+            "Azure SQL S2, build 20261014.3.\n\n---\n\nTell me what to change, or ask me to create the TRD when you're ready.")
+        result = await check_output_guardrail(prd)
+        assert result.allowed is True, result.blocked_reason
+        assert result.response_text == prd
 
     asyncio.run(_run())
 
@@ -110,6 +151,34 @@ def test_orchestrator_output_newline_period_not_flagged_as_url():
         assert result.allowed is True
         assert result.blocked_reason is None
         assert result.response_text == greeting_output
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("text", [
+    "Frontend: Next.js 15 with React. Backend: Node.js/Express. Charts with Chart.js and D3.js.",
+    "Backend: ASP.NET Core Web API; real-time updates with Socket.IO; mobile with Vue.js.",
+    "Files: app.py, main.ts, package.json and settings.gradle.kts.",
+])
+def test_orchestrator_output_technology_names_are_not_urls(text):
+    """Regression (seen live): a TRD mentioning Next.js / Node.js was blocked as 'Next.js: Not in allow list'."""
+    async def _run():
+        result = await check_output_guardrail(text)
+        assert result.allowed is True, result.blocked_reason
+        assert result.response_text == text
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("text, kept", [
+    ("Log in at www.malicious-phishing-site.xyz to continue.", "Log in at (link removed) to continue."),
+    ("Download from http://evil-downloads.net/setup.exe now.", "Download from (link removed) now."),
+])
+def test_orchestrator_output_unknown_links_are_removed(text, kept):
+    async def _run():
+        result = await check_output_guardrail(text)
+        assert result.allowed is True
+        assert result.response_text == kept
 
     asyncio.run(_run())
 
@@ -418,3 +487,27 @@ def test_compliant_software_development_flow():
         assert "FR-001" in output_check.response_text
 
     asyncio.run(_run())
+
+
+def test_block_messages_are_short_and_honest():
+    from app.services.conversation_service import GUARDRAIL_UNAVAILABLE_MESSAGE, guardrail_block_message
+    from app.services.guardrails_layer.client import GuardrailResultSummary
+
+    def blocked(name):
+        return GuardrailResultSummary(allowed=False, guardrail_name=name, blocked_reason="details for the log")
+
+    assert guardrail_block_message(blocked("ExecutionError")) == GUARDRAIL_UNAVAILABLE_MESSAGE
+    assert "not related to planning" in guardrail_block_message(blocked("Off Topic Prompts")) or \
+        "doesn't seem related" in guardrail_block_message(blocked("Off Topic Prompts"))
+    for name in ("Jailbreak", "Prompt Injection Detection", "Off Topic Prompts", "NSFW Text"):
+        message = guardrail_block_message(blocked(name))
+        assert "details for the log" not in message and name not in message
+
+
+@pytest.mark.skipif(__import__("os").getenv("GUARDRAILS_LIVE_TESTS") != "1",
+                    reason="Set GUARDRAILS_LIVE_TESTS=1 to run the scenarios against the real guardrail model")
+def test_live_guardrail_scenarios():
+    """Every realistic workflow message is allowed and every attack / off-topic request is blocked (real model)."""
+    from tests.guardrail_scenarios import evaluate
+    rows, mismatches = asyncio.run(evaluate(check_input_guardrail))
+    assert not mismatches, "\n".join(f"{'allow' if m[1] else 'block'} expected, got {m[3]}: {m[0]}" for m in mismatches)

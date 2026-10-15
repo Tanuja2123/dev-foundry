@@ -17,14 +17,18 @@ REPO_SETUP_OPERATIONS = (
     "GENERATE_REPOSITORY_PROPOSAL", "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY",
     "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE",
 )
+# Azure Boards work items from the PRD: a parallel track, available once the Azure DevOps project exists
+BACKLOG_OPERATIONS = ("GENERATE_WORK_ITEMS_PROPOSAL", "UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS")
 OPERATION_AGENT = {op: "Requirements_Agent" for op in REQUIREMENTS_OPERATIONS}
 OPERATION_AGENT.update({op: "Repo_Setup_Agent" for op in REPO_SETUP_OPERATIONS})
+OPERATION_AGENT.update({op: "Backlog_Agent" for op in BACKLOG_OPERATIONS})
 
 Operation = Literal[
     "GENERATE_PRD", "UPDATE_PRD", "GENERATE_TRD", "UPDATE_TRD",
     "GENERATE_PROJECT_PROPOSAL", "UPDATE_PROJECT_PROPOSAL", "CREATE_PROJECT", "UPDATE_ADO_PROJECT",
     "GENERATE_REPOSITORY_PROPOSAL", "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY",
     "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE",
+    "GENERATE_WORK_ITEMS_PROPOSAL", "UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS",
 ]
 
 
@@ -44,10 +48,40 @@ class RoutingDecision(BaseModel):
     mentions_technology: bool = Field(
         False, description="True if the user names a language, framework, database, library, cloud or infrastructure service.")
     action: Literal["delegate", "respond"] = Field(description="'delegate' to run one child-agent operation, 'respond' to answer directly.")
-    agent: Optional[Literal["Requirements_Agent", "Repo_Setup_Agent"]] = Field(None, description="Child agent, required when action is 'delegate'.")
+    agent: Optional[Literal["Requirements_Agent", "Repo_Setup_Agent", "Backlog_Agent"]] = Field(
+        None, description="Child agent, required when action is 'delegate'.")
     operation: Optional[Operation] = Field(None, description="Operation, required when action is 'delegate'. Must be one of allowed_operations.")
     reply: Optional[str] = Field(None, description="Markdown answer to the user, required when action is 'respond'.")
-    title: Optional[str] = Field(None, description="3-5 word project title, only for the very first message of a new conversation; otherwise null.")
+    different_product: bool = Field(
+        False,
+        description=(
+            "True only when the state shows this chat already has a PRD AND the latest message describes a DIFFERENT "
+            "product (another app or system, not a change to the current one), without explicitly asking to replace "
+            "the current PRD. False for changes to the current product and for 'replace the PRD with this'."))
+    show_document: Optional[Literal["PRD", "TRD"]] = Field(
+        None,
+        description=(
+            "Set (with action 'respond') when the user asks to see, show, open or find the current PRD or TRD "
+            "('where is the PRD?', 'show me the TRD'). The stored document is then shown by the system; never write it "
+            "yourself in reply."))
+    title: Optional[str] = Field(
+        None,
+        description=(
+            "2-5 word name of the PRODUCT the user wants to build, based on the whole conversation (e.g. 'School "
+            "Management System', 'Clinic Appointment Booking'). Never the user's own words, never a question, never "
+            "a placeholder. Null if no specific product has been described yet (greetings, small talk, questions "
+            "about DevFoundry such as 'what can you do?', 'what are you up to?')."
+        ),
+    )
+    title_confidence: float = Field(
+        0.0,
+        description=(
+            "0.0-1.0: how clearly the conversation so far describes ONE specific software product. 0.0 = greetings, "
+            "small talk or questions about DevFoundry; 0.3 = a vague wish ('I need an app'); 0.6 = a category without "
+            "purpose ('a management system'); 0.8 = a concrete product ('an appointment booking web app for a "
+            "clinic'); 1.0 = a detailed description. The title is only used from 0.7."
+        ),
+    )
 
 
 # Stage -> operations allowed in that stage (in workflow order)
@@ -122,6 +156,12 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
         operations.append("UPDATE_TRD")
     if has_prd and not has_trd and "GENERATE_TRD" not in operations:
         operations.append("GENERATE_TRD")
+    # Azure Boards work items: once the ADO project exists, in any later stage
+    project = (state or {}).get("project") or {}
+    if has_prd and project.get("ado_project_id"):
+        operations.append("GENERATE_WORK_ITEMS_PROPOSAL")
+        if project.get("work_items_proposal"):
+            operations += ["UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS"]
     return operations
 
 
@@ -155,7 +195,28 @@ _DOCUMENT_TRANSITIONS = {
     "GENERATE_TRD": "Great, the PRD is approved. Shall I create the Technical Requirements Document (TRD) now?",
     "GENERATE_PROJECT_PROPOSAL": "Great, the TRD is approved. Shall I proceed with repository setup and propose the "
                                  "Azure DevOps project name and description?",
+    "CREATE_WORK_ITEMS": "Great, the backlog draft is approved. Shall I create the work items in Azure Boards now?",
 }
+
+
+DIFFERENT_PRODUCT_MARKER = "your message describes a different product"
+
+
+def different_product_reply(state: Optional[Dict[str, Any]]) -> str:
+    project = (state or {}).get("project") or {}
+    current = project.get("project_name") if not store.is_placeholder_name(project.get("project_name")) else None
+    holder = f"This chat already holds the PRD for **{current}**" if current else "This chat already has a PRD"
+    return (f"{holder}, and {DIFFERENT_PRODUCT_MARKER}.\n\n"
+            "Each chat is one project, so nothing was changed. To plan the new product, click **New Project** and "
+            "paste the description there. If you want to replace this chat's PRD instead, say "
+            "\"Replace the PRD with this product\".\n\n---\n\n"
+            "Shall I continue with the current project?")
+
+
+def answers_different_product_question(history: List[Dict[str, Any]]) -> bool:
+    """True when the assistant's last reply was the 'different product' question: the user's answer decides now."""
+    last = next((m.get("text") or "" for m in reversed(history or []) if m.get("role") == "assistant"), "")
+    return DIFFERENT_PRODUCT_MARKER in last
 
 
 def apply_intent_rules(decision: RoutingDecision, stage: Optional[str],
@@ -163,8 +224,14 @@ def apply_intent_rules(decision: RoutingDecision, stage: Optional[str],
     """
     Deterministic corrections on top of the model's decision:
     - moving to the next document (TRD, repository setup) needs an explicit request, not just an approval;
-    - a technology change request is always a TRD update while a TRD exists, even if the model chose to answer directly.
+    - a technology change request is always a TRD update while a TRD exists, even if the model chose to answer directly;
+    - a different product described in a chat that already has a PRD never overwrites that PRD: the user is asked first.
     """
+    if decision.different_product and _documents(state)[0] and (
+            decision.action == "respond" or decision.operation in ("GENERATE_PRD", "UPDATE_PRD")):
+        return RoutingDecision(reasoning="different product described in a chat that already has a PRD",
+                                user_intent=decision.user_intent, action="respond",
+                                reply=different_product_reply(state))
     if (decision.action == "delegate" and decision.operation in _DOCUMENT_TRANSITIONS
             and decision.user_intent in ("approve_only", "question")):
         return RoutingDecision(reasoning=f"{decision.operation} needs an explicit request (intent: {decision.user_intent})",
@@ -213,6 +280,7 @@ _OUTDATED_SUGGESTIONS = {
     store.ADO_PROJECT_OUTDATED: ("Update Azure DevOps project",
                                  "Update the Azure DevOps project description (and name, if needed) to reflect the latest requirements."),
     store.STRUCTURE_OUTDATED: ("Update repository structure", "Update the repository structure to reflect the latest TRD."),
+    store.WORK_ITEMS_OUTDATED: ("Update work items", "Update the Azure Boards work items draft to reflect the latest PRD."),
 }
 
 
@@ -245,4 +313,19 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
             suggestions.append(("Propose folder structure", "Please propose the complete skeleton folder structure for the repository based on the approved TRD architecture."))
         else:
             suggestions.append(("Push to main", "The proposed repository folder structure is approved. Please push the initial structure to the main branch in Azure DevOps."))
+    # Azure Boards work items: offered once the repository is pushed (or as soon as a draft is waiting for approval)
+    project = (state or {}).get("project") or {}
+    if (project.get("ado_project_id") and store.has_work_item_columns(project)
+            and store.WORK_ITEMS_OUTDATED not in outdated):
+        draft, created = project.get("work_items_proposal"), project.get("work_items")
+        if draft and _draft_not_created(project):
+            suggestions.append(("Create work items", "The work items look good. Please create them in Azure Boards."))
+        elif not draft and not created and stage == store.STAGE_COMPLETE:
+            suggestions.append(("Plan work items", "Draft the Azure Boards work items (epic, features and one story "
+                                                   "per requirement with acceptance criteria) from the PRD."))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]
+
+
+def _draft_not_created(project: Dict[str, Any]) -> bool:
+    """True when the draft (or a change to it) is not in Azure Boards yet: the draft is marked "synced" on creation."""
+    return not (project.get("work_items_proposal") or {}).get("synced")

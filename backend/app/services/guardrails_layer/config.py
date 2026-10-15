@@ -85,7 +85,8 @@ ORCHESTRATOR_ALLOWED_SCOPE = (
 
 REQUIREMENTS_AGENT_ALLOWED_SCOPE = (
     "Requirements Agent allowed scope: conversational greetings, pleasantries, "
-    "gathering, analyzing, clarifying, and drafting "
+    "gathering, analyzing, clarifying, drafting, and updating "
     "software functional and non-functional requirements, Product Requirements Documents (PRD), "
-    "user stories, and acceptance criteria. Greetings and conversational pleasantries are on-topic."
+    "Technical Requirements Documents (TRD), technology stack selection, system architecture, "
+    "API design, user stories, and acceptance criteria. Greetings and conversational pleasantries are on-topic."
 )

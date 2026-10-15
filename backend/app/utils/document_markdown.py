@@ -50,7 +50,8 @@ def prd_json_to_markdown(data: Any) -> str:
                     req_text = item.get("requirement", "")
                     source = item.get("source", "")
                     if req_id and req_text:
-                        lines.append(f"- **{req_id}** _{source}_: {req_text}")
+                        lines.append(f"- **{req_id}** _{source}_: {req_text}" if source
+                                     else f"- **{req_id}**: {req_text}")
                     else:
                         # Generic dict item
                         lines.append(f"- {', '.join(f'{k}: {v}' for k, v in item.items())}")

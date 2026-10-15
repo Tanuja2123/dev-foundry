@@ -5,6 +5,7 @@ import { PanelLeftOpen, Moon, Sun, Pencil } from 'lucide-react'
 
 import {
   continueChat,
+  createConversation,
   deleteConversation,
   getConversation,
   listConversations,
@@ -20,6 +21,9 @@ import type { ChatMessage, Project, Suggestion } from '../types'
 function createId() {
   return crypto.randomUUID()
 }
+
+// Key of the new chat that is still being created (it has no conversation id yet)
+const DRAFT_KEY = '__draft__'
 
 function getInitials(name: string) {
   if (!name) return 'U'
@@ -54,8 +58,10 @@ export function HomePage() {
   >({})
   const [draftMessages, setDraftMessages] = useState<ChatMessage[]>([])
   const [draftFiles, setDraftFiles] = useState<File[]>([])
-  const [sending, setSending] = useState(false)
-  const [chatError, setChatError] = useState<string | null>(null)
+  // Chats run in parallel: each conversation has its own request, Stop button and error.
+  // DRAFT_KEY = the new chat that is still being created (before it has an id).
+  const [sendingIds, setSendingIds] = useState<Set<string>>(() => new Set())
+  const [errorsByConversation, setErrorsByConversation] = useState<Record<string, string | null>>({})
   const [sidebarState, setSidebarState] = useState<SidebarState>(() => {
     const saved = localStorage.getItem('sidebarState') as SidebarState | null
     return saved === 'hidden' ? 'hidden' : 'expanded'
@@ -70,7 +76,7 @@ export function HomePage() {
     return saved === 'dark' ? 'dark' : 'light'
   })
   const [isEditActiveProjectOpen, setIsEditActiveProjectOpen] = useState(false)
-  const abortControllerRef = useRef<AbortController | null>(null)
+  const controllersRef = useRef<Map<string, AbortController>>(new Map())
 
   useEffect(() => {
     localStorage.setItem('sidebarState', sidebarState)
@@ -186,6 +192,22 @@ export function HomePage() {
   const files = conversation
     ? (filesByConversation[conversation.id] ?? [])
     : draftFiles
+  const activeKey = conversation?.id ?? DRAFT_KEY
+  const sending = sendingIds.has(activeKey)
+  const chatError = errorsByConversation[activeKey] ?? null
+
+  function setBusy(key: string, busy: boolean) {
+    setSendingIds((current) => {
+      const next = new Set(current)
+      if (busy) next.add(key)
+      else next.delete(key)
+      return next
+    })
+  }
+
+  function setChatError(message: string | null, key: string = activeKey) {
+    setErrorsByConversation((current) => ({ ...current, [key]: message }))
+  }
 
   const displayName = account?.name ?? account?.username ?? 'Signed in'
   const initials = getInitials(displayName)
@@ -194,27 +216,27 @@ export function HomePage() {
     navigate('/projects')
   }
 
+  // Stops only the open chat's request; other chats keep running.
   function handleStopChat() {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort()
-      abortControllerRef.current = null
+    const controller = controllersRef.current.get(activeKey)
+    if (controller) {
+      controller.abort()
+      controllersRef.current.delete(activeKey)
     }
-    setSending(false)
+    setBusy(activeKey, false)
   }
 
+  // Switching chats never cancels a running request: its reply is delivered to its own chat.
   function selectConversation(conversationId: string) {
-    handleStopChat()
     setSelectedId(conversationId)
     setDraftMessages([])
     setDraftFiles([])
-    setChatError(null)
     if (location.pathname === '/projects') {
       navigate('/')
     }
   }
 
   const handleNewConversation = useCallback(() => {
-    handleStopChat()
     try {
       localStorage.removeItem(lastConversationKey)
     } catch {
@@ -223,7 +245,7 @@ export function HomePage() {
     setSelectedId(null)
     setDraftMessages([])
     setDraftFiles([])
-    setChatError(null)
+    setErrorsByConversation((current) => ({ ...current, [DRAFT_KEY]: null }))
     if (location.pathname === '/projects') {
       navigate('/')
     }
@@ -293,87 +315,62 @@ export function HomePage() {
 
   async function sendMessage(content: string) {
     if (sending) return
-    const isNew = !conversation
-    const conversationId = conversation?.id ?? null
     const userMessage: ChatMessage = {
       id: createId(),
       role: 'user',
       content,
     }
     const attachedFile = files[0] ?? null
-
-    const controller = new AbortController()
-    abortControllerRef.current = controller
-
     setChatError(null)
-    setSending(true)
 
-    if (isNew) {
+    // A new chat gets its id before the first message, so its request and reply belong to it even if the user
+    // opens another chat (or starts another new one) while it runs.
+    let conversationId = conversation?.id ?? null
+    if (!conversationId) {
+      setBusy(DRAFT_KEY, true)
       setDraftMessages([userMessage])
+      let created
+      try {
+        created = await createConversation()
+      } catch (reason) {
+        setBusy(DRAFT_KEY, false)
+        setChatError(reason instanceof Error ? reason.message : 'Could not start the chat.', DRAFT_KEY)
+        return
+      }
+      const newId = created.conversation_id
+      conversationId = newId
+      const newProject: Project = { id: newId, name: created.title || 'New Project', stage: 'requirements' }
+      setConversations((prev) => [newProject, ...prev])
+      setMessagesByConversation((prev) => ({ ...prev, [newId]: [userMessage] }))
+      setDraftMessages([])
+      setDraftFiles([])
+      setBusy(DRAFT_KEY, false)
+      setSelectedId((current) => current ?? newId)    // open it, unless the user already moved to another chat
     } else {
-      setMessagesByConversation((current) => ({
-        ...current,
-        [conversationId!]: [...(current[conversationId!] ?? []), userMessage],
-      }))
+      const id = conversationId
+      setMessagesByConversation((current) => ({ ...current, [id]: [...(current[id] ?? []), userMessage] }))
     }
 
+    const key = conversationId
+    const controller = new AbortController()
+    controllersRef.current.set(key, controller)
+    setBusy(key, true)
     try {
-      // Pass null for conversationId on the very first message
-      const result = await continueChat(conversationId, content, attachedFile, controller.signal)
+      const result = await continueChat(key, content, attachedFile, controller.signal)
       const assistantMessage: ChatMessage = {
         id: createId(),
         role: 'assistant',
         content: result.response,
       }
-      setSuggestionsByConversation((prev) => ({
-        ...prev,
-        [result.conversation_id]: result.suggestions ?? [],
-      }))
-
-      if (isNew) {
-        const newId = result.conversation_id
-        let projectTitle = result.title || 'New Project'
-        if (!result.title) {
-          try {
-            const fresh = await getConversation(newId)
-            if (fresh.title) projectTitle = fresh.title
-          } catch {
-            // fallback
-          }
-        }
-
-        const newProject: Project = {
-          id: newId,
-          name: projectTitle,
-          stage: 'requirements',
-        }
-        setConversations((prev) => [newProject, ...prev])
-        setSelectedId(newId)
-        setMessagesByConversation((prev) => ({
-          ...prev,
-          [newId]: [userMessage, assistantMessage],
-        }))
-        setDraftMessages([])
-        setDraftFiles([])
-      } else {
-        if (result.title) {
-          setConversations((current) =>
-            current.map((p) =>
-              p.id === conversationId ? { ...p, name: result.title! } : p,
-            ),
-          )
-        }
-        if (attachedFile) {
-          setFilesByConversation((current) => ({
-            ...current,
-            [conversationId!]: [],
-          }))
-        }
-        setMessagesByConversation((current) => ({
-          ...current,
-          [conversationId!]: [...(current[conversationId!] ?? []), assistantMessage],
-        }))
+      setSuggestionsByConversation((prev) => ({ ...prev, [key]: result.suggestions ?? [] }))
+      if (result.title) {
+        // the sidebar and header type the new title in (TypewriterText animates text changes)
+        setConversations((current) => current.map((p) => (p.id === key ? { ...p, name: result.title! } : p)))
       }
+      if (attachedFile) {
+        setFilesByConversation((current) => ({ ...current, [key]: [] }))
+      }
+      setMessagesByConversation((current) => ({ ...current, [key]: [...(current[key] ?? []), assistantMessage] }))
     } catch (reason) {
       if (
         (reason instanceof DOMException && reason.name === 'AbortError') ||
@@ -382,12 +379,12 @@ export function HomePage() {
       ) {
         return
       }
-      setChatError(
-        reason instanceof Error ? reason.message : 'Chat request failed.',
-      )
+      setChatError(reason instanceof Error ? reason.message : 'Chat request failed.', key)
     } finally {
-      setSending(false)
-      abortControllerRef.current = null
+      if (controllersRef.current.get(key) === controller) {
+        controllersRef.current.delete(key)
+      }
+      setBusy(key, false)
     }
   }
 
@@ -430,6 +427,7 @@ export function HomePage() {
     <div className={`app-shell sidebar-state-${sidebarState}`}>
       <Sidebar
         projects={conversations}
+        busyProjectIds={sendingIds}
         selectedProjectId={isProjectsView ? null : (conversation?.id ?? null)}
         onSelectProject={selectConversation}
         onNewProject={handleNewConversation}
@@ -473,7 +471,10 @@ export function HomePage() {
               )}
               {!isProjectsView && (
                 <div className="topbar-title-with-actions">
-                  <h1><TypewriterText text={activeProject.name} speed={28} /></h1>
+                  <h1>
+                    {/* A new chat starts as "New Project" and its product name is typed in when it arrives */}
+                    <TypewriterText key={activeProject.id || 'draft'} text={activeProject.name} speed={28} />
+                  </h1>
                   {conversation && (
                     <button
                       type="button"

@@ -71,6 +71,10 @@ class _Query:
             if self.table == "Project":
                 for column in ("prd_version", "trd_version", "trd_prd_version", "proposal_trd_version"):
                     row.setdefault(column, 0)
+                for column, default in (("work_items_proposal", None), ("work_items_proposal_prd_version", 0),
+                                        ("work_items", None), ("work_items_prd_version", 0)):   # migration 006
+                    if column not in self.db.missing_columns:
+                        row.setdefault(column, default)
             if self.table == "Repository":
                 row.setdefault("status", "PROPOSED")
                 row.setdefault("structure_version", 0)

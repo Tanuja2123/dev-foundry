@@ -35,6 +35,7 @@ test-cli/
 *.swp
 *.swo
 
+FEATURES.md
 ISSUES.md
 TESTING.md
 MERGE_NOTES.md
