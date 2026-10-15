@@ -9,6 +9,9 @@ import {
   Square,
   FileText,
   Lightbulb,
+  Copy,
+  Check,
+  Pencil,
 } from 'lucide-react'
 import { ACCEPTED_REQUIREMENT_FILES } from '../constants'
 import type { ChatMessage, Project, Suggestion } from '../types'
@@ -93,6 +96,7 @@ type ChatPanelProps = {
   error: string | null
   onSend: (content: string) => void
   onStop?: () => void
+  onEditAndResend?: (messageId: string, newContent: string) => void
   onFilesAdded: (files: FileList) => void
   onRemoveFile: (name: string) => void
 }
@@ -107,6 +111,7 @@ export function ChatPanel({
   error,
   onSend,
   onStop,
+  onEditAndResend,
   onFilesAdded,
   onRemoveFile,
 }: ChatPanelProps) {
@@ -116,6 +121,47 @@ export function ChatPanel({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+
+  useEffect(() => {
+    setEditingMessageId(null)
+  }, [project.id])
+
+  function handleEditInComposer(message: ChatMessage) {
+    if (sending) {
+      onStop?.()
+    }
+    setEditingMessageId(message.id)
+    setDraft(message.content)
+    setTimeout(() => {
+      if (textareaRef.current) {
+        textareaRef.current.focus()
+        textareaRef.current.setSelectionRange(
+          textareaRef.current.value.length,
+          textareaRef.current.value.length,
+        )
+        textareaRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' })
+      }
+    }, 50)
+  }
+
+  async function handleCopy(text: string, id: string) {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId(null), 2000)
+    } catch {
+      const el = document.createElement('textarea')
+      el.value = text
+      document.body.appendChild(el)
+      el.select()
+      document.execCommand('copy')
+      document.body.removeChild(el)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId(null), 2000)
+    }
+  }
 
   function updateJumpToLatest() {
     const container = messagesRef.current
@@ -162,7 +208,13 @@ export function ChatPanel({
     if (sending) return
     const content = (customText ?? draft).trim()
     if (!content && files.length === 0) return
-    onSend(content || 'Please analyze the uploaded document.')
+    const currentEditId = editingMessageId
+    setEditingMessageId(null)
+    if (currentEditId && onEditAndResend && customText === undefined) {
+      onEditAndResend(currentEditId, content || 'Please analyze the uploaded document.')
+    } else {
+      onSend(content || 'Please analyze the uploaded document.')
+    }
     // A suggestion click sends its own text and keeps whatever the user was typing
     if (customText === undefined) setDraft('')
     setTimeout(() => {
@@ -199,35 +251,91 @@ export function ChatPanel({
 
           </div>
         ) : (
-          messages.map((message) => {
-            const isUser = message.role === 'user'
-            return (
-              <article
-                key={message.id}
-                className={`bubble bubble-${isUser ? 'user' : 'assistant'}`}
-              >
-                <div className="bubble-header">
-                  {isUser && (
-                    <div className="bubble-avatar-icon bubble-avatar-user">
-                      <User size={13} />
-                    </div>
-                  )}
-                  <span className="bubble-role-name">
-                    {isUser ? 'You' : 'DevFoundry Copilot'}
-                  </span>
-                </div>
-                <div className="bubble-content">
-                  {isUser ? (
-                    <div className="message-body">
-                      <p style={{ whiteSpace: 'pre-wrap' }}>{message.content}</p>
-                    </div>
-                  ) : (
-                    <MarkdownRenderer content={message.content} />
-                  )}
-                </div>
-              </article>
-            )
-          })
+          (() => {
+            const lastUserMessageIndex = messages.map((m) => m.role).lastIndexOf('user')
+            return messages.map((message, index) => {
+              const isUser = message.role === 'user'
+              const isLastUserQuery = isUser && index === lastUserMessageIndex
+              const isStopped = Boolean(message.stopped)
+              const isEditingThis = editingMessageId === message.id
+              return (
+                <article
+                  key={message.id}
+                  className={`bubble bubble-${isUser ? 'user' : 'assistant'} ${isStopped ? 'bubble-stopped' : ''} ${isEditingThis ? 'bubble-editing' : ''}`}
+                >
+                  <div className="bubble-header">
+                    {isUser && (
+                      <div className="bubble-avatar-icon bubble-avatar-user">
+                        <User size={13} />
+                      </div>
+                    )}
+                    <span className="bubble-role-name">
+                      {isUser ? 'You' : 'DevFoundry Copilot'}
+                    </span>
+                    {isUser && isStopped && (
+                      <span className="stopped-badge" title="Query was stopped before response">
+                        <Square size={9} fill="currentColor" /> Stopped
+                      </span>
+                    )}
+                  </div>
+                  <div className="bubble-content">
+                    {isUser ? (
+                      <>
+                        <div className="message-body">
+                          <p style={{ whiteSpace: 'pre-wrap' }}>{message.content}</p>
+                        </div>
+                        <div className="bubble-actions bubble-actions-user">
+                          {isLastUserQuery && (
+                            <button
+                              type="button"
+                              className="edit-query-button"
+                              onClick={() => handleEditInComposer(message)}
+                              title="Edit query in input box"
+                              aria-label="Edit query in input box"
+                            >
+                              <Pencil size={13} />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="copy-response-button"
+                            onClick={() => void handleCopy(message.content, message.id)}
+                            title={copiedId === message.id ? 'Copied!' : 'Copy query'}
+                            aria-label={copiedId === message.id ? 'Copied!' : 'Copy query'}
+                          >
+                            {copiedId === message.id ? (
+                              <Check size={13} className="copy-icon-success" />
+                            ) : (
+                              <Copy size={13} />
+                            )}
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <MarkdownRenderer content={message.content} />
+                        <div className="bubble-actions">
+                          <button
+                            type="button"
+                            className="copy-response-button"
+                            onClick={() => void handleCopy(message.content, message.id)}
+                            title={copiedId === message.id ? 'Copied!' : 'Copy response'}
+                            aria-label={copiedId === message.id ? 'Copied!' : 'Copy response'}
+                          >
+                            {copiedId === message.id ? (
+                              <Check size={13} className="copy-icon-success" />
+                            ) : (
+                              <Copy size={13} />
+                            )}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </article>
+              )
+            })
+          })()
         )}
         {sending && <PendingResponse conversationId={project.id || undefined} />}
         <div ref={messagesEndRef} />
@@ -275,6 +383,27 @@ export function ChatPanel({
         )}
 
         <div className="composer">
+          {editingMessageId && (
+            <div className="composer-editing-banner">
+              <span className="composer-editing-banner-label">
+                <Pencil size={12} />
+                Editing query in input box
+              </span>
+              <button
+                type="button"
+                className="composer-editing-cancel"
+                onClick={() => {
+                  setEditingMessageId(null)
+                  setDraft('')
+                }}
+                title="Cancel editing"
+                aria-label="Cancel editing"
+              >
+                <X size={12} />
+                <span>Cancel</span>
+              </button>
+            </div>
+          )}
           {files.length > 0 && (
             <ul className="file-chips">
               {files.map((file) => (

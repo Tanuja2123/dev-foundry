@@ -3297,3 +3297,161 @@ code {
     opacity: 0;
   }
 }
+
+/* Assistant Message Actions (ChatGPT-style copy button) */
+.bubble-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 6px;
+}
+
+.copy-response-button,
+.edit-query-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--ms-text-secondary);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.copy-response-button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: var(--ms-text);
+  transform: translateY(-1px);
+}
+
+.edit-query-button:hover:not(:disabled) {
+  background: var(--ms-primary);
+  border-color: var(--ms-primary);
+  color: #ffffff;
+  transform: translateY(-1px);
+}
+
+.copy-response-button:active,
+.edit-query-button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.edit-query-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.copy-response-button .copy-icon-success {
+  color: var(--ms-success, #10b981);
+}
+
+/* User Message Bubble Actions & Edit Query */
+.bubble-user {
+  position: relative;
+}
+
+.bubble-user.bubble-stopped {
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.bubble-user.bubble-editing {
+  border-color: var(--ms-primary);
+  box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.35);
+}
+
+.stopped-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #f87171;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  margin-left: auto;
+  letter-spacing: 0.02em;
+}
+
+.bubble-actions-user {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 4px;
+}
+
+/* Composer Editing Banner */
+.composer-editing-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  margin-bottom: 6px;
+  border-radius: 8px;
+  background: rgba(14, 165, 233, 0.1);
+  border: 1px solid rgba(14, 165, 233, 0.25);
+  font-size: 0.78rem;
+  color: var(--ms-text);
+  animation: fadeIn 0.15s ease-out;
+}
+
+.composer-editing-banner-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  color: var(--ms-primary);
+}
+
+.composer-editing-cancel {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--ms-text-secondary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 6px;
+  transition: all 0.15s ease;
+}
+
+.composer-editing-cancel:hover {
+  color: var(--ms-text);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* Light Mode Overrides */
+[data-theme='light'] .edit-query-button,
+[data-theme='light'] .copy-response-button {
+  border-color: rgba(0, 0, 0, 0.1);
+  background: rgba(0, 0, 0, 0.04);
+}
+
+[data-theme='light'] .composer-editing-banner {
+  background: rgba(14, 165, 233, 0.08);
+  border-color: rgba(14, 165, 233, 0.25);
+}
+
+[data-theme='light'] .composer-editing-cancel {
+  border-color: rgba(0, 0, 0, 0.15);
+  background: rgba(0, 0, 0, 0.04);
+  color: #475569;
+}
+
+[data-theme='light'] .composer-editing-cancel:hover {
+  background: rgba(0, 0, 0, 0.08);
+  color: #0f172a;
+}
