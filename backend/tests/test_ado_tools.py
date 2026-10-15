@@ -111,12 +111,15 @@ class _ScriptedClient:
     operation_statuses = []
     project_status_code = 200
 
+    repos = None
+
     def __init__(self, *args, **kwargs):
         self._client = _REAL_HTTPX_CLIENT(transport=httpx.MockTransport(self._handle))
 
     @classmethod
-    def reset(cls, operation_statuses, project_status_code=200):
+    def reset(cls, operation_statuses, project_status_code=200, repos=None):
         cls.requests, cls.operation_statuses, cls.project_status_code = [], list(operation_statuses), project_status_code
+        cls.repos = list(repos) if repos is not None else None
 
     @classmethod
     def _handle(cls, request):
@@ -138,6 +141,16 @@ class _ScriptedClient:
                                              "_links": {"web": {"href": "https://dev.azure.com/fake-org/My%20Proj"}}})
         if request.method == "PATCH" and "/_apis/projects/" in path:
             return httpx.Response(202, json={"id": "op-1", "status": "notSet"})
+        if request.method == "GET" and path.endswith("/_apis/git/repositories"):
+            if cls.repos is not None:
+                return httpx.Response(200, json={"value": cls.repos})
+            return httpx.Response(404, text="not found")
+        if request.method == "PATCH" and "/_apis/git/repositories/" in path:
+            body = json.loads(request.content)
+            new_name = body.get("name")
+            repo_id = path.rstrip("/").split("/")[-1]
+            return httpx.Response(200, json={"id": repo_id, "name": new_name,
+                                             "webUrl": f"https://dev.azure.com/fake-org/Proj/_git/{new_name}"})
         if request.method == "POST" and path.endswith("/_apis/git/repositories"):
             return httpx.Response(201, json={"id": "repo-1", "webUrl": "https://dev.azure.com/fake-org/Proj/_git/repo"})
         return httpx.Response(400, text="unexpected")
@@ -222,6 +235,23 @@ def test_create_ado_repository_unchanged(scripted):
     result = server.create_ado_repository("Proj", "repo")
     assert result == {"status": "success", "name": "repo", "id": "repo-1",
                       "url": "https://dev.azure.com/fake-org/Proj/_git/repo"}
+
+
+def test_create_ado_repository_renames_empty_default_repo(scripted):
+    # When Azure DevOps created an empty default repo (defaultBranch is None)
+    _ScriptedClient.reset([], repos=[{"id": "default-id", "name": "My Proj", "defaultBranch": None}])
+    result = server.create_ado_repository("Proj", "my-repo")
+    assert result == {"status": "success", "name": "my-repo", "id": "default-id",
+                      "url": "https://dev.azure.com/fake-org/Proj/_git/my-repo"}
+
+
+def test_create_ado_repository_returns_existing_repo(scripted):
+    # When the repo already exists with the desired name
+    _ScriptedClient.reset([], repos=[{"id": "existing-id", "name": "my-repo", "defaultBranch": "refs/heads/main",
+                                      "webUrl": "https://dev.azure.com/fake-org/Proj/_git/my-repo"}])
+    result = server.create_ado_repository("Proj", "my-repo")
+    assert result == {"status": "success", "name": "my-repo", "id": "existing-id",
+                      "url": "https://dev.azure.com/fake-org/Proj/_git/my-repo"}
 
 
 def test_existing_tools_report_missing_config(no_ado_config):
