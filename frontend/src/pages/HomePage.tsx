@@ -1,7 +1,7 @@
 import { useMsal } from '@azure/msal-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { PanelLeftOpen, Moon, Sun, Pencil } from 'lucide-react'
+import { PanelLeftOpen, Moon, Sun } from 'lucide-react'
 
 import {
   continueChat,
@@ -10,9 +10,7 @@ import {
   getConversation,
   listConversations,
 } from '../api/chat'
-import { updateProjectName } from '../api/projects'
 import { ChatPanel } from '../components/ChatPanel'
-import { EditProjectModal } from '../components/EditProjectModal'
 import { Sidebar, type SidebarState } from '../components/Sidebar'
 import { TypewriterText } from '../components/TypewriterText'
 import { ProjectsPage } from './ProjectsPage'
@@ -75,7 +73,6 @@ export function HomePage() {
     const saved = localStorage.getItem('theme')
     return saved === 'dark' ? 'dark' : 'light'
   })
-  const [isEditActiveProjectOpen, setIsEditActiveProjectOpen] = useState(false)
   const controllersRef = useRef<Map<string, AbortController>>(new Map())
 
   useEffect(() => {
@@ -224,6 +221,50 @@ export function HomePage() {
       controllersRef.current.delete(activeKey)
     }
     setBusy(activeKey, false)
+    setMessagesByConversation((current) => {
+      const list = current[activeKey] ?? []
+      if (list.length === 0) return current
+      const last = list[list.length - 1]
+      if (last.role === 'user') {
+        return {
+          ...current,
+          [activeKey]: [...list.slice(0, -1), { ...last, stopped: true }],
+        }
+      }
+      return current
+    })
+    setDraftMessages((prev) => {
+      if (prev.length === 0) return prev
+      const last = prev[prev.length - 1]
+      if (last.role === 'user') {
+        return [...prev.slice(0, -1), { ...last, stopped: true }]
+      }
+      return prev
+    })
+  }
+
+  // Edit a stopped query and re-send it
+  async function handleEditAndResend(messageId: string, newContent: string) {
+    if (sending) return
+    const key = activeKey
+    if (conversation) {
+      setMessagesByConversation((current) => {
+        const list = current[key] ?? []
+        const idx = list.findIndex((m) => m.id === messageId)
+        if (idx === -1) return current
+        return {
+          ...current,
+          [key]: list.slice(0, idx),
+        }
+      })
+    } else {
+      setDraftMessages((prev) => {
+        const idx = prev.findIndex((m) => m.id === messageId)
+        if (idx === -1) return prev
+        return prev.slice(0, idx)
+      })
+    }
+    await sendMessage(newContent)
   }
 
   // Switching chats never cancels a running request: its reply is delivered to its own chat.
@@ -475,17 +516,6 @@ export function HomePage() {
                     {/* A new chat starts as "New Project" and its product name is typed in when it arrives */}
                     <TypewriterText key={activeProject.id || 'draft'} text={activeProject.name} speed={28} />
                   </h1>
-                  {conversation && (
-                    <button
-                      type="button"
-                      className="topbar-edit-btn"
-                      onClick={() => setIsEditActiveProjectOpen(true)}
-                      title={`Edit project name for "${activeProject.name}"`}
-                      aria-label={`Edit project name for "${activeProject.name}"`}
-                    >
-                      <Pencil size={13} />
-                    </button>
-                  )}
                 </div>
               )}
             </div>
@@ -521,24 +551,12 @@ export function HomePage() {
             error={chatError}
             onSend={(content) => void sendMessage(content)}
             onStop={handleStopChat}
+            onEditAndResend={(messageId, newContent) => void handleEditAndResend(messageId, newContent)}
             onFilesAdded={addFiles}
             onRemoveFile={removeFile}
           />
         )}
       </div>
-
-      {/* Edit Project Name Modal from Topbar */}
-      {conversation && (
-        <EditProjectModal
-          isOpen={isEditActiveProjectOpen}
-          initialName={activeProject.name}
-          onSave={async (newName) => {
-            const updated = await updateProjectName(conversation.id, newName)
-            handleUpdateProjectName(conversation.id, updated.project_name || newName)
-          }}
-          onClose={() => setIsEditActiveProjectOpen(false)}
-        />
-      )}
     </div>
   )
 }

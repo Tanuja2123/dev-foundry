@@ -28,6 +28,7 @@ export type ChatMessage = {
   id: string
   role: ChatRole
   content: string
+  stopped?: boolean
 }
 export type DocumentStatus = 'created' | 'not_created'
 
