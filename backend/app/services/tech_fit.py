@@ -183,6 +183,40 @@ def looks_affirmative(user_query: str) -> bool:
     return bool(_AFFIRMATIVE.match(user_query or ""))
 
 
+# Words a plain "yes" to the fit question may contain besides the question's own words
+_CONFIRMATION_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "go", "ahead", "do", "it", "confirm", "confirmed", "proceed",
+    "switch", "switching", "anyway", "anyways", "apply", "please", "i", "we", "want", "still", "lets", "let", "us",
+    "the", "a", "to", "that", "this", "change", "with", "and", "use", "using", "keep", "going", "fine", "accept",
+    "understood", "understand", "know", "risk", "risks", "trade", "off", "tradeoff", "despite", "lower", "fit", "it's",
+    "its", "thanks", "thank", "you", "now", "just", "really", "sounds", "good",
+}
+_DIFFERENT_CHOICE = re.compile(r"\b(but|instead|rather|actually|however|except|or)\b", re.IGNORECASE)
+
+
+def _last_assistant(history: List[Dict[str, Any]]) -> str:
+    return next((m.get("text") or "" for m in reversed(history or []) if m.get("role") == "assistant"), "")
+
+
+def is_plain_confirmation(user_query: str, history: List[Dict[str, Any]]) -> bool:
+    """
+    A clear "yes" to the fit question ("yes", "yes, switch anyway", "go ahead with Phoenix"): affirmative, no "but /
+    instead", and no word that is neither a confirmation word nor in the question itself (so "yes, but use Go" or
+    "yes, use Django" are not plain confirmations). Decided by code: the model is not asked to interpret a "yes".
+    """
+    if not (is_confirmation_turn(history) and looks_affirmative(user_query)) or _DIFFERENT_CHOICE.search(user_query):
+        return False
+    question = {w.strip(".'") for w in re.findall(r"[a-z0-9.+#']+", _last_assistant(history).lower())}
+    words = [w.strip(".'") for w in re.findall(r"[a-z0-9.+#']+", (user_query or "").lower())]
+    return all(word in _CONFIRMATION_WORDS or word in question for word in words if word)
+
+
+def _warned_choice_matches(assessment: "TechFitAssessment", history: List[Dict[str, Any]]) -> bool:
+    """The re-assessed choice is the one the question warned about (e.g. 'Elixir Phoenix' appears in the question)."""
+    choice = (assessment.requested_choice or "").strip().lower()
+    return bool(choice) and choice in _last_assistant(history).lower()
+
+
 def confirmation_reply(assessment: TechFitAssessment) -> str:
     current, requested = assessment.current_choice or "the current choice", assessment.requested_choice or "the change"
     area = f" for the {assessment.area[0].lower() + assessment.area[1:]}" if assessment.area else ""
@@ -228,6 +262,11 @@ async def gate(client: Any, user_query: str, history: List[Dict[str, Any]], stat
     if not project.get("trd"):
         return None, None
     confirming = is_confirmation_turn(history)
+    # A clear "yes" to the question is decided by code (seen live: the model re-read "yes, switch anyway" as a new
+    # switch request and the same question came back)
+    if is_plain_confirmation(user_query, history):
+        logger.info("[Tech Change Check] The user confirmed the warned change; applying it")
+        return None, original_request(history)
     assessment = await assess(client, user_query, history, project.get("prd"), project.get("trd"))
     if assessment is None:
         if confirming and looks_affirmative(user_query):
@@ -238,8 +277,8 @@ async def gate(client: Any, user_query: str, history: List[Dict[str, Any]], stat
     logger.info(f"[Tech Change Check] {assessment.current_choice!r} {assessment.current_fit} -> "
                 f"{assessment.requested_choice!r} {assessment.requested_fit} (changes={assessment.changes_technology}, "
                 f"confirms={assessment.confirms_previous_warning}, threshold {threshold()})")
-    if confirming and (assessment.confirms_previous_warning or (looks_affirmative(user_query)
-                                                                and not assessment.changes_technology)):
+    if confirming and (assessment.confirms_previous_warning or (looks_affirmative(user_query) and (
+            not assessment.changes_technology or _warned_choice_matches(assessment, history)))):
         logger.info("[Tech Change Check] The user confirmed the warned change; applying it")
         return None, original_request(history)
     if needs_confirmation(assessment):

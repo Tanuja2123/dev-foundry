@@ -280,6 +280,34 @@ def work_items_status(project: Optional[Dict[str, Any]]) -> str:
     return "; ".join(parts) or "none drafted yet"
 
 
+def has_pr_review_column(repository: Optional[Dict[str, Any]]) -> bool:
+    """True once migration 007 (Repository.pr_reviews) was run."""
+    return bool(repository) and "pr_reviews" in repository
+
+
+def save_pr_review(repository: Dict[str, Any], pr_id: int, review: Dict[str, Any]) -> Dict[str, Any]:
+    """Stores the latest review of one pull request (Repository.pr_reviews, keyed by PR id)."""
+    reviews = dict(repository.get("pr_reviews") or {})
+    reviews[str(pr_id)] = review
+    return update_repository(repository["repo_id"], pr_reviews=reviews)
+
+
+def unposted_findings(review: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    posted = (review or {}).get("posted") or {}
+    return [f for f in (review or {}).get("findings") or [] if f.get("fingerprint") not in posted]
+
+
+def pr_reviews_status(repository: Optional[Dict[str, Any]]) -> str:
+    """One line for the Orchestrator: the reviewed pull requests and whether their findings were posted."""
+    reviews = (repository or {}).get("pr_reviews") or {}
+    parts = []
+    for pr_id, review in sorted(reviews.items(), key=lambda item: int(item[0]))[-5:]:
+        findings, waiting = len(review.get("findings") or []), len(unposted_findings(review))
+        state = (f"{waiting} not posted yet" if waiting else "all posted") if findings else "nothing to post"
+        parts.append(f"PR #{pr_id} (iteration {review.get('iteration')}): {findings} findings, {state}")
+    return "; ".join(parts) or "none reviewed yet"
+
+
 # ---------------------------------------------------------------------------
 # Workflow state
 # ---------------------------------------------------------------------------
@@ -328,6 +356,8 @@ def describe_workflow_state(state: Dict[str, Any], include_requirements: bool = 
         ]
         if repository.get("commit_id"):
             lines.append(f"pushed_commit: {repository.get('commit_id')} on {repository.get('branch')}")
+        if repository.get("ado_repo_id") and has_pr_review_column(repository):
+            lines.append(f"pull_request_security_reviews: {pr_reviews_status(repository)}")
     else:
         lines.append("repository: none proposed yet")
     if project.get("ado_project_id"):

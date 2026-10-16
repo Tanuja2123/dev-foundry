@@ -132,6 +132,7 @@ Database migrations, run in this order in the Supabase SQL editor:
 4. `backend/db/migrations/004_assign_existing_conversations.sql`: assigns the old `default_user` conversations to one account and makes the owner mandatory. Set your email in the file and run it **after signing in once**.
 5. `backend/db/migrations/005_scaffold_commands.sql`: stores the generator commands and their exact output (`Repository.scaffold_commands`, `Repository.scaffold_structure`). Without it, the generated files and the requested changes are pushed as one commit.
 6. `backend/db/migrations/006_work_items.sql`: the Azure Boards work items draft and the created items (`Project.work_items_proposal`, `Project.work_items` and their PRD versions). Without it, the work items step answers with a request to run this migration.
+7. `backend/db/migrations/007_pr_reviews.sql`: the pull request security reviews (`Repository.pr_reviews`: the latest review per PR and which findings were posted). Without it, a PR review request answers with a request to run this migration.
 
 # Azure DevOps Repository Setup
 
@@ -147,6 +148,12 @@ After the PRD and TRD are approved, the Repo Setup Agent works through these ste
    - reject the approach / ask for another stack, framework or template: the TRD is updated and the structure is generated again with new commands. Requested files that still fit are re-added.
 6. **Push:** the first push commits the generator output exactly as produced (commit 1, its message lists the commands), then the requested changes (commit 2, only if there are any). Later changes are pushed as one follow-up commit with only the differences.
 7. **Azure Boards work items** (any time after the project exists): the Backlog agent drafts one Epic, Features and one story per PRD requirement (FR-001…) with acceptance criteria. After review and explicit approval, the work items are created in the project's Azure Boards with the project's own types (Scrum: Product Backlog Item, Agile: User Story, Basic: Issue) and parent links. When the PRD changes, the work items are flagged as out of date; syncing again adds new items and updates changed ones, and never deletes or duplicates.
+
+8. **Pull request security review** (any time after the repository exists): in the project chat, "Review PR #12 for security issues" reads the PR's changed files from Azure DevOps and checks the lines it adds:
+   - **rule-based checks:** secrets (cloud, Git, payment and AI keys, private keys, tokens, passwords in connection strings or assignments), committed `.env` / key files, secrets used as environment-variable defaults, plain-HTTP URLs, and hard-coded URLs / IP addresses that belong in configuration;
+   - **AI review** (Groq first, then MAQ AI): injection, XSS, missing authorization, weak crypto, disabled TLS checks, unsafe deserialization and similar issues. The PR's code is treated as data, and every AI finding must point at a line the PR adds.
+
+   The findings are shown in the chat grouped by severity, with file, line and a masked snippet: a secret is never repeated. Nothing is posted until you ask: "post the findings to PR #12" adds one comment per finding on its line, plus a summary. Posting again never duplicates a comment, and posting is refused when the PR got new commits after the review. Lock files, binaries and files over 300 KB are skipped and reported.
 
 The structure shown in chat and the files pushed are guaranteed to be the same. Both come from the `Repository` row in Supabase: the tree is drawn by code, and the push tool reads that row instead of taking files from the model.
 
@@ -244,8 +251,10 @@ has no practical Windows toolchain. For these stacks the agent offers the closes
 | `TITLE_CONFIDENCE_THRESHOLD` | no | How sure (0-1) the Orchestrator must be that the chat describes a specific product before it names the chat. The default is `0.7`; below it the chat stays "New Project". After the Azure DevOps project is created, the chat title is always the project name. |
 | `SCAFFOLD_COMMAND_TIMEOUT_SECONDS` | no | Time limit per generator command. The default is `600` (first runs of Maven, Gradle, Pulumi and `go get` download their caches). |
 | `SCAFFOLD_ALLOWED_PACKAGES` | no | Extra generator packages `npx` / `uvx` / `npm create` may run (comma separated), e.g. `create-my-template` |
+| `PR_REVIEW_CHUNK_CHARS` / `PR_REVIEW_MAX_CHUNKS` | no | Size of each part of a PR's changes sent to the AI reviewer (default `10000` characters) and how many parts are reviewed (default `6`). Larger PRs are still fully checked by the rule-based checks; the reply says when the AI review was partial. |
+| `LOG_TO_FILE` / `LOG_COLOR` / `NO_COLOR` | no | Logging. The console shows `HH:MM:SS LEVEL [Tag] message`, with each component's tag in its own colour and guardrail tripwires in bold red; the progress polls and `/health` are left out of the access log. A plain copy goes to `backend/logs/devfoundry.log` (10 MB, 3 backups); `LOG_TO_FILE=0` turns it off. Colours are used when the output is a terminal; `NO_COLOR=1` turns them off, `LOG_COLOR=1` forces them on. |
 
-The PAT needs **Project and Team (Read, write & manage)** to create projects, **Code (Read & write)** to create repositories and push, and **Work Items (Read & write)** to create the Azure Boards work items.
+The PAT needs **Project and Team (Read, write & manage)** to create projects, **Code (Read & write)** to create repositories, push, read pull requests and post review comments, and **Work Items (Read & write)** to create the Azure Boards work items.
 
 ## Tests
 

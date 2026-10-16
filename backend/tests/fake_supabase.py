@@ -81,7 +81,8 @@ class _Query:
                 row.setdefault("structure_trd_version", 0)
                 row.setdefault("pushed_structure", None)
                 row.setdefault("pushed_structure_version", None)
-                for column in ("scaffold_commands", "scaffold_structure"):  # migration 005
+                for column in ("scaffold_commands", "scaffold_structure",   # migration 005
+                               "pr_reviews"):                               # migration 007
                     if column not in self.db.missing_columns:
                         row.setdefault(column, None)
             for existing in rows:

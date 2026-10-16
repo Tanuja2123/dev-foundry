@@ -80,6 +80,47 @@ def test_confirmation_applies_the_original_request(monkeypatch):
     assert run_gate(monkeypatch, confirm, "yes, switch anyway", history) == (None, "use cobol for the current backend")
 
 
+PHOENIX = COBOL.model_copy(update={"current_choice": "Ruby on Rails", "requested_choice": "Elixir Phoenix",
+                                   "current_fit": 9, "requested_fit": 4})
+
+
+@pytest.mark.parametrize("answer", [
+    "yes, switch anyway", "yes", "Yes, switch anyway.", "go ahead", "yes please, switch to Elixir Phoenix",
+    "Yes, I confirm: apply the backend change to Elixir Phoenix despite the lower fit.",
+])
+def test_a_clear_yes_is_applied_by_code_without_asking_the_model_again(monkeypatch, answer):
+    # seen live: the re-assessment read "yes, switch anyway" as a new switch (changes=True, confirms=False) and the
+    # same question came back; a clear yes to the question is now decided by code
+    question, _ = run_gate(monkeypatch, PHOENIX, "Option: use Elixir Phoenix for the backend instead of Rails.")
+    history = [{"role": "user", "text": "Option: use Elixir Phoenix for the backend instead of Rails."},
+               {"role": "assistant", "text": question}]
+    calls = []
+
+    async def must_not_assess(*args):
+        calls.append(args)
+        return PHOENIX                                        # would re-ask, as seen live
+
+    monkeypatch.setattr(tech_fit, "assess", must_not_assess)
+    result = asyncio.run(tech_fit.gate(None, answer, history, STATE))
+    assert result == (None, "Option: use Elixir Phoenix for the backend instead of Rails.") and calls == []
+
+
+@pytest.mark.parametrize("answer", ["yes, but use Go instead", "yes, use Django", "ok then use Fortran",
+                                    "no, keep Rails", "why is Phoenix rated 4?"])
+def test_anything_but_a_clear_yes_is_not_decided_by_code(answer):
+    question = tech_fit.confirmation_reply(PHOENIX)
+    history = [{"role": "user", "text": "use phoenix"}, {"role": "assistant", "text": question}]
+    assert tech_fit.is_plain_confirmation(answer, history) is False
+
+
+def test_a_longer_yes_about_the_warned_choice_is_still_a_confirmation(monkeypatch):
+    question, _ = run_gate(monkeypatch, PHOENIX, "use phoenix")
+    history = [{"role": "user", "text": "use phoenix"}, {"role": "assistant", "text": question}]
+    # extra words make it not "plain", so the model is asked; it reports the same choice the question warned about
+    reply = run_gate(monkeypatch, PHOENIX, "yes, my team insists on switching to Elixir Phoenix", history)
+    assert reply == (None, "use phoenix")
+
+
 def test_a_different_technology_after_the_warning_is_checked_again(monkeypatch):
     question, _ = run_gate(monkeypatch, COBOL)
     history = [{"role": "user", "text": "use cobol"}, {"role": "assistant", "text": question}]

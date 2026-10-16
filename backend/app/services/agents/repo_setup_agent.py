@@ -11,6 +11,7 @@ from app.services.mcp.ado_mcp_server import (
     update_ado_project,
 )
 from app.services.mcp.ado_git_push import AdoPushError, DEFAULT_COMMIT_MESSAGE, MAX_FILES, MAX_FILE_BYTES
+from app.services import progress
 from app.services import project_store as store
 from app.services.repo_structure import apply_structure_update, layer_changes, normalize_structure
 from app.services.scaffold_service import MAX_COMMANDS, run_scaffold_commands
@@ -136,6 +137,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
             return _error(f"'{project_name}' / '{project_description}' is not a real project name/description.",
                           "VALIDATION_ERROR")
 
+        progress.begin_side_effect("Creating the Azure DevOps project")    # Stop can no longer cancel the turn
         result = create_ado_project(project_name=project_name, project_description=project_description)
         if result.get("status") == "success" and conversation_id:
             try:
@@ -167,6 +169,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
             return _error(f"'{project_name}' is not a real project name.", "VALIDATION_ERROR")
         if project_description is not None and store.is_placeholder_name(project_description):
             project_description = None
+        progress.begin_side_effect("Updating the Azure DevOps project")
         result = update_ado_project(project_id=project["ado_project_id"], project_name=project_name,
                                     project_description=project_description)
         if result.get("status") == "success":
@@ -244,6 +247,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         if store.is_placeholder_name(repository_name):
             return _error(f"'{repository_name}' is not a real repository name.", "VALIDATION_ERROR")
 
+        progress.begin_side_effect("Creating the repository in Azure DevOps")
         result = create_ado_repository(project_id_or_name=_project_ref(project, project_id_or_name),
                                        repository_name=repository_name)
         if result.get("status") == "success":
@@ -402,6 +406,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
                 item["changes"] = result["changes"]
             return item
 
+        progress.begin_side_effect("Pushing to Azure DevOps")
         scaffold = repository.get("scaffold_structure")
         commands = repository.get("scaffold_commands") or []
         if previously_pushed is None and scaffold and "pushed_structure" in repository:

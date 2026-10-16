@@ -19,6 +19,7 @@ node_modules/
 
 # Logs and OS files
 *.log
+backend/logs/
 .DS_Store
 Thumbs.db
 
@@ -40,3 +41,4 @@ ISSUES.md
 TESTING.md
 MERGE_NOTES.md
 ADO_BOARDS_AND_HIERARCHIES.md
+WORKFLOW.md

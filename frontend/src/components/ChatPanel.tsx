@@ -32,7 +32,7 @@ function pendingStatus(seconds: number) {
 
 const PROGRESS_POLL_MS = 2000
 
-function PendingResponse({ conversationId }: { conversationId?: string }) {
+function PendingResponse({ conversationId, notice }: { conversationId?: string; notice?: string | null }) {
   const [elapsed, setElapsed] = useState(0)
   const [progress, setProgress] = useState<ChatProgress | null>(null)
 
@@ -83,6 +83,7 @@ function PendingResponse({ conversationId }: { conversationId?: string }) {
         <span className="pending-elapsed">{elapsed}s</span>
       </div>
       {progress?.detail && <div className="pending-detail">{progress.detail}</div>}
+      {notice && <div className="pending-notice">{notice}</div>}
     </article>
   )
 }
@@ -94,6 +95,7 @@ type ChatPanelProps = {
   suggestions: Suggestion[]
   sending: boolean
   error: string | null
+  stopNotice?: string | null
   onSend: (content: string) => void
   onStop?: () => void
   onEditAndResend?: (messageId: string, newContent: string) => void
@@ -109,6 +111,7 @@ export function ChatPanel({
   suggestions,
   sending,
   error,
+  stopNotice,
   onSend,
   onStop,
   onEditAndResend,
@@ -337,7 +340,7 @@ export function ChatPanel({
             })
           })()
         )}
-        {sending && <PendingResponse conversationId={project.id || undefined} />}
+        {sending && <PendingResponse conversationId={project.id || undefined} notice={stopNotice} />}
         <div ref={messagesEndRef} />
         </div>
         {showJumpToLatest && (

@@ -14,6 +14,7 @@ from agent_framework import Message
 
 from app.core.logger import logger
 from app.services import ado_boards
+from app.services import progress
 from app.services import project_store as store
 from app.services.agents.backlog_agent import get_backlog_agent
 
@@ -123,6 +124,7 @@ async def create_work_items(project: Dict[str, Any]) -> str:
     if not draft:
         return NO_DRAFT_MESSAGE
     backlog = {key: value for key, value in draft.items() if key != "synced"}
+    progress.begin_side_effect("Creating the work items in Azure Boards")    # Stop can no longer cancel the turn
     result = await asyncio.to_thread(ado_boards.create_work_items, project["ado_project_id"], backlog,
                                      project.get("work_items"))
     status = result.get("status")

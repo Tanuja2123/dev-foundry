@@ -19,9 +19,12 @@ REPO_SETUP_OPERATIONS = (
 )
 # Azure Boards work items from the PRD: a parallel track, available once the Azure DevOps project exists
 BACKLOG_OPERATIONS = ("GENERATE_WORK_ITEMS_PROPOSAL", "UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS")
+# Security review of pull requests: available once the repository exists in Azure DevOps
+PR_REVIEW_OPERATIONS = ("LIST_PULL_REQUESTS", "REVIEW_PULL_REQUEST", "POST_PR_REVIEW_COMMENTS")
 OPERATION_AGENT = {op: "Requirements_Agent" for op in REQUIREMENTS_OPERATIONS}
 OPERATION_AGENT.update({op: "Repo_Setup_Agent" for op in REPO_SETUP_OPERATIONS})
 OPERATION_AGENT.update({op: "Backlog_Agent" for op in BACKLOG_OPERATIONS})
+OPERATION_AGENT.update({op: "Security_Review_Agent" for op in PR_REVIEW_OPERATIONS})
 
 Operation = Literal[
     "GENERATE_PRD", "UPDATE_PRD", "GENERATE_TRD", "UPDATE_TRD",
@@ -29,6 +32,7 @@ Operation = Literal[
     "GENERATE_REPOSITORY_PROPOSAL", "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY",
     "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE",
     "GENERATE_WORK_ITEMS_PROPOSAL", "UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS",
+    "LIST_PULL_REQUESTS", "REVIEW_PULL_REQUEST", "POST_PR_REVIEW_COMMENTS",
 ]
 
 
@@ -48,9 +52,12 @@ class RoutingDecision(BaseModel):
     mentions_technology: bool = Field(
         False, description="True if the user names a language, framework, database, library, cloud or infrastructure service.")
     action: Literal["delegate", "respond"] = Field(description="'delegate' to run one child-agent operation, 'respond' to answer directly.")
-    agent: Optional[Literal["Requirements_Agent", "Repo_Setup_Agent", "Backlog_Agent"]] = Field(
+    agent: Optional[Literal["Requirements_Agent", "Repo_Setup_Agent", "Backlog_Agent", "Security_Review_Agent"]] = Field(
         None, description="Child agent, required when action is 'delegate'.")
     operation: Optional[Operation] = Field(None, description="Operation, required when action is 'delegate'. Must be one of allowed_operations.")
+    pull_request_id: Optional[int] = Field(
+        None, description="The pull request number the user refers to ('PR #12', 'pull request 12'), for the pull "
+                          "request operations; null if none is named.")
     reply: Optional[str] = Field(None, description="Markdown answer to the user, required when action is 'respond'.")
     different_product: bool = Field(
         False,
@@ -162,6 +169,12 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
         operations.append("GENERATE_WORK_ITEMS_PROPOSAL")
         if project.get("work_items_proposal"):
             operations += ["UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS"]
+    # Pull request security reviews: once the repository exists in Azure DevOps, in any stage
+    repository = (state or {}).get("repository") or {}
+    if repository.get("ado_repo_id") and project.get("ado_project_id"):
+        operations += ["LIST_PULL_REQUESTS", "REVIEW_PULL_REQUEST"]
+        if repository.get("pr_reviews"):
+            operations.append("POST_PR_REVIEW_COMMENTS")
     return operations
 
 
@@ -196,6 +209,7 @@ _DOCUMENT_TRANSITIONS = {
     "GENERATE_PROJECT_PROPOSAL": "Great, the TRD is approved. Shall I proceed with repository setup and propose the "
                                  "Azure DevOps project name and description?",
     "CREATE_WORK_ITEMS": "Great, the backlog draft is approved. Shall I create the work items in Azure Boards now?",
+    "POST_PR_REVIEW_COMMENTS": "Shall I post the review findings as comments on the pull request now?",
 }
 
 
@@ -323,6 +337,16 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
         elif not draft and not created and stage == store.STAGE_COMPLETE:
             suggestions.append(("Plan work items", "Draft the Azure Boards work items (epic, features and one story "
                                                    "per requirement with acceptance criteria) from the PRD."))
+    # Pull request security reviews: post waiting findings first, otherwise offer a review once the code is pushed
+    if repository.get("ado_repo_id") and store.has_pr_review_column(repository):
+        waiting = [(pr_id, review) for pr_id, review in (repository.get("pr_reviews") or {}).items()
+                   if store.unposted_findings(review)]
+        if waiting:
+            pr_id = max(waiting, key=lambda item: item[1].get("reviewed_at") or "")[0]
+            suggestions.append((f"Post findings to PR #{pr_id}",
+                                f"Post the security review findings as comments on pull request #{pr_id}."))
+        elif stage == store.STAGE_COMPLETE:
+            suggestions.append(("Review a pull request", "Review the active pull request for security issues."))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]
 
 
