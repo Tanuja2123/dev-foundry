@@ -185,26 +185,26 @@ def labels(suggestions):
 def test_next_steps_follow_the_workflow(db):
     assert wr.next_steps(None) == []
     save_prd()
-    assert labels(wr.next_steps(state())) == ["Create the TRD"]
+    assert labels(wr.next_steps(state())) == ["Approve the PRD and create TRD", "Request custom adjustments to the PRD"]
     save_trd()
-    assert labels(wr.next_steps(state())) == ["Proceed to repository setup"]
+    assert labels(wr.next_steps(state())) == ["Approve the TRD and start project setup", "Adjust architecture and technology stack choices"]
     project = store.get_project(CONV)
     store.update_project(project["project_id"], project_name="Clinic", proposal_trd_version=1,
                          workflow_stage=store.STAGE_PROJECT_REVIEW)
-    assert labels(wr.next_steps(state())) == ["Create the project"]
+    assert labels(wr.next_steps(state())) == ["Approve proposal and create ADO project", "Modify proposed project name and description"]
     store.update_project(project["project_id"], ado_project_id="p", workflow_stage=store.STAGE_REPOSITORY_REVIEW)
-    assert labels(wr.next_steps(state())) == ["Suggest a repository name"]
+    assert labels(wr.next_steps(state())) == ["Suggest suitable Git repository name options", "Propose a custom Git repository name"]
     repo = store.propose_repository_name(project["project_id"], "clinic")
-    assert labels(wr.next_steps(state())) == ["Create the repository"]
+    assert labels(wr.next_steps(state())) == ["Create repository with the proposed name", "Propose a custom Git repository name"]
     store.save_structure(repo["repo_id"], [{"path": "/README.md", "content": "# c\n"}], 0, trd_version=1)
     store.update_project(project["project_id"], workflow_stage=store.STAGE_STRUCTURE_REVIEW)
-    assert labels(wr.next_steps(state())) == ["Push to main"]
+    assert labels(wr.next_steps(state())) == ["Approve proposed structure and push to main", "Request folder structure or file adjustments"]
     pushed = [{"path": "/README.md", "content": "# c\n"}]
     store.update_repository(repo["repo_id"], status=store.REPO_PUSHED, pushed_structure=pushed)
     store.update_project(project["project_id"], workflow_stage=store.STAGE_COMPLETE)
-    assert labels(wr.next_steps(state())) == ["Plan work items"]          # Azure Boards (migration 006)
+    assert labels(wr.next_steps(state())) == ["Draft project work items in Boards", "Summarize final project setup and status"]          # Azure Boards (migration 006)
     store.save_structure(repo["repo_id"], [{"path": "/README.md", "content": "# c v2\n"}], 1, trd_version=1)
-    assert labels(wr.next_steps(state())) == ["Push the changes", "Plan work items"]
+    assert labels(wr.next_steps(state())) == ["Push folder structure changes to main", "Draft project work items in Boards"]
 
 
 def test_next_steps_put_outdated_items_first_and_hold_the_workflow(db):
@@ -217,10 +217,10 @@ def test_next_steps_put_outdated_items_first_and_hold_the_workflow(db):
     store.save_structure(repo["repo_id"], [{"path": "/README.md", "content": "# c\n"}], 0, trd_version=1)
 
     save_prd({"Objective": "changed"})
-    assert labels(wr.next_steps(state())) == ["Update the TRD"]           # no "Push to main" while upstream is outdated
+    assert labels(wr.next_steps(state())) == ["Update TRD to match latest PRD"]           # no "Push to main" while upstream is outdated
     save_trd({"changed": True})
     steps = wr.next_steps(state())
-    assert labels(steps) == ["Update Azure DevOps project", "Update repository structure"]
+    assert labels(steps) == ["Update Azure DevOps project with requirements", "Update repository structure to match TRD"]
     assert all(s["prompt"] for s in steps)
     assert "outdated" in cs.follow_up_note(CONV) and "repository structure" in cs.follow_up_note(CONV)
 

@@ -123,6 +123,8 @@ def read_project(client: httpx.Client, org_url: str, project_id_or_name: str, he
         }
     data = project.json()
     web_url = (data.get("_links") or {}).get("web", {}).get("href") or f"{org_url}/{quote(data.get('name') or project_name)}"
+    if web_url and " " in web_url:
+        web_url = web_url.replace(" ", "%20")
     return {"status": "success", "id": data.get("id"), "name": data.get("name"),
             "description": data.get("description"), "url": web_url}
 
@@ -291,7 +293,9 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
                             if patch_res.status_code == 200:
                                 data = patch_res.json()
                                 repo_id = data.get("id", "")
-                                repo_url = data.get("webUrl") or data.get("remoteUrl") or f"{org_url}/{project_id_or_name}/_git/{repository_name}"
+                                repo_url = data.get("webUrl") or data.get("remoteUrl") or f"{org_url}/{quote(project_id_or_name)}/_git/{quote(repository_name)}"
+                                if repo_url and " " in repo_url:
+                                    repo_url = repo_url.replace(" ", "%20")
                                 logger.info(f"[ADO MCP] Renamed empty default repository '{r.get('name')}' to '{repository_name}'.")
                                 return {
                                     "status": "success",
@@ -308,7 +312,9 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
             if response.status_code in (200, 201):
                 data = response.json()
                 repo_id = data.get("id", "")
-                repo_url = data.get("webUrl") or data.get("remoteUrl") or f"{org_url}/{project_id_or_name}/_git/{repository_name}"
+                repo_url = data.get("webUrl") or data.get("remoteUrl") or f"{org_url}/{quote(project_id_or_name)}/_git/{quote(repository_name)}"
+                if repo_url and " " in repo_url:
+                    repo_url = repo_url.replace(" ", "%20")
                 logger.info(f"[ADO MCP] Azure DevOps repository '{repository_name}' created successfully.")
                 return {
                     "status": "success",
@@ -446,7 +452,7 @@ def update_ado_project(project_id: str, project_name: Optional[str] = None,
                 # so report what was applied.
                 updated["name"] = payload.get("name", updated.get("name"))
                 updated["description"] = payload.get("description", updated.get("description"))
-                updated["url"] = f"{org_url}/{quote(updated['name'] or str(project_id))}"
+                updated["url"] = f"{org_url}/{quote(updated['name'] or str(project_id))}".replace(" ", "%20")
                 logger.info(f"[ADO MCP] Azure DevOps project '{project_id}' updated (name='{updated.get('name')}').")
             return updated
     except Exception as e:
