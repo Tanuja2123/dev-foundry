@@ -279,6 +279,7 @@ def get_local_slm_client() -> OpenAIChatCompletionClient:
 # Workflow state persistence (Project / Repository tables)
 
 STRUCTURE_PLACEHOLDER = "[[REPOSITORY_STRUCTURE]]"
+COMMANDS_PLACEHOLDER = "[[REPOSITORY_COMMANDS]]"
 
 # Shown to the user instead of technical errors (the details are logged with the same reference)
 SERVICE_UNAVAILABLE_MESSAGE = ("⚠️ The AI service is busy or unavailable right now, so I couldn't process your message. "
@@ -395,6 +396,15 @@ def persist_requirements_output(conversation_id: Optional[str], raw_output: str)
             if stage in (store.STAGE_REQUIREMENTS, store.STAGE_PRD_REVIEW):
                 fields["workflow_stage"] = store.STAGE_PRD_REVIEW
         if trd:
+            def _strip_mandated_tags(val: Any) -> Any:
+                if isinstance(val, str):
+                    return re.sub(r"\s*\(\s*mandated(?:\s+by\s+user)?\s*\)", "", val, flags=re.IGNORECASE).strip()
+                elif isinstance(val, list):
+                    return [_strip_mandated_tags(x) for x in val]
+                elif isinstance(val, dict):
+                    return {k: _strip_mandated_tags(v) for k, v in val.items()}
+                return val
+            trd = _strip_mandated_tags(trd)
             fields["trd"] = trd
             if versioned:
                 fields["trd_version"] = (project.get("trd_version") or 0) + 1
@@ -485,14 +495,16 @@ def render_structure_for_display(state: Dict) -> Optional[str]:
         changes = layer_changes(scaffold, files)
         notes.update({path: "added" for path in changes["add"]})
         notes.update({path: "edited" for path in changes["edit"]})
-    if commands and repository.get("pushed_structure") is not None:
-        # Only once the structure exists in the repository: which commands created it (not shown during the review)
-        parts.append("Created by running these commands (their exact output is the first commit"
-                     + (", followed by the changes you asked for" if notes or changes["delete"] else "") + "):")
-        parts.append(_format_commands(commands))
+    # Directory tree first
     parts.append(render_structure_tree(files, root_name=repository.get("repo_name"), notes=notes))
     if changes["delete"]:
         parts.append("Removed from the generated files: " + ", ".join(f"`{p}`" for p in changes["delete"]))
+
+    # Generator commands directly UNDER the directory tree
+    if commands and repository.get("pushed_structure") is not None:
+        parts.append("Created by running these commands (their exact output is the first commit"
+                     + (", followed by the changes you asked for" if notes or changes["delete"] else "") + "):")
+        parts.append(_format_commands(commands))
 
     if not pushed and repository.get("pushed_structure") is None and scaffold and any(changes.values()):
         counts = ", ".join(f"{len(changes[k])} {label}" for k, label in
@@ -500,6 +512,39 @@ def render_structure_for_display(state: Dict) -> Optional[str]:
         parts.append(f"On approval this is pushed to `main` in two commits: the generator output ({len(scaffold)} files), "
                      f"then your requested changes ({counts}).")
     return "\n\n".join(parts)
+
+
+def render_tree_only(state: Dict) -> Optional[str]:
+    repository = (state or {}).get("repository") or {}
+    files = repository.get("structure") or []
+    if not files:
+        return None
+    scaffold = repository.get("scaffold_structure")
+    notes: Dict[str, str] = {}
+    if scaffold:
+        changes = layer_changes(scaffold, files)
+        notes.update({path: "added" for path in changes["add"]})
+        notes.update({path: "edited" for path in changes["edit"]})
+    return render_structure_tree(files, root_name=repository.get("repo_name"), notes=notes)
+
+
+def render_commands_for_display(state: Dict) -> Optional[str]:
+    repository = (state or {}).get("repository") or {}
+    files = repository.get("structure") or []
+    commands = repository.get("scaffold_commands") or []
+    if not commands or repository.get("pushed_structure") is None:
+        return None
+    scaffold = repository.get("scaffold_structure")
+    notes: Dict[str, str] = {}
+    changes = {"add": [], "edit": [], "delete": []}
+    if scaffold:
+        changes = layer_changes(scaffold, files)
+        notes.update({path: "added" for path in changes["add"]})
+        notes.update({path: "edited" for path in changes["edit"]})
+    title = f"**Pushed repository structure** (version {repository.get('structure_version')}, {len(files)} files)"
+    header = ("Created by running these commands (their exact output is the first commit"
+              + (", followed by the changes you asked for" if notes or changes["delete"] else "") + "):")
+    return f"{title}\n\n{header}\n\n{_format_commands(commands)}"
 
 def partial_success_reply(before: Optional[Dict], after: Optional[Dict], reference: str) -> Optional[str]:
     """
@@ -587,8 +632,15 @@ def stored_document_reply(document: Optional[str], workflow_state: Optional[Dict
     elif document == "TRD" and project.get("trd"):
         body, name = trd_json_to_markdown(project["trd"]), "Technical Requirements Document (TRD)"
         step = ("Tell me what to change in the TRD, or continue with the next step." if project.get("project_name") else
-                "Tell me what to change, or ask me to proceed with repository setup when you're ready.")
+                "Tell me what to change, or ask me to proceed with project setup when you're ready.")
         version = project.get("trd_version")
+    elif document == "STRUCTURE" and (workflow_state or {}).get("repository", {}).get("structure"):
+        tree = render_structure_for_display(workflow_state)
+        repo_name = (workflow_state or {}).get("repository", {}).get("repo_name") or "repository"
+        pushed = bool((workflow_state or {}).get("repository", {}).get("commit_id"))
+        status_text = "pushed to `main`" if pushed else "ready for review before pushing to `main`"
+        step = "The repository setup is complete." if pushed else "Review it, then say **push to main** or tell me what to change."
+        return f"Here is the proposed repository folder structure for **{repo_name}** ({status_text}):\n\n{tree}\n\n---\n\n{step}"
     else:
         return None
     label = f" (version {version})" if version else ""
@@ -621,10 +673,41 @@ def presents_document(reply: str) -> bool:
         and text.count("\n") >= 5
 
 
+def _encode_markdown_links(text: str) -> str:
+    """Ensure any markdown link [label](url) with spaces in url is percent-encoded so it's clickable."""
+    def _replace(match):
+        label = match.group(1)
+        url = match.group(2)
+        clean_url = url.replace(" ", "%20")
+        return f"[{label}]({clean_url})"
+    return re.sub(r'\[([^\]]+)\]\((https?://[^)]+)\)', _replace, text)
+
+
+def _strip_meta_commentary(text: str) -> str:
+    """Strips LLM meta-commentary, case reflection, checklists, and rule self-checks."""
+    if not text:
+        return text
+    patterns = [
+        r"(?is)\n*-{0,3}\s*That'?s the (?:full,?\s*)?formatted response for\b.*",
+        r"(?is)\n*-{0,3}\s*Here'?s a (?:quick\s*)?checklist of what was included\b.*",
+        r"(?is)\n*-{0,3}\s*Let me double-check against the rules:?\b.*",
+        r"(?is)\n*-{0,3}\s*Everything looks correct\.\s+The response is clean\b.*",
+        r"(?is)\n*-{0,3}\s*Ready for the user'?s reply\b.*",
+    ]
+    for pat in patterns:
+        text = re.sub(pat, "", text)
+    return text.strip()
+
+
 def normalize_reply(text: str) -> str:
-    """Models sometimes return escaped line breaks ("\\n") inside the reply; turn them into real ones."""
-    if text and "\\n" in text and text.count("\\n") > text.count("\n"):
-        return text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    """Normalize reply line breaks, strip meta-commentary, strip mandated tags, and encode markdown links."""
+    if not text:
+        return ""
+    if "\\n" in text and text.count("\\n") > text.count("\n"):
+        text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
+    text = _strip_meta_commentary(text)
+    text = re.sub(r"\s*\(\s*mandated(?:\s+by\s+user)?\s*\)", "", text, flags=re.IGNORECASE)
+    text = _encode_markdown_links(text)
     return text
 
 
@@ -685,13 +768,56 @@ def enforce_closing_line(text: str) -> str:
     return "\n\n".join(body + ["---", closing])
 
 
-def insert_structure_tree(text: str, tree_markdown: Optional[str]) -> str:
-    """Replaces the synthesizer's placeholder with the code-rendered tree (appends it if the placeholder is missing)."""
-    if not tree_markdown:
-        return text.replace(STRUCTURE_PLACEHOLDER, "")
-    if STRUCTURE_PLACEHOLDER in text:
-        return text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
-    return text.rstrip() + "\n\n" + tree_markdown
+def should_attach_structure_tree(text: str, state: Optional[Dict[str, Any]]) -> bool:
+    """
+    True when a conversational reply discusses repository creation or the folder structure in STRUCTURE_REVIEW,
+    or asks to push/review/update it, but does not yet include the rendered structure tree.
+    """
+    if not state:
+        return False
+    repo = state.get("repository") or {}
+    files = repo.get("structure") or []
+    if not files or repo.get("pushed_structure") is not None or repo.get("commit_id"):
+        return False
+    marker = f"(version {repo.get('structure_version')},"
+    if marker in text or STRUCTURE_PLACEHOLDER in text:
+        return False
+    lower = text.lower()
+    keywords = (
+        "current structure", "repository structure", "folder structure", "proposed structure",
+        "generate or push", "push the current", "push it", "push to main", "push to the main branch",
+        "git repository", "has already been created", "created successfully", "starter structure",
+        "approve proposed structure", "repository is ready", "structure is ready"
+    )
+    return any(k in lower for k in keywords)
+
+
+def insert_structure_tree(text: str, tree_markdown: Optional[str], commands_markdown: Optional[str] = None) -> str:
+    """Replaces the synthesizer's placeholders with the code-rendered tree and commands."""
+    if tree_markdown:
+        if STRUCTURE_PLACEHOLDER in text:
+            text = text.replace(STRUCTURE_PLACEHOLDER, tree_markdown, 1).replace(STRUCTURE_PLACEHOLDER, "")
+        elif "\n---" in text:
+            parts = text.rsplit("\n---", 1)
+            text = parts[0].rstrip() + "\n\n" + tree_markdown + "\n\n---" + parts[1]
+        else:
+            text = text.rstrip() + "\n\n" + tree_markdown
+    else:
+        text = text.replace(STRUCTURE_PLACEHOLDER, "")
+
+    if commands_markdown:
+        if COMMANDS_PLACEHOLDER in text:
+            text = text.replace(COMMANDS_PLACEHOLDER, commands_markdown, 1).replace(COMMANDS_PLACEHOLDER, "")
+        else:
+            if "\n---" in text:
+                parts = text.rsplit("\n---", 1)
+                text = parts[0].rstrip() + "\n\n" + commands_markdown + "\n\n---" + parts[1]
+            else:
+                text = text.rstrip() + "\n\n" + commands_markdown
+    else:
+        text = text.replace(COMMANDS_PLACEHOLDER, "")
+
+    return text
 
 DEFAULT_HISTORY_TOKEN_BUDGET = 60_000
 
@@ -805,10 +931,10 @@ ROUTING RULES:
      "go ahead with the technical requirements", or "yes" as a direct answer to the question "Would you like me to create a TRD?").
      Approving or praising the PRD ("the PRD looks good", "PRD approved") is NOT a request for the TRD:
      respond, confirming the PRD is approved, and ask whether you should create the TRD now.
-   - TRD -> repository setup: delegate GENERATE_PROJECT_PROPOSAL only if the user explicitly asks to proceed with repository /
-     Azure DevOps project setup (e.g. "let's proceed with repository setup", "set up the ADO project").
+   - TRD -> project setup: delegate GENERATE_PROJECT_PROPOSAL only if the user explicitly asks to proceed with project /
+     Azure DevOps project setup (e.g. "let's proceed with project setup", "proceed with repository setup", "set up the ADO project").
      Approving the TRD alone ("the TRD looks good") is NOT that request: respond, confirming the TRD is final, and ask
-     whether to proceed with repository setup.
+     whether to proceed with project setup.
 2. The PRD and TRD can be updated at ANY stage, even after the Azure DevOps project, repository or push exist.
    - Any message about technologies (use, add, replace, remove or keep a language, framework, database, library or cloud
      service) is UPDATE_TRD, EVEN IF the TRD already contains that technology. Never treat it as approval to move on.
@@ -1156,9 +1282,16 @@ CASE 3: If status is "COMPLETE" and workflow_stage is "TRD" (or contains technic
   * **Integration & Infrastructure** (External Integrations, File Storage, Messaging, Deployment, CI/CD & Observability, Rationale)
   * **Security** (Authentication & Authorization, Data Protection, Application Security, Compliance, Rationale)
 - Under each heading use ONE flat bullet per field, e.g. "- **Framework:** React" and "- **Supporting Technologies:** Redux Toolkit, React Router".
-  Do not nest lists. Put the rationale in its own short paragraph starting with "**Rationale:**".
+  Do not nest lists. Never output "(mandated by user)", "(mandated)", or "(as requested)" anywhere in the stack. Output only clean technology names.
+  Put the rationale in its own short 2-sentence paragraph starting with "**Rationale:**" (strictly 2 sentences, under 45 words, project-specific, zero generic marketing praise or velocity filler).
 - If change_notes is present, start with a short "**What changed:**" paragraph based on change_notes (including when nothing needed to change).
-- Closing sentence: ask whether they want to change any of these technology choices or proceed with repository setup.
+- Closing sentence: ask whether they want to change any of these technology choices or proceed with project setup.
+
+CRITICAL RULE — ZERO META-COMMENTARY:
+- Output ONLY the final user-facing response.
+- NEVER include internal explanations, checklists, rule reviews, or meta-commentary (e.g., NEVER write "That's the formatted response for CASE...", "Here's a quick checklist of what was included and why", or tables detailing fields and purposes).
+- All project and repository URLs in Markdown links must have spaces encoded with %20 (e.g. "[Project Name](https://dev.azure.com/org/Project%20Name)") so they are clickable links.
+- Stop immediately after the single closing sentence following the "---" divider.
 
 CLOSING RULE (every case): the content ends, then a divider line "---" on its own line, then exactly ONE plain sentence (no
 bullet, no heading, no bold label) telling the user what they can do next. Nothing after that sentence.
@@ -1225,8 +1358,11 @@ Put a blank line before and after every heading, divider (---) and list; never p
             # The structure shown to the user is rendered from the stored files (the same files that get pushed)
             child_data = parse_agent_json(child_raw_json) or {}
             structure_tree = None
-            if conversation_id and child_data.get("workflow_stage") in STRUCTURE_STAGES:
-                structure_tree = render_structure_for_display(store.get_workflow_state(conversation_id))
+            commands_block = None
+            if conversation_id and (child_data.get("workflow_stage") in STRUCTURE_STAGES or
+                                    operation in ("CREATE_REPOSITORY", "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE")):
+                wf_state = store.get_workflow_state(conversation_id)
+                structure_tree = render_structure_for_display(wf_state)
 
             # Orchestrator Synthesizer for Repo_Setup_Agent
             logger.info("[Orchestrator] Converting Repo_Setup_Agent output into user-facing natural language...")
@@ -1256,7 +1392,7 @@ CASE 3: If status is "COMPLETE" and workflow_stage is "PROJECT_CREATED":
 - Show the project details clearly:
   * **Project Name**: [name]
   * **Project ID**: [id]
-  * **Project URL**: [link](url)
+  * **Project URL**: [[name]](<url_with_%20_for_spaces>) (ensure the markdown link URL is encoded so it is clickable in browsers)
 - Present the next step: the suggested repository name (**Suggested Repository Name**: repository_proposal.repo_name).
 - Closing sentence: "Shall I create the repository with this name, or would you prefer a different name?"
 
@@ -1281,19 +1417,32 @@ CASE 6b: If status is "COMPLETE" and workflow_stage is "STRUCTURE_OPTIONS":
 - Closing sentence: ask the user to choose an option (or name another stack). Do NOT output the structure placeholder line.
 
 CASE 7: If status is "COMPLETE" and workflow_stage is "STRUCTURE_PUSHED":
-- Announce that the approved structure was pushed to the branch, as push.commits describes: one line per commit with its
-  kind, **Commit ID** (short), **Commit Message** (first line only), file count and a [link](commit_url). For a commit with
-  changes, list the added, edited and deleted files.
-- Show **Repository**, **Branch** and **Files** (files_count).
-- Output the placeholder line (see STRUCTURE RULE), then state that repository setup is complete and the project is ready for development.
+- Start with heading "### Structure Pushed Successfully" followed by:
+  "The approved structure has been pushed to the repository. Here's what was committed:"
+- Immediately output the placeholder line: {STRUCTURE_PLACEHOLDER}
+- Next line: "Repository setup is complete, and the project is ready for development."
+- Next, list each commit from push.commits as exactly one clean bullet line (do NOT list individual added, edited, or deleted file paths, as the directory tree already shows them):
+  "- **<kind>** — `<short commit_id>` — *<commit_message>* — <files_count> files — [View Commit](<commit_url>)"
+- Next, show the details table:
+  | Detail | Value |
+  |---|---|
+  | **Repository** | <repository_name> |
+  | **Branch** | <branch> |
+  | **Files** | <files_count> |
 
 CASE 8: If status is "COMPLETE" and workflow_stage is "ADO_PROJECT_UPDATED":
 - Announce that the Azure DevOps project was updated, with **Project Name**, **Project Description** and **Project URL** ([link](url)).
 
 STRUCTURE RULE (CASES 1, 5, 6, 7):
-- Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs. The system replaces it with
-  the exact stored structure (and, once it has been pushed, the commands that created it).
-- NEVER draw the folder tree, list the files or mention / repeat any generator commands yourself.
+- Output the exact line {STRUCTURE_PLACEHOLDER} on its own line where the folder structure belongs.
+- The system replaces this placeholder with the exact stored structure and the generator commands under it.
+- NEVER draw the folder tree, list file paths or repeat any generator commands yourself.
+
+CRITICAL RULE — ZERO META-COMMENTARY:
+- Output ONLY the final user-facing response.
+- NEVER include internal explanations, checklists, rule reviews, or meta-commentary (e.g., NEVER write "That's the formatted response for CASE...", "Here's a quick checklist of what was included and why", or tables detailing fields and purposes).
+- All project and repository URLs in Markdown links must have spaces encoded with %20 (e.g. "[Project Name](https://dev.azure.com/org/Project%20Name)") so they are clickable links.
+- Stop immediately after the single closing sentence following the "---" divider.
 
 CLOSING RULE (every case): the content ends, then a divider line "---" on its own line, then exactly ONE plain sentence (no
 bullet, no heading, no bold label) telling the user what they can do next. Nothing after that sentence.
@@ -1312,7 +1461,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 messages=[Message(role="user", contents=["Please present this update to the user."])])
             synth_duration = round((time.time() - synth_start) * 1000, 1)
             response_text = synthesis_result.messages[-1].text if synthesis_result.messages else child_raw_json
-            response_text = enforce_closing_line(insert_structure_tree(response_text, structure_tree))
+            response_text = enforce_closing_line(normalize_reply(insert_structure_tree(response_text, structure_tree, commands_block)))
             logger.info(f"[Orchestrator] Response synthesized ({synth_duration}ms)")
 
         elif route_agent == "Backlog_Agent":
@@ -1327,6 +1476,11 @@ Put a blank line before and after every heading, divider (---) and list; never p
             if stored_document:
                 logger.info(f"[Routing Decision] Showing the stored {decision.show_document}")
             response_text = enforce_closing_line(stored_document or normalize_reply(response_text))
+            if not stored_document and should_attach_structure_tree(response_text, workflow_state):
+                tree = render_structure_for_display(workflow_state)
+                if tree:
+                    logger.info("[Routing Decision] Attaching proposed repository structure to conversational reply")
+                    response_text = enforce_closing_line(insert_structure_tree(response_text, tree))
 
         return title_prefix + response_text
 

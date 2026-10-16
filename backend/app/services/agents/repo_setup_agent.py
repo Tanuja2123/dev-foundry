@@ -591,9 +591,10 @@ E. UPDATE_REPOSITORY_PROPOSAL:
 F. CREATE_REPOSITORY:
 - Triggered ONLY when the user explicitly approves the proposed repository name.
 - Call `create_ado_repository` with the ADO project name (project_name from the workflow state) and the approved repository name.
-- If it succeeds, call `scaffold_repository_structure` with the generators for the approved TRD (see section 5). If the TRD's
-  stack cannot be generated on this server, do not call it: return STRUCTURE_OPTIONS (the repository stays empty until the
-  user chooses).
+- If it succeeds (or if the repository already exists / already_existed is True):
+  * If the repository structure does not exist yet: call `scaffold_repository_structure` with the generators for the approved TRD (see section 5). If the TRD's stack cannot be generated on this server, do not call it: return STRUCTURE_OPTIONS (the repository stays empty until the user chooses).
+  * If the repository structure is already scaffolded in the workflow state: include that structure in the output.
+  * In all cases, return the proposed repository structure so the user can review it before pushing.
 - Return status "COMPLETE", workflow_stage "REPOSITORY_CREATED", repository details (name, id, url), the structure (version,
   files_count, the commands exactly as run, and a summary of what the generators created), and next_action state
   "STRUCTURE_REVIEW" with allowed_operations: ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].

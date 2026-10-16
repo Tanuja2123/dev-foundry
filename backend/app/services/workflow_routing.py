@@ -58,7 +58,7 @@ class RoutingDecision(BaseModel):
             "True only when the state shows this chat already has a PRD AND the latest message describes a DIFFERENT "
             "product (another app or system, not a change to the current one), without explicitly asking to replace "
             "the current PRD. False for changes to the current product and for 'replace the PRD with this'."))
-    show_document: Optional[Literal["PRD", "TRD"]] = Field(
+    show_document: Optional[Literal["PRD", "TRD", "STRUCTURE"]] = Field(
         None,
         description=(
             "Set (with action 'respond') when the user asks to see, show, open or find the current PRD or TRD "
@@ -107,7 +107,7 @@ ALLOWED_OPERATIONS: Dict[str, Tuple[str, ...]] = {
 STAGE_HINTS = {
     store.STAGE_REQUIREMENTS: "Describe the product you want to build (or upload a requirements document) and I'll draft the Product Requirements Document (PRD).",
     store.STAGE_PRD_REVIEW: "The PRD is ready for your review. You can ask for changes, or ask me to create the Technical Requirements Document (TRD).",
-    store.STAGE_TRD_REVIEW: "The TRD is ready for your review. You can ask for technology changes, or ask me to proceed with repository setup.",
+    store.STAGE_TRD_REVIEW: "The TRD is ready for your review. You can ask for technology changes, or ask me to proceed with project setup.",
     store.STAGE_PROJECT_REVIEW: "The Azure DevOps project proposal is ready. You can change the name or description, or approve it to create the project.",
     store.STAGE_REPOSITORY_REVIEW: "The Azure DevOps project exists. You can change the suggested repository name, or approve it to create the repository.",
     store.STAGE_STRUCTURE_REVIEW: "The repository folder structure is ready for review. You can request changes, or approve it to push it to the main branch.",
@@ -143,11 +143,11 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
     if stage == store.STAGE_REQUIREMENTS and not has_prd:
         return ["GENERATE_PRD", "UPDATE_PRD"]
     operations = list(ALLOWED_OPERATIONS.get(stage, ()))
-    # If the repository exists in STRUCTURE_REVIEW but structure has not been saved yet,
-    # allow CREATE_REPOSITORY to idempotently complete structure creation
+    # In STRUCTURE_REVIEW, allow CREATE_REPOSITORY to idempotently handle repository creation / confirmation
     if stage == store.STAGE_STRUCTURE_REVIEW and state:
         repo = state.get("repository") or {}
-        if not repo.get("structure") and "CREATE_REPOSITORY" not in operations:
+        if "CREATE_REPOSITORY" not in operations and repo.get("status") in (
+                store.REPO_PROPOSED, store.REPO_CREATED, store.REPO_STRUCTURE_REVIEW):
             operations.append("CREATE_REPOSITORY")
     # The PRD and TRD can be updated at any time; downstream artifacts are then flagged as outdated.
     if has_prd and "UPDATE_PRD" not in operations:
@@ -193,7 +193,7 @@ def validate_decision(decision: RoutingDecision, stage: Optional[str],
 # Steps that move from one document to the next: they need an explicit request, an approval alone is not enough.
 _DOCUMENT_TRANSITIONS = {
     "GENERATE_TRD": "Great, the PRD is approved. Shall I create the Technical Requirements Document (TRD) now?",
-    "GENERATE_PROJECT_PROPOSAL": "Great, the TRD is approved. Shall I proceed with repository setup and propose the "
+    "GENERATE_PROJECT_PROPOSAL": "Great, the TRD is approved. Shall I proceed with project setup and propose the "
                                  "Azure DevOps project name and description?",
     "CREATE_WORK_ITEMS": "Great, the backlog draft is approved. Shall I create the work items in Azure Boards now?",
 }
@@ -274,13 +274,13 @@ def blocked_reply(stage: Optional[str], reason: str) -> str:
 # ---------------------------------------------------------------------------
 
 _OUTDATED_SUGGESTIONS = {
-    store.TRD_OUTDATED: ("Update the TRD", "Update the TRD to reflect the latest PRD changes."),
-    store.PROJECT_PROPOSAL_OUTDATED: ("Refresh project proposal",
+    store.TRD_OUTDATED: ("Update TRD to match latest PRD", "Update the TRD to reflect the latest PRD changes."),
+    store.PROJECT_PROPOSAL_OUTDATED: ("Refresh project proposal for new requirements",
                                       "Update the project name and description to reflect the latest requirements."),
-    store.ADO_PROJECT_OUTDATED: ("Update Azure DevOps project",
+    store.ADO_PROJECT_OUTDATED: ("Update Azure DevOps project with requirements",
                                  "Update the Azure DevOps project description (and name, if needed) to reflect the latest requirements."),
-    store.STRUCTURE_OUTDATED: ("Update repository structure", "Update the repository structure to reflect the latest TRD."),
-    store.WORK_ITEMS_OUTDATED: ("Update work items", "Update the Azure Boards work items draft to reflect the latest PRD."),
+    store.STRUCTURE_OUTDATED: ("Update repository structure to match TRD", "Update the repository structure to reflect the latest TRD."),
+    store.WORK_ITEMS_OUTDATED: ("Update Azure Boards items from PRD", "Update the Azure Boards work items draft to reflect the latest PRD."),
 }
 
 
@@ -295,34 +295,93 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
 
     # Only suggest moving forward when nothing upstream is outdated
     if not suggestions:
-        if stage == store.STAGE_PRD_REVIEW:
-            suggestions.append(("Create the TRD", "The PRD looks comprehensive and approved. Please generate the detailed Technical Requirements Document (TRD) covering technology stack, system architecture, and API design."))
+        if stage == store.STAGE_REQUIREMENTS:
+            suggestions.append((
+                "Proceed with recommended project requirements defaults",
+                "Please proceed by making reasonable assumptions based on industry best practices and generate the Product Requirements Document (PRD)."
+            ))
+            suggestions.append((
+                "Specify core requirements and platform goals",
+                "Here are the specific requirements for the product:\n- Target Roles: <e.g. Customer, Administrator>\n- Core Capabilities: <e.g. browse catalogue, place orders, view order history>\n- Supported Platform: <e.g. Web browser with individual sign-in>\n- Success Criteria: <e.g. reduce order processing time by 30%>"
+            ))
+        elif stage == store.STAGE_PRD_REVIEW:
+            suggestions.append((
+                "Approve the PRD and create TRD",
+                "The PRD looks comprehensive and approved. Please generate the detailed Technical Requirements Document (TRD) covering technology stack, system architecture, and API design."
+            ))
+            suggestions.append((
+                "Request custom adjustments to the PRD",
+                "I would like to make some adjustments to the PRD. Specifically: <describe user roles, capabilities, or constraints to add or change>"
+            ))
         elif stage == store.STAGE_TRD_REVIEW:
-            suggestions.append(("Proceed to repository setup", "The TRD architecture and technology stack are approved. Let's proceed with repository setup and propose the Azure DevOps project name and description."))
+            suggestions.append((
+                "Approve the TRD and start project setup",
+                "The TRD architecture and technology stack are approved. Let's proceed with project setup and propose the Azure DevOps project name and description."
+            ))
+            suggestions.append((
+                "Adjust architecture and technology stack choices",
+                "I would like to adjust some of the technology choices in the TRD. Specifically: <specify framework, language, database, or tool to change and what to replace it with>"
+            ))
         elif stage == store.STAGE_PROJECT_REVIEW:
-            suggestions.append(("Create the project", "The proposed Azure DevOps project name and description look good. Please go ahead and create the Azure DevOps project."))
+            suggestions.append((
+                "Approve proposal and create ADO project",
+                "The proposed Azure DevOps project name and description look good. Please go ahead and create the Azure DevOps project."
+            ))
+            suggestions.append((
+                "Modify proposed project name and description",
+                "Please update the proposed project details to: Project Name: <new project name>, Description: <new project description>"
+            ))
         elif stage == store.STAGE_REPOSITORY_REVIEW:
             if repository.get("repo_name"):
-                suggestions.append(("Create the repository", "The proposed repository name is approved. Please create the Git repository in Azure DevOps."))
+                suggestions.append((
+                    "Create repository with the proposed name",
+                    "The proposed repository name is approved. Please create the Git repository in Azure DevOps."
+                ))
             else:
-                suggestions.append(("Suggest a repository name", "Please analyze the project requirements and recommend suitable repository names."))
+                suggestions.append((
+                    "Suggest suitable Git repository name options",
+                    "Please analyze the project requirements and recommend suitable repository names."
+                ))
+            suggestions.append((
+                "Propose a custom Git repository name",
+                "I'd prefer a different repository name. Can we name it: <new-repo-name>"
+            ))
     if store.STRUCTURE_CHANGES_NOT_PUSHED in outdated and store.STRUCTURE_OUTDATED not in outdated:
-        suggestions.append(("Push the changes", "The folder structure changes look good. Please push these structure updates as a new commit to Azure DevOps."))
+        suggestions.append(("Push folder structure changes to main", "The folder structure changes look good. Please push these structure updates as a new commit to Azure DevOps."))
     elif stage == store.STAGE_STRUCTURE_REVIEW and repository.get("pushed_structure") is None and not suggestions:
         if not repository.get("structure"):
-            suggestions.append(("Propose folder structure", "Please propose the complete skeleton folder structure for the repository based on the approved TRD architecture."))
+            suggestions.append((
+                "Propose initial skeleton repository folder structure",
+                "Please propose the complete skeleton folder structure for the repository based on the approved TRD architecture."
+            ))
         else:
-            suggestions.append(("Push to main", "The proposed repository folder structure is approved. Please push the initial structure to the main branch in Azure DevOps."))
+            suggestions.append((
+                "Approve proposed structure and push to main",
+                "The proposed repository folder structure is approved. Please push the initial structure to the main branch in Azure DevOps."
+            ))
+        suggestions.append((
+            "Request folder structure or file adjustments",
+            "Please adjust the repository folder structure. I would like to add or change: <describe files, directories, or modules to add or remove>"
+        ))
     # Azure Boards work items: offered once the repository is pushed (or as soon as a draft is waiting for approval)
     project = (state or {}).get("project") or {}
     if (project.get("ado_project_id") and store.has_work_item_columns(project)
             and store.WORK_ITEMS_OUTDATED not in outdated):
         draft, created = project.get("work_items_proposal"), project.get("work_items")
         if draft and _draft_not_created(project):
-            suggestions.append(("Create work items", "The work items look good. Please create them in Azure Boards."))
+            suggestions.append(("Approve and create Azure Boards items", "The work items look good. Please create them in Azure Boards."))
+            suggestions.append(("Request modifications to work items draft", "I would like to make some adjustments to the work items draft. Specifically: <describe work items, acceptance criteria, or stories to add or change>"))
         elif not draft and not created and stage == store.STAGE_COMPLETE:
-            suggestions.append(("Plan work items", "Draft the Azure Boards work items (epic, features and one story "
+            suggestions.append(("Draft project work items in Boards", "Draft the Azure Boards work items (epic, features and one story "
                                                    "per requirement with acceptance criteria) from the PRD."))
+            if len(suggestions) < 2:
+                suggestions.append(("Summarize final project setup and status", "Please provide a comprehensive summary of our project setup, repository details, and completed milestones."))
+        elif created and stage == store.STAGE_COMPLETE and len(suggestions) < 2:
+            suggestions.append(("Summarize final project setup and status", "Please provide a comprehensive summary of our project setup, repository details, and completed milestones."))
+            suggestions.append(("Propose next development steps and milestones", "What are the recommended immediate next steps to begin developing the features outlined in the PRD?"))
+
+    if store.STRUCTURE_CHANGES_NOT_PUSHED in outdated and len(suggestions) < 2:
+        suggestions.append(("Request further folder structure changes now", "Please adjust the repository folder structure before pushing. Specifically: <describe files or directories to change>"))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]
 
 
