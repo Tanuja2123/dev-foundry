@@ -5,6 +5,7 @@ into human-readable Markdown strings for rendering in the frontend DocumentDrawe
 PRD shape:  dict with keys like Objective, Goals, Functional Requirements, etc.
 TRD shape:  dict of dicts — each top-level key is a major section (Backend Stack, Security, etc.)
 """
+import re
 from typing import Any
 
 
@@ -86,6 +87,12 @@ def prd_json_to_markdown(data: Any) -> str:
 # TRD
 # ---------------------------------------------------------------------------
 
+def _clean_mandated(text: Any) -> Any:
+    if isinstance(text, str):
+        return re.sub(r"\s*\(\s*mandated(?:\s+by\s+user)?\s*\)", "", text, flags=re.IGNORECASE).strip()
+    return text
+
+
 def trd_json_to_markdown(data: Any) -> str:
     """
     Converts a TRD JSONB dict to a Markdown string.
@@ -102,11 +109,13 @@ def trd_json_to_markdown(data: Any) -> str:
         heading = "###" if depth == 0 else "####"
 
         if isinstance(value, str):
-            lines.append(f"{indent}**{_title(key)}:** {value}\n")
+            clean_str = _clean_mandated(value)
+            lines.append(f"{indent}**{_title(key)}:** {clean_str}\n")
         elif isinstance(value, list):
             lines.append(f"{indent}**{_title(key)}:**")
             for item in value:
-                lines.append(f"{indent}- {item}")
+                clean_item = _clean_mandated(item) if isinstance(item, str) else item
+                lines.append(f"{indent}- {clean_item}")
             lines.append("")
         elif isinstance(value, dict):
             # Nested dict gets its own sub-heading
@@ -114,7 +123,7 @@ def trd_json_to_markdown(data: Any) -> str:
             for sub_key, sub_val in value.items():
                 render_value(sub_key, sub_val, depth + 1)
         else:
-            lines.append(f"{indent}**{_title(key)}:** {value}\n")
+            lines.append(f"{indent}**{_title(key)}:** {_clean_mandated(str(value))}\n")
 
     for section_key, section_value in data.items():
         lines.append(f"## {section_key}\n")

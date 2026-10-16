@@ -386,27 +386,7 @@ export function ChatPanel({
         )}
 
         <div className="composer">
-          {editingMessageId && (
-            <div className="composer-editing-banner">
-              <span className="composer-editing-banner-label">
-                <Pencil size={12} />
-                Editing query in input box
-              </span>
-              <button
-                type="button"
-                className="composer-editing-cancel"
-                onClick={() => {
-                  setEditingMessageId(null)
-                  setDraft('')
-                }}
-                title="Cancel editing"
-                aria-label="Cancel editing"
-              >
-                <X size={12} />
-                <span>Cancel</span>
-              </button>
-            </div>
-          )}
+
           {files.length > 0 && (
             <ul className="file-chips">
               {files.map((file) => (

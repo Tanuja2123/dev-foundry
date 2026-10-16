@@ -324,7 +324,8 @@ def test_posting_once_and_never_twice(db, fake_ado, monkeypatch):
     reply = _run("REVIEW_PULL_REQUEST", "review PR 12 again")
     assert "Every finding is already on the pull request" in reply
     labels = [s["label"] for s in wr.next_steps(_state())]
-    assert "Review a pull request" in labels and not any(label.startswith("Post findings") for label in labels)
+    assert "Review open pull request for security issues" in labels
+    assert not any(label.startswith("Post security review findings") for label in labels)
 
 
 def test_comments_found_on_the_pr_are_not_posted_again(db, fake_ado, monkeypatch):
@@ -415,7 +416,8 @@ def test_operations_are_available_once_the_repository_exists(db):
     approve = wr.RoutingDecision(reasoning="x", user_intent="approve_only", action="delegate",
                                  agent="Security_Review_Agent", operation="POST_PR_REVIEW_COMMENTS")
     assert wr.apply_intent_rules(approve, stage, state).reply == wr._DOCUMENT_TRANSITIONS["POST_PR_REVIEW_COMMENTS"]
-    assert [s["label"] for s in wr.next_steps(state)] == ["Plan work items", "Review a pull request"]
+    assert [s["label"] for s in wr.next_steps(state)] == ["Draft project work items in Boards", "Summarize final project setup and status",
+                                                    "Review open pull request for security issues"]
 
 
 def test_chip_offers_posting_waiting_findings(db, fake_ado, monkeypatch):
@@ -424,9 +426,10 @@ def test_chip_offers_posting_waiting_findings(db, fake_ado, monkeypatch):
     state = _state()
     assert "POST_PR_REVIEW_COMMENTS" in wr.allowed_operations(wr.effective_stage(state), state)
     chips = wr.next_steps(state)
-    assert {"label": "Post findings to PR #12",
+    assert {"label": "Post security review findings to PR #12",
             "prompt": "Post the security review findings as comments on pull request #12."} in chips
-    assert prs.is_post_request(chips[-1]["prompt"], [])
+    assert chips[0]["label"].startswith("Post security review findings")   # pending decision first
+    assert prs.is_post_request(chips[0]["prompt"], [])
     assert "PR #12 (iteration 2): 5 findings, 5 not posted yet" in store.describe_workflow_state(state) or \
         "not posted yet" in store.describe_workflow_state(state)
 
