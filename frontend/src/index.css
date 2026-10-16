@@ -1679,17 +1679,22 @@ code {
   background: var(--ms-primary-subtle);
   border: 1px solid rgba(0, 120, 212, 0.4);
   color: var(--ms-chip-text);
-  border-radius: 999px;
-  padding: 5px 12px;
-  font-size: 0.8rem;
+  border-radius: 9999px;
+  padding: 6px 14px;
+  font-size: 0.82rem;
+  font-weight: 500;
+  line-height: 1.4;
+  text-align: center;
+  white-space: nowrap;
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
 }
 
 .suggestion-chip:hover {
   background: rgba(0, 120, 212, 0.22);
   border-color: var(--ms-primary);
   color: var(--ms-text);
+  transform: translateY(-1px);
 }
 
 .suggestion-chip:focus-visible {
