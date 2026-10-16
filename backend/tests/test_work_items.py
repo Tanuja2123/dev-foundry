@@ -237,7 +237,7 @@ def test_draft_is_validated_stored_and_rendered(db, monkeypatch):
     assert reply.startswith("Here is the suggested **Azure Boards backlog** for **Clinic-Booking**")
     assert "1 epic, 2 features and 3 stories" in reply
     assert reply.rstrip().endswith("approve the backlog to create the work items in Azure Boards.")
-    assert [s["label"] for s in wr.next_steps(_state())] == ["Create work items"]
+    assert [s["label"] for s in wr.next_steps(_state())] == ["Approve and create Azure Boards items", "Request modifications to work items draft"]
 
 
 def test_update_sends_the_current_draft(db, monkeypatch):
@@ -265,15 +265,16 @@ def test_create_stores_the_items_and_marks_the_draft_synced(db, monkeypatch):
     assert project["work_items_proposal"]["synced"] is True
     assert "[Open the backlog](https://dev.azure.com/o/p/_backlogs/backlog)" in reply
     assert "([#1](https://dev.azure.com/o/p/_workitems/edit/1))" in reply
-    assert wr.next_steps(_state()) == []                                  # nothing left to do
+    assert [s["label"] for s in wr.next_steps(_state())] == ["Summarize final project setup and status",
+                                                         "Propose next development steps and milestones"]
     # a PRD change flags the work items as outdated and offers the update
     store.update_project(project["project_id"], prd_version=2)
     assert store.WORK_ITEMS_OUTDATED in store.outdated_items(_state())
-    assert [s["label"] for s in wr.next_steps(_state())] == ["Update work items"]
+    assert [s["label"] for s in wr.next_steps(_state())] == ["Update Azure Boards items from PRD"]
     # after redrafting from PRD v2 the draft is current: the next step is creating it (seen live: still "Update")
     store.update_project(project["project_id"], work_items_proposal=backlog, work_items_proposal_prd_version=2)
     assert store.WORK_ITEMS_OUTDATED not in store.outdated_items(_state())
-    assert [s["label"] for s in wr.next_steps(_state())] == ["Create work items"]
+    assert [s["label"] for s in wr.next_steps(_state())] == ["Approve and create Azure Boards items", "Request modifications to work items draft"]
 
 
 def test_creating_again_says_nothing_was_created():

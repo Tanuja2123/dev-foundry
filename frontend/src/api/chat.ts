@@ -61,6 +61,20 @@ export async function createConversation(): Promise<Conversation> {
   return response.json() as Promise<Conversation>
 }
 
+export type CancelResult = { status: 'cancelled' | 'finishing' | 'idle'; action?: string }
+
+/**
+ * Stop: cancels the chat's running turn on the server. "finishing" means an Azure DevOps action had already started,
+ * so the turn completes (never cut off halfway) and its reply still arrives.
+ */
+export async function cancelChat(conversationId: string): Promise<CancelResult> {
+  const response = await authFetch(`${apiBaseUrl()}/api/chat/cancel/${conversationId}`, { method: 'POST' })
+  if (!response.ok) {
+    throw new Error(await readError(response, 'Could not stop the request'))
+  }
+  return response.json() as Promise<CancelResult>
+}
+
 export async function continueChat(
   conversationId: string | null | undefined,
   userQuery: string,

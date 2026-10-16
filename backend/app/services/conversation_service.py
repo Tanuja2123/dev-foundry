@@ -19,6 +19,7 @@ from app.services.mcp.ado_mcp_server import sanitize_ado_project_name
 from app.services import project_store as store
 from app.services import progress, tech_fit
 from app.services.backlog_service import run_backlog_operation
+from app.services import pr_review_service
 from app.services.repo_structure import layer_changes, render_structure_tree
 from app.services.scaffold_service import describe_toolchains
 from app.services.workflow_routing import (RoutingDecision, blocked_reply, effective_stage, next_steps,
@@ -286,6 +287,7 @@ SERVICE_UNAVAILABLE_MESSAGE = ("⚠️ The AI service is busy or unavailable rig
                                "Nothing was changed - please try again in a minute. (Reference: {reference})")
 UNEXPECTED_ERROR_MESSAGE = ("⚠️ Something went wrong while processing your message. Nothing was changed - please try "
                             "again. (Reference: {reference})")
+STOPPED_MESSAGE = "Stopped. Nothing was changed, and the message was not saved."
 STRUCTURE_STAGES = ("REPOSITORY_CREATED", "STRUCTURE_REVIEW", "STRUCTURE_PUSHED")
 SCAFFOLD_OPERATIONS = ("CREATE_REPOSITORY", "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE")
 
@@ -919,6 +921,12 @@ AVAILABLE CHILD AGENTS AND OPERATIONS:
    - UPDATE_WORK_ITEMS_PROPOSAL: change the draft (rename/merge/split features, reword stories, acceptance criteria).
    - CREATE_WORK_ITEMS: create / sync the drafted work items in Azure Boards (explicit approval only, e.g. "the work
      items look good, create them", "yes, create them in Azure Boards").
+4. Security_Review_Agent (pull requests of the project's repository; only once the repository exists in Azure DevOps)
+   - LIST_PULL_REQUESTS: show the repository's active pull requests ("which PRs are open?").
+   - REVIEW_PULL_REQUEST: security review of one pull request ("review PR #12", "check pull request 3 for security
+     issues", "is my PR safe?"); set pull_request_id when the user names a number. Nothing is posted.
+   - POST_PR_REVIEW_COMMENTS: post the stored review findings as comments on the pull request (explicit request only,
+     e.g. "post the findings to PR #12", "yes, add them as comments").
 
 WORKFLOW STAGES (in order):
 REQUIREMENTS -> PRD_REVIEW -> TRD_REVIEW -> PROJECT_REVIEW -> REPOSITORY_REVIEW -> STRUCTURE_REVIEW -> COMPLETE
@@ -969,6 +977,10 @@ ROUTING RULES:
    agents list). They never change the workflow stage, so they can be used in any stage once the ADO project exists.
    Changes to the work items DRAFT are UPDATE_WORK_ITEMS_PROPOSAL, not UPDATE_PRD; a change to the product's features
    is still UPDATE_PRD (the draft is then flagged as outdated).
+7c. Pull request / PR / code review / security review requests -> Security_Review_Agent (rule 4 of the agents list).
+   They never change the workflow stage. Reviewing again after new commits is REVIEW_PULL_REQUEST. Praising a review
+   ("looks good", "thanks") is not a request to post: respond. Questions about a finding -> respond, using the review
+   shown in the conversation.
 8. Greetings, general questions, status questions, or a request to skip/cancel a step -> respond directly.
    - A request to see the current PRD or TRD ("where is the PRD?", "show me the TRD") -> respond with show_document
      "PRD" or "TRD". The system shows the stored document; NEVER write a PRD or TRD yourself in reply.
@@ -1090,6 +1102,24 @@ DECISION FIELDS:
                                "structure was shown; showing the structure instead")
                 decision = RoutingDecision(reasoning="push needs review", user_intent=decision.user_intent,
                                            action="respond", reply=review)
+        # An explicit "post the findings" / "review PR #N" always runs the PR operation (code checks the facts)
+        pr_operation = pr_review_service.explicit_operation(user_query, allowed_operations(stage, workflow_state))
+        if pr_operation and decision.operation != pr_operation:
+            logger.warning(f"[Routing Guard] {decision.action} {decision.operation or ''} -> {pr_operation} "
+                           "(explicit pull request request)")
+            decision = RoutingDecision(reasoning="explicit pull request request", user_intent="explicit_next_step",
+                                       action="delegate", agent="Security_Review_Agent", operation=pr_operation,
+                                       pull_request_id=decision.pull_request_id)
+        # Posting review comments on a pull request needs an explicit request (like a push)
+        if (decision.action == "delegate" and decision.operation == "POST_PR_REVIEW_COMMENTS"
+                and not pr_review_service.is_post_request(user_query, history)):
+            pr_id, _review = pr_review_service.latest_review(
+                ((workflow_state or {}).get("repository") or {}),
+                pr_review_service.pr_number(user_query, decision.pull_request_id))
+            logger.warning("[Routing Guard] POST_PR_REVIEW_COMMENTS needs an explicit request to post; asking first")
+            decision = RoutingDecision(reasoning="posting needs an explicit request", user_intent=decision.user_intent,
+                                       action="respond",
+                                       reply=pr_review_service.POST_QUESTION.format(pr_id=pr_id or "?"))
         route_agent = decision.agent if decision.action == "delegate" else None
         operation = decision.operation
         response_text = decision.reply or blocked_reply(stage, "")
@@ -1470,6 +1500,14 @@ Put a blank line before and after every heading, divider (---) and list; never p
             response_text = enforce_closing_line(await run_backlog_operation(
                 client, operation, user_query, message_list, workflow_state or {}))
 
+        elif route_agent == "Security_Review_Agent":
+            logger.info(f"[Routing Decision] -> Delegating to Security_Review_Agent ({operation}, "
+                        f"PR {decision.pull_request_id})")
+            progress.step(OPERATION_STEPS.get(operation, "Working on the pull request"))
+            # The AI review runs on the fast order (Azure -> Groq -> MAQ AI): small parts of the diff, typed answers
+            response_text = enforce_closing_line(await pr_review_service.run_pr_operation(
+                small_client, operation, user_query, decision.pull_request_id, workflow_state or {}))
+
         else:
             logger.info("[Routing Decision] -> Handled directly by Orchestrator (Path A Generic/Conversational)")
             stored_document = stored_document_reply(decision.show_document, workflow_state)
@@ -1534,6 +1572,8 @@ OPERATION_STEPS = {
     "UPDATE_REPOSITORY_STRUCTURE": "Updating the repository structure", "PUSH_REPOSITORY_STRUCTURE": "Pushing to Azure DevOps",
     "GENERATE_WORK_ITEMS_PROPOSAL": "Drafting the work items", "UPDATE_WORK_ITEMS_PROPOSAL": "Updating the work items draft",
     "CREATE_WORK_ITEMS": "Creating the work items in Azure Boards",
+    "LIST_PULL_REQUESTS": "Reading the pull requests", "REVIEW_PULL_REQUEST": "Reviewing the pull request",
+    "POST_PR_REVIEW_COMMENTS": "Posting the review comments",
 }
 
 DEFAULT_TITLE = "New Project"
@@ -1638,8 +1678,18 @@ async def process_chat_request(conversation_id: Optional[str], user_query: str, 
         logger.info(f"[Conversation] '{key}' is busy with another message; this one waits for it")
     async with lock:
         progress.start(key, user_id)             # live progress for the dashboard (GET /api/chat/progress/{id})
+        # The turn runs as its own task so Stop (POST /api/chat/cancel/{id}) can cancel it. Nothing is saved before
+        # the end of a turn, so a cancelled turn leaves no message behind (an edited resend replaces it cleanly).
+        task = asyncio.create_task(_process_chat_request(conversation_id, user_query, file, user_id=user_id))
+        progress.attach_task(key, task)
         try:
-            return await _process_chat_request(conversation_id, user_query, file, user_id=user_id)
+            return await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if task.cancelled() and not (current and current.cancelling()):
+                logger.info(f"[Conversation] '{key}': stopped by the user; nothing was changed or saved")
+                return ChatResponse(conversation_id=key, response=STOPPED_MESSAGE, suggestions=[])
+            raise
         finally:
             progress.finish(key)
 

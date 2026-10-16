@@ -72,6 +72,18 @@ def chat_progress(conversation_id: str, user: CurrentUser = Depends(get_current_
     return {"running": current is not None, **(current or {})}
 
 
+@router.post("/chat/cancel/{conversation_id}")
+def cancel_chat(conversation_id: str, user: CurrentUser = Depends(get_current_user)) -> dict:
+    """
+    Stop: cancels the conversation's running turn unless an Azure DevOps action has already started.
+    {"status": "cancelled"} | {"status": "finishing", "action": "..."} | {"status": "idle"}
+    """
+    result = progress.cancel(conversation_id, user.user_id)
+    logger.info(f"[Route] Stop requested for conversation '{conversation_id}': {result.get('status')}"
+                + (f" ({result['action']} already started)" if result.get("action") else ""))
+    return result
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def create_chat(
     conversation_id: Optional[str] = Form(None, description="Optional existing conversation identifier. If null/omitted, a new conversation is created automatically."),

@@ -40,7 +40,9 @@ app = FastAPI(
 
 @app.middleware("http")
 async def request_logging_middleware(request: Request, call_next):
-    if request.url.path.startswith("/api/chat/progress/"):       # polled every 2 s while a chat runs: not logged
+    # Polled endpoints are not logged (progress every 2 s while a chat runs, health checks); uvicorn's access log
+    # drops them too (app/core/logger.py)
+    if request.url.path.startswith("/api/chat/progress/") or request.url.path == "/health":
         return await call_next(request)
     start_time = time.time()
     logger.info(f"--> [API] {request.method} {request.url.path}")

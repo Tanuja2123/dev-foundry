@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { PanelLeftOpen, Moon, Sun } from 'lucide-react'
 
 import {
+  cancelChat,
   continueChat,
   createConversation,
   deleteConversation,
@@ -60,6 +61,8 @@ export function HomePage() {
   // DRAFT_KEY = the new chat that is still being created (before it has an id).
   const [sendingIds, setSendingIds] = useState<Set<string>>(() => new Set())
   const [errorsByConversation, setErrorsByConversation] = useState<Record<string, string | null>>({})
+  // "Too late to stop" notice per chat, shown in the waiting bubble until the reply arrives
+  const [stopNotices, setStopNotices] = useState<Record<string, string | null>>({})
   const [sidebarState, setSidebarState] = useState<SidebarState>(() => {
     const saved = localStorage.getItem('sidebarState') as SidebarState | null
     return saved === 'hidden' ? 'hidden' : 'expanded'
@@ -213,34 +216,53 @@ export function HomePage() {
     navigate('/projects')
   }
 
-  // Stops only the open chat's request; other chats keep running.
-  function handleStopChat() {
-    const controller = controllersRef.current.get(activeKey)
+  // Stops only the open chat's request; other chats keep running. The server is asked first: before any Azure DevOps
+  // action it cancels the turn (nothing is changed or saved); once an action has started, the turn finishes and its
+  // reply still arrives, so the request keeps waiting and the bubble says why.
+  async function handleStopChat() {
+    const key = activeKey
+    if (key !== DRAFT_KEY) {
+      try {
+        const result = await cancelChat(key)
+        if (result.status === 'finishing') {
+          setStopNotices((current) => ({
+            ...current,
+            [key]: `Too late to stop: ${result.action ?? 'an Azure DevOps action'} has already started. Finishing it; the reply will show what was done.`,
+          }))
+          return
+        }
+      } catch {
+        // the server could not be asked: stop waiting anyway
+      }
+    }
+    const controller = controllersRef.current.get(key)
     if (controller) {
       controller.abort()
-      controllersRef.current.delete(activeKey)
+      controllersRef.current.delete(key)
     }
-    setBusy(activeKey, false)
+    setBusy(key, false)
     setMessagesByConversation((current) => {
-      const list = current[activeKey] ?? []
+      const list = current[key] ?? []
       if (list.length === 0) return current
       const last = list[list.length - 1]
       if (last.role === 'user') {
         return {
           ...current,
-          [activeKey]: [...list.slice(0, -1), { ...last, stopped: true }],
+          [key]: [...list.slice(0, -1), { ...last, stopped: true }],
         }
       }
       return current
     })
-    setDraftMessages((prev) => {
-      if (prev.length === 0) return prev
-      const last = prev[prev.length - 1]
-      if (last.role === 'user') {
-        return [...prev.slice(0, -1), { ...last, stopped: true }]
-      }
-      return prev
-    })
+    if (key === DRAFT_KEY) {
+      setDraftMessages((prev) => {
+        if (prev.length === 0) return prev
+        const last = prev[prev.length - 1]
+        if (last.role === 'user') {
+          return [...prev.slice(0, -1), { ...last, stopped: true }]
+        }
+        return prev
+      })
+    }
   }
 
   // Edit a stopped query and re-send it
@@ -426,6 +448,7 @@ export function HomePage() {
         controllersRef.current.delete(key)
       }
       setBusy(key, false)
+      setStopNotices((current) => ({ ...current, [key]: null }))
     }
   }
 
@@ -549,8 +572,9 @@ export function HomePage() {
             suggestions={conversation ? (suggestionsByConversation[conversation.id] ?? []) : []}
             sending={sending}
             error={chatError}
+            stopNotice={stopNotices[activeKey] ?? null}
             onSend={(content) => void sendMessage(content)}
-            onStop={handleStopChat}
+            onStop={() => void handleStopChat()}
             onEditAndResend={(messageId, newContent) => void handleEditAndResend(messageId, newContent)}
             onFilesAdded={addFiles}
             onRemoveFile={removeFile}

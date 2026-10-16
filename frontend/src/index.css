@@ -15,6 +15,9 @@
   /* Links & suggestion chips */
   --ms-link: #0067b8;
   --ms-link-hover: #005a9e;
+  /* Section headings inside replies and documents (h2 / h3-h4) */
+  --ms-heading-strong: #005a9e;
+  --ms-heading: #0078d4;
   --ms-chip-text: #005a9e;
   --ms-copilot-gradient: linear-gradient(135deg, #0078d4 0%, #7738d8 50%, #00b4d8 100%);
   --ms-copilot-glow: rgba(0, 120, 212, 0.2);
@@ -85,6 +88,9 @@
   /* Links & suggestion chips */
   --ms-link: #60a5fa;
   --ms-link-hover: #93c5fd;
+  /* Light blues: the light theme's dark blues have ~2.5:1 contrast on the dark bubbles */
+  --ms-heading-strong: #93c5fd;
+  --ms-heading: #7cb4f7;
   --ms-chip-text: #bfdbfe;
   --ms-copilot-gradient: linear-gradient(135deg, #0078d4 0%, #7738d8 50%, #00b4d8 100%);
   --ms-copilot-glow: rgba(0, 120, 212, 0.28);
@@ -1475,17 +1481,24 @@ code {
 
 .message-body h2 {
   font-size: 1.12rem;
-  color: var(--ms-primary-active);
+  color: var(--ms-heading-strong);
+  margin-top: 20px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--ms-border);
 }
 
 .message-body h3 {
   font-size: 1.02rem;
-  color: var(--ms-primary);
+  color: var(--ms-heading);
 }
 
 .message-body h4 {
   font-size: 0.94rem;
-  color: var(--ms-primary);
+  color: var(--ms-heading);
+}
+
+.message-body > :first-child {
+  margin-top: 0;
 }
 
 .message-body p {
@@ -1895,6 +1908,18 @@ code {
   padding-left: 30px;
   font-size: 0.78rem;
   color: var(--ms-text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* "Too late to stop": an Azure DevOps action had already started, so the turn finishes */
+.pending-notice {
+  margin-top: 6px;
+  margin-left: 30px;
+  padding: 6px 10px;
+  border-left: 3px solid #d97706;
+  border-radius: 4px;
+  background: rgba(217, 119, 6, 0.1);
+  font-size: 0.8rem;
   overflow-wrap: anywhere;
 }
 
@@ -2851,6 +2876,22 @@ code {
   color: var(--ms-text);
   margin-top: 24px;
   margin-bottom: 10px;
+}
+
+/* Same section-heading colours as in the chat, readable in both themes */
+.drawer-markdown-wrapper h2 {
+  color: var(--ms-heading-strong);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--ms-border);
+}
+
+.drawer-markdown-wrapper h3,
+.drawer-markdown-wrapper h4 {
+  color: var(--ms-heading);
+}
+
+.drawer-markdown-wrapper > :first-child {
+  margin-top: 0;
 }
 
 .drawer-markdown-wrapper hr {
