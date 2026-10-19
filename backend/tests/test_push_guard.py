@@ -71,5 +71,50 @@ def test_the_guard_is_wired_into_the_pipeline_and_prompt():
     import inspect
     source = inspect.getsource(cs._execute_agent_pipeline)
     assert "push_review_reply(user_query, history, workflow_state)" in source
-    assert "partial_success_reply(before, store.get_workflow_state(conversation_id), reference)" in source
+    assert "partial_success_reply(before, store.get_workflow_state(conversation_id), reference," in source
+    assert "await progress.wait_for_tools(conversation_id)" in source        # final state, not mid-way
     assert "it never moves two steps" in source
+
+
+@pytest.mark.parametrize("reason, phrase", [("busy", "the AI service is busy"),
+                                            ("error", "something went wrong while writing the reply"),
+                                            ("blocked", "the final safety check stopped the reply")])
+def test_every_failure_path_reports_real_changes(reason, phrase):
+    before = {"project": state()["project"], "repository": None}
+    reply = cs.partial_success_reply(before, state(), "ref1", reason)
+    assert reply.startswith(f"Part of your request was completed, but {phrase}")
+    assert "The repository **clinic-appointments** was created." in reply and "Nothing was changed" not in reply
+
+
+def test_a_blocked_reply_and_unexpected_errors_check_the_stored_state():
+    import inspect
+    handler = inspect.getsource(cs._process_chat_request)
+    assert "state_before = store.get_workflow_state(conversation_id)" in handler
+    assert '"blocked")' in handler
+    pipeline = inspect.getsource(cs._execute_agent_pipeline)
+    assert '"busy" if busy else "error"' in pipeline           # unexpected errors no longer claim "Nothing was changed"
+
+
+def test_the_generator_reply_is_built_by_code():
+    before = {"project": state()["project"], "repository": {"repo_name": "clinic-appointments", "status": "PROPOSED"}}
+    after = state()
+    ok = cs.scaffold_reply("CREATE_REPOSITORY", {"status": "success", "kept_requested_files": ["/docs/a.md"]},
+                           before, after)
+    assert ok.startswith("The repository **clinic-appointments** was created. Its starting structure was generated")
+    assert "Your added files were kept: `/docs/a.md`." in ok and "(version 1, 2 files)" in ok
+    assert ok.endswith("Review it, then say **push to main** or tell me what to change.")
+    failed = cs.scaffold_reply("GENERATE_REPOSITORY_STRUCTURE", {"status": "error", "message": "`mix` timed out."},
+                               after, after)
+    assert failed.startswith("I couldn't generate the structure: `mix` timed out. Nothing was saved")
+    import inspect
+    assert "deferred[\"run\"]" in inspect.getsource(cs._execute_agent_pipeline)
+
+
+def test_a_structure_change_is_one_sentence_and_the_tree():
+    before = state()
+    after = state(structure_version=2)
+    after["repository"]["structure"] = [FILES[0]] + [{"path": "/docs/architecture.md", "content": "# A"}]
+    reply = cs.structure_update_reply(before, after)
+    assert reply.startswith("The structure was updated as you asked: 1 file added, 1 file removed.")
+    assert "/backend/bin/www" not in reply.split("```")[0]                 # no list of paths outside the tree
+    assert "(version 2," in reply and reply.endswith("tell me what else to change.")

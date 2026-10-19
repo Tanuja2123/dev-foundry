@@ -13,6 +13,7 @@ subcommands and generator packages are accepted; arguments may not contain shell
 followed, so nothing outside the temporary folder can be read back.
 """
 import base64
+import fnmatch
 import os
 import re
 import shlex
@@ -353,6 +354,65 @@ def collect_files(root_dir: str) -> Tuple[List[Dict[str, str]], Dict[str, List[s
     return files, {k: v for k, v in skipped.items() if v}
 
 
+# Never committed, even when a generator's .gitignore doesn't list them: IDE settings and machine-specific files (seen
+# live: flutter create wrote android/local.properties with the server's SDK paths, .idea/ and *.iml files)
+DENY_DIRS = {".idea"}
+DENY_FILES = {"local.properties", ".DS_Store", "Thumbs.db"}
+DENY_SUFFIXES = (".iml",)
+
+
+def _gitignore_rules(files: List[Dict[str, str]]) -> List[Tuple[str, str, bool, bool, bool]]:
+    """(base folder, pattern, negated, dir_only, anchored) for every rule of every generated .gitignore."""
+    rules = []
+    for item in files:
+        path = item["path"]
+        if not path.endswith("/.gitignore") or item.get("encoding") == "base64":
+            continue
+        base = path[: -len(".gitignore")]                           # "/frontend/" or "/"
+        for raw in item.get("content", "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            negated = line.startswith("!")
+            line = line[1:] if negated else line
+            dir_only = line.endswith("/")
+            anchored = line.startswith("/") or "/" in line.strip("/")
+            pattern = line.strip("/")
+            if pattern:
+                rules.append((base, pattern, negated, dir_only, anchored))
+    return rules
+
+
+def _rule_matches(rel: str, pattern: str, dir_only: bool, anchored: bool) -> bool:
+    parts = rel.split("/")
+    candidates = ["/".join(parts[:n]) for n in range(1, len(parts) + (0 if dir_only else 1))]   # folders (+ the file)
+    if anchored:
+        return any(fnmatch.fnmatchcase(c, pattern) for c in candidates)
+    names = parts[:-1] if dir_only else parts
+    return any(fnmatch.fnmatchcase(name, pattern) for name in names)
+
+
+def drop_ignored_files(files: List[Dict[str, str]]) -> Tuple[List[Dict[str, str]], List[str]]:
+    """
+    Removes generated files that must not be committed (FEATURES SCAF-R10), BEFORE the generator output is saved (so
+    they never reach commit 1): files excluded by the generated .gitignore files, plus IDE and machine-specific files.
+    Returns (kept, dropped paths).
+    """
+    rules = _gitignore_rules(files)
+    kept, dropped = [], []
+    for item in files:
+        path = item["path"]
+        parts = path.strip("/").split("/")
+        name = parts[-1]
+        ignored = name in DENY_FILES or name.endswith(DENY_SUFFIXES) or any(p in DENY_DIRS for p in parts[:-1])
+        if not ignored and name != ".gitignore":
+            for base, pattern, negated, dir_only, anchored in rules:
+                if path.startswith(base) and _rule_matches(path[len(base):], pattern, dir_only, anchored):
+                    ignored = not negated
+        (dropped if ignored else kept).append(path if ignored else item)
+    return kept, dropped
+
+
 # ---------------------------------------------------------------------------
 # Running the commands
 # ---------------------------------------------------------------------------
@@ -390,6 +450,29 @@ def _command_version(command: ScaffoldCommand, args: List[str]) -> Optional[str]
     return f"{args[0]} {tool}" if tool and tool != "installed" and not tool.lower().startswith(args[0]) else tool
 
 
+def validate_scaffold_plan(commands: Iterable[Any], initializers: Optional[Iterable[Any]] = None
+                           ) -> List[Tuple[ScaffoldCommand, List[str]]]:
+    """
+    The checks that run before anything is executed (fast): step count, allowed commands and arguments, installed
+    executables. Raises AdoPushError like run_scaffold_commands. Lets the agent's tool accept a plan in milliseconds and
+    run it after the model's turn (ISSUES AGT-29).
+    """
+    specs, inits = list(commands or []), list(initializers or [])
+    if not specs and not inits:
+        raise _error("At least one scaffold command or initializer is required.", "VALIDATION_ERROR")
+    if len(specs) + len(inits) > MAX_COMMANDS:
+        raise _error(f"Too many scaffold steps ({len(specs) + len(inits)}); the limit is {MAX_COMMANDS}.",
+                     "VALIDATION_ERROR")
+    parsed = [parse_command(spec) for spec in specs]
+    for command, args in parsed:
+        if not _resolve_executable(args[0]):
+            installed = ", ".join(name for name in ALLOWED_COMMANDS if _resolve_executable(name)) or "none"
+            raise _error(f"`{args[0]}` is not installed on the DevFoundry server, so `{command.command}` cannot run. "
+                         f"Installed scaffold tools: {installed}. Java/Kotlin projects can use the online initializers "
+                         "(spring-boot, quarkus, micronaut) instead.", "TOOL_NOT_INSTALLED")
+    return parsed
+
+
 def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int] = None,
                           initializers: Optional[Iterable[Any]] = None, default_name: str = "app") -> ScaffoldResult:
     """
@@ -400,18 +483,7 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
     """
     specs = list(commands or [])
     inits = [i if isinstance(i, Mapping) else (i.model_dump() if hasattr(i, "model_dump") else {}) for i in initializers or []]
-    if not specs and not inits:
-        raise _error("At least one scaffold command or initializer is required.", "VALIDATION_ERROR")
-    if len(specs) + len(inits) > MAX_COMMANDS:
-        raise _error(f"Too many scaffold steps ({len(specs) + len(inits)}); the limit is {MAX_COMMANDS}.",
-                     "VALIDATION_ERROR")
-    parsed = [parse_command(spec) for spec in specs]          # validate everything before running anything
-    for command, args in parsed:
-        if not _resolve_executable(args[0]):
-            installed = ", ".join(name for name in ALLOWED_COMMANDS if _resolve_executable(name)) or "none"
-            raise _error(f"`{args[0]}` is not installed on the DevFoundry server, so `{command.command}` cannot run. "
-                         f"Installed scaffold tools: {installed}. Java/Kotlin projects can use the online initializers "
-                         "(spring-boot, quarkus, micronaut) instead.", "TOOL_NOT_INSTALLED")
+    parsed = validate_scaffold_plan(specs, inits)              # validate everything before running anything
 
     timeout = timeout_seconds or command_timeout_seconds()
     env = _command_env()
@@ -450,6 +522,9 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
             executed.append(command)
 
         files, skipped = collect_files(workspace)
+    files, ignored = drop_ignored_files(files)
+    if ignored:
+        skipped["ignored_files"] = ignored          # never committed (.gitignore rules, IDE / machine files)
 
     if not files:
         raise _error("The scaffold commands ran but produced no files.", "SCAFFOLD_EMPTY")

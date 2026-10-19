@@ -372,7 +372,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                     f"MaxTokens: {effective_options.get('max_tokens')}{', streamed' if stream_internally else ''})..."
                 )
                 started = time.time()
-                progress.detail(f"Using {provider.name}")
+                progress.detail(backup_notice(provider, errors))
 
                 try:
                     res = provider.client.get_response(
@@ -577,25 +577,45 @@ async def read_stream_with_watchdog(stream: Any, provider: Any) -> Any:
         except asyncio.TimeoutError:
             raise StreamStalledError(f"no complete answer within {total:.0f}s")
     iterator = stream.__aiter__()
-    while True:
-        remaining = total - (time.time() - started)
-        if remaining <= 0:
-            await _close_quietly(stream)
-            raise StreamStalledError(f"no complete answer within {total:.0f}s")
-        try:
-            await asyncio.wait_for(iterator.__anext__(), timeout=min(stall, remaining))
+    # Time while one of our tools runs (e.g. the generator commands inside the Repo Setup agent's turn) is not the
+    # model being silent: it counts neither as a stall nor toward the total (seen live: 166 s of generators was taken
+    # for a stalled model, the turn failed and the structure was saved after the reply)
+    tool_seconds, idle = 0.0, 0.0
+    step = max(0.05, min(5.0, stall / 4))
+    next_update: Optional[asyncio.Future] = None
+    try:
+        while True:
+            if time.time() - started - tool_seconds >= total:
+                raise StreamStalledError(f"no complete answer within {total:.0f}s")
+            if next_update is None:
+                next_update = asyncio.ensure_future(iterator.__anext__())
+            slice_start = time.time()
+            done, _ = await asyncio.wait({next_update}, timeout=step)
+            waited = time.time() - slice_start
+            if not done:
+                if progress.tools_running():
+                    tool_seconds += waited
+                    continue
+                idle += waited
+                if idle >= stall:
+                    raise StreamStalledError(f"the stream stalled: no new text for {stall:.0f}s "
+                                             f"(after {time.time() - started:.0f}s, {updates} updates)")
+                continue
+            try:
+                next_update.result()
+            except StopAsyncIteration:
+                next_update = None
+                break
+            next_update, idle = None, 0.0
             updates += 1
             if updates % 50 == 0:
                 progress.detail(f"{getattr(provider, 'name', 'The model')} is writing… "
                                 f"({time.time() - started:.0f}s)")
-        except StopAsyncIteration:
-            break
-        except asyncio.TimeoutError:
-            await _close_quietly(stream)
-            if time.time() - started >= total:
-                raise StreamStalledError(f"no complete answer within {total:.0f}s")
-            raise StreamStalledError(f"the stream stalled: no new text for {stall:.0f}s "
-                                     f"(after {time.time() - started:.0f}s, {updates} updates)")
+    except StreamStalledError:
+        if next_update is not None and not next_update.done():
+            next_update.cancel()
+        await _close_quietly(stream)
+        raise
     return await stream.get_final_response()
 
 
@@ -604,6 +624,19 @@ async def _close_quietly(stream: Any) -> None:
         await stream.close()
     except Exception:
         pass
+
+
+def backup_notice(provider: Any, errors: List[str]) -> str:
+    """
+    The waiting bubble's detail line (FEATURES REV-5): which model is answering, and - once an earlier one failed or was
+    skipped - that a backup took over and how long it may take (otherwise a slow fallback looks like a hang).
+    """
+    name = getattr(provider, "name", "the model")
+    if not errors:
+        return f"Using {name}"
+    slow = getattr(provider, "stream", False)                 # the streamed tier (MAQ AI) takes minutes for documents
+    return (f"The main model is busy, so a backup ({name}) is answering"
+            + ("; this can take a few minutes" if slow else ""))
 
 
 def is_empty_response(response: Any) -> bool:

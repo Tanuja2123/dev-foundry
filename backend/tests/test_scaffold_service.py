@@ -328,7 +328,10 @@ def test_scaffold_tool_saves_exact_generator_output_and_commands(db, ado, runner
     assert result["status"] == "success" and result["files_count"] == 5
     assert result["commands"] == [{"command": c["command"], "cwd": "."} for c in CLI_COMMANDS]
     repo = repository(db)
-    assert repo["structure"] == repo["scaffold_structure"]
+    # commit 1 = the exact generator output; the saved structure adds the code-written README (SCAF-R12)
+    assert len(repo["scaffold_structure"]) == 5 and result["changes_on_top_of_generated_files"]["edit"] == ["/README.md"]
+    readme = next(f["content"] for f in repo["structure"] if f["path"] == "/README.md")
+    assert readme.startswith("# Taskflow") and "## Getting started" in readme and "uv sync" in readme
     assert repo["scaffold_commands"] == result["commands"]
     assert store.get_project(CONV)["workflow_stage"] == store.STAGE_STRUCTURE_REVIEW
 
@@ -350,10 +353,12 @@ def test_push_without_changes_is_one_commit_of_the_generator_output(db, ado, run
     call(tools, "scaffold_repository_structure", commands=CLI_COMMANDS)
     result = call(tools, "push_repository_structure")
     pushes = [c for c in ado if c[0].startswith("push_")]
-    assert len(pushes) == 1 and pushes[0][0] == "push_repository_files"
+    # commit 1: the generator output exactly as produced; commit 2: the README (the only requested change)
+    assert [p[0] for p in pushes] == ["push_repository_files", "push_repository_changes"]
     assert pushes[0][1] == repository(db)["scaffold_structure"] and pushes[0][3] is True   # allow_empty (README.md)
     assert pushes[0][2].startswith(rsa.SCAFFOLD_COMMIT_MESSAGE) and "$ uv add --no-sync typer" in pushes[0][2]
-    assert result["push_type"] == "initial commit" and len(result["commits"]) == 1
+    assert any(str(arg).startswith("docs: update README.md") for arg in pushes[1])
+    assert len(result["commits"]) == 2
     assert repository(db)["pushed_structure"] == repository(db)["structure"]
     assert store.get_project(CONV)["workflow_stage"] == store.STAGE_COMPLETE
 
@@ -403,12 +408,29 @@ def test_rescaffold_for_a_new_stack_replaces_the_structure_and_reports_earlier_c
     call(tools, "scaffold_repository_structure", commands=CLI_COMMANDS)
     call(tools, "update_repository_structure", upsert_files=[{"path": "/docs/usage.md", "content": "# Usage\n"}])
     result = call(tools, "scaffold_repository_structure", commands=FULLSTACK_COMMANDS)
-    assert result["previous_requested_changes"]["add"] == ["/docs/usage.md"]
+    # AGT-29: files the user ADDED are kept by code on a regeneration (the model used to have to re-add them)
+    assert result["kept_requested_files"] == ["/docs/usage.md"]
     assert "/pyproject.toml" not in result["paths"] and "/frontend/src/main.tsx" in result["paths"]
+    assert "/docs/usage.md" in result["paths"]
     repo = repository(db)
-    assert repo["structure"] == repo["scaffold_structure"] and repo["scaffold_commands"][0]["command"].startswith("npx")
-    readded = call(tools, "update_repository_structure", upsert_files=[{"path": "/docs/usage.md", "content": "# Usage\n"}])
-    assert readded["changes_on_top_of_generated_files"]["add"] == ["/docs/usage.md"]
+    assert repo["scaffold_commands"][0]["command"].startswith("npx")
+    assert "/docs/usage.md" not in {f["path"] for f in repo["scaffold_structure"]}     # commit 1 stays pure output
+    assert result["changes_on_top_of_generated_files"]["add"] == ["/README.md", "/docs/usage.md"]
+
+
+def test_generators_run_after_the_model_turn_when_deferred(db, ado, runner):
+    """AGT-29: in the chat pipeline the tool only validates and queues the plan; code runs it after the turn."""
+    tools_now = created_repo(db, ado)
+    deferred = {}
+    tools = rsa.build_repo_setup_tools(CONV, None, deferred)
+    planned = call(tools, "scaffold_repository_structure", commands=CLI_COMMANDS)
+    assert planned["status"] == "success" and planned["planned"] is True and callable(deferred["run"])
+    assert not repository(db).get("structure")                                  # nothing ran yet
+    blocked = call(tools, "update_repository_structure", upsert_files=[{"path": "/x.md", "content": "x"}])
+    assert blocked["status"] == "error" and blocked["error_type"] == "PLANNED"
+    outcome = deferred["run"]()
+    assert outcome["status"] == "success" and repository(db)["structure"]
+    assert tools_now                                                            # the non-deferred tools still exist
 
 
 def test_hand_written_structure_clears_the_generator_record(db, ado, runner):
@@ -479,3 +501,45 @@ def test_real_uv_init_output_is_captured_exactly():
     files = {f["path"]: f["content"] for f in result.files}
     assert {"/pyproject.toml", "/README.md", "/.python-version", "/src/demo_cli/__init__.py"} <= set(files)
     assert 'name = "demo-cli"' in files["/pyproject.toml"] and files["/README.md"] == ""
+
+
+# ---------------------------------------------------------------------------- SCAF-R10: never-committed files
+
+def test_ignored_and_machine_files_are_dropped_before_commit_one():
+    from app.services.scaffold_service import drop_ignored_files
+    files = [
+        {"path": "/frontend/.gitignore", "content": ".dart_tool/\n/build/\n*.log\n.env*\n!.env.example\n"},
+        {"path": "/frontend/pubspec.yaml", "content": "name: app"},
+        {"path": "/frontend/lib/main.dart", "content": "void main() {}"},
+        {"path": "/frontend/android/local.properties", "content": "sdk.dir=C:\\Users\\server\\Android"},
+        {"path": "/frontend/.idea/workspace.xml", "content": "<x/>"},
+        {"path": "/frontend/book_nook.iml", "content": "<module/>"},
+        {"path": "/frontend/.dart_tool/package_config.json", "content": "{}"},
+        {"path": "/frontend/build/app.js", "content": "x"},
+        {"path": "/frontend/lib/build/keep.dart", "content": "x"},       # "/build/" is anchored to frontend/
+        {"path": "/frontend/debug.log", "content": "x"},
+        {"path": "/frontend/.env.local", "content": "SECRET=1"},
+        {"path": "/frontend/.env.example", "content": "SECRET="},         # re-included by "!"
+        {"path": "/backend/.gitignore", "content": "/deps/\n"},
+        {"path": "/backend/mix.exs", "content": "defmodule X"},
+        {"path": "/backend/deps/x.ex", "content": "x"},
+        {"path": "/README.md", "content": "# app"},
+    ]
+    kept, dropped = drop_ignored_files(files)
+    kept_paths = {f["path"] for f in kept}
+    assert set(dropped) == {"/frontend/android/local.properties", "/frontend/.idea/workspace.xml",
+                            "/frontend/book_nook.iml", "/frontend/.dart_tool/package_config.json",
+                            "/frontend/build/app.js", "/frontend/debug.log", "/frontend/.env.local",
+                            "/backend/deps/x.ex"}
+    assert {"/frontend/lib/build/keep.dart", "/frontend/.env.example", "/frontend/.gitignore",
+            "/backend/.gitignore", "/README.md", "/frontend/lib/main.dart"} <= kept_paths
+
+
+def test_flutter_defaults_to_mobile_platforms():
+    from app.services.scaffold_catalog import apply_auto_flags, find_generator
+    flutter = next(g for g in __import__("app.services.scaffold_catalog", fromlist=["GENERATORS"]).GENERATORS
+                   if g.id == "flutter")
+    assert apply_auto_flags(flutter, ["create", "app"])[-1] == "--platforms=android,ios"
+    with_web = apply_auto_flags(flutter, ["create", "--platforms", "android,ios,web", "app"])
+    assert "--platforms=android,ios" not in with_web                       # the agent's choice (from the TRD) wins
+    assert find_generator                                                    # imported for completeness

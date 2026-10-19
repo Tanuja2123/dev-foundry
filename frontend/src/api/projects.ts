@@ -44,6 +44,14 @@ export async function fetchProjectsOverview(): Promise<ProjectOverview[]> {
 }
 
 /**
+ * One project's overview (its PRD / TRD as Markdown), e.g. for the "Open PRD" button under a chat reply.
+ */
+export async function fetchProjectOverview(conversationId: string): Promise<ProjectOverview | null> {
+  const projects = await fetchProjectsOverview()
+  return projects.find((p) => p.conversation_id === conversationId) ?? null
+}
+
+/**
  * Updates the project name (and Azure DevOps project name if created).
  * Returns the updated project overview.
  */

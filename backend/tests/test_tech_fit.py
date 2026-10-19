@@ -29,8 +29,10 @@ def test_a_much_worse_choice_gets_the_confirmation_question(monkeypatch):
     assert confirmed is None
     assert "**COBOL** fits this project less well than the current **Node.js / Express**" in reply
     assert tech_fit.CONFIRMATION_MARKER in reply
-    assert "**Fit for this project:** Node.js / Express 8/10 · COBOL 2/10" in reply
-    assert "**Pros of COBOL:**\n- Very stable runtime" in reply and "**Cons of COBOL:**" in reply
+    # REV-6 / D8: reasons first, rough labels instead of "8/10 vs 2/10"
+    assert "**Fit for this project:** Node.js / Express: strong fit · COBOL: weak fit" in reply and "/10" not in reply
+    assert reply.index("**Why:**\n- No modern web framework") < reply.index("**Fit for this project:**")
+    assert "**Advantages of COBOL here:**\n- Very stable runtime" in reply
     assert "**Recommendation:** Keep Node.js" in reply
     assert reply.endswith('Do you still want to switch to COBOL (say "yes, switch anyway"), or keep Node.js / Express?')
     assert cs.enforce_closing_line(reply) == reply                     # already in the house format
@@ -60,7 +62,7 @@ def test_a_poor_addition_is_questioned_with_its_own_wording(monkeypatch):
                                    recommendation="Not needed for appointment bookings.")
     reply, _ = run_gate(monkeypatch, blockchain)
     assert "adding **a blockchain ledger** doesn't fit this project well" in reply
-    assert "**Fit for this project:** adding a blockchain ledger 2/10" in reply
+    assert "**Fit for this project:** adding a blockchain ledger: weak fit" in reply
     assert reply.endswith('Do you still want to go ahead with it (say "yes, switch anyway"), or leave the TRD as it is?')
     keep = blockchain.model_copy(update={"change_kind": "keep"})
     assert run_gate(monkeypatch, keep) == (None, None)
@@ -165,3 +167,13 @@ def test_only_saved_documents_are_shown(monkeypatch):
     source = inspect.getsource(cs._execute_agent_pipeline)
     assert "tech_fit.gate(" in source and "unsaved_document" in source
     assert "Confirmation of the technology change -> UPDATE_TRD" in source
+
+
+def test_no_invented_advantages_and_alternatives_for_the_reason_behind_it(monkeypatch):
+    honest = COBOL.model_copy(update={"pros": [], "alternatives": [
+        "Java with Spring Boot - if the company standardises on the JVM",
+        "C# with ASP.NET Core - if the team works in .NET"]})
+    reply, _ = run_gate(monkeypatch, honest)
+    assert "**Advantages of COBOL here:** none for this project." in reply
+    assert "**If there is a reason behind the request**" in reply and "- Java with Spring Boot" in reply
+    assert tech_fit.fit_label(5) == "fair fit" and tech_fit.fit_label(85) == "strong fit"     # 0-100 tolerated

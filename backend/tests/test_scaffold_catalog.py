@@ -50,7 +50,7 @@ def test_every_generator_is_allowed_by_the_command_rules():
      "npx --yes create-next-app@latest web --ts --yes --skip-install --disable-git"),
     ("npx --yes @angular/cli@latest new shop --directory web --skip-install", "angular",
      "npx --yes @angular/cli@latest new shop --directory web --skip-install --defaults --skip-git"),
-    ("flutter create --org com.example app", "flutter", "flutter create --org com.example app --no-pub"),
+    ("flutter create --org com.example app", "flutter", "flutter create --org com.example app --no-pub --platforms=android,ios"),
     ("composer create-project laravel/laravel api", "composer",
      "composer create-project laravel/laravel api --no-install --no-scripts --no-interaction"),
     ("rails new web --database=postgresql", "rails", "rails new web --database=postgresql --skip-bundle --skip-git"),

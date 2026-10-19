@@ -198,7 +198,8 @@ def test_next_steps_follow_the_workflow(db):
     assert labels(wr.next_steps(state())) == ["Create repository with the proposed name", "Propose a custom Git repository name"]
     store.save_structure(repo["repo_id"], [{"path": "/README.md", "content": "# c\n"}], 0, trd_version=1)
     store.update_project(project["project_id"], workflow_stage=store.STAGE_STRUCTURE_REVIEW)
-    assert labels(wr.next_steps(state())) == ["Approve proposed structure and push to main", "Request folder structure or file adjustments"]
+    assert labels(wr.next_steps(state())) == ["Approve proposed structure and push to main", "Request folder structure or file adjustments",
+                                             "Verify the scaffold installs and builds"]
     pushed = [{"path": "/README.md", "content": "# c\n"}]
     store.update_repository(repo["repo_id"], status=store.REPO_PUSHED, pushed_structure=pushed)
     store.update_project(project["project_id"], workflow_stage=store.STAGE_COMPLETE)

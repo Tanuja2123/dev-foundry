@@ -12,11 +12,15 @@ import {
   Copy,
   Check,
   Pencil,
+  ExternalLink,
+  LayoutGrid,
 } from 'lucide-react'
 import { ACCEPTED_REQUIREMENT_FILES } from '../constants'
-import type { ChatMessage, Project, Suggestion } from '../types'
+import type { ChatMessage, Project, ReplyAction, Suggestion } from '../types'
 import { MarkdownRenderer } from './MarkdownRenderer'
+import { DocumentDrawer } from './DocumentDrawer'
 import { getChatProgress, type ChatProgress } from '../api/chat'
+import { fetchProjectOverview } from '../api/projects'
 
 // The input grows with its content up to this height, then scrolls.
 const COMPOSER_MAX_HEIGHT = 280
@@ -101,6 +105,64 @@ type ChatPanelProps = {
   onEditAndResend?: (messageId: string, newContent: string) => void
   onFilesAdded: (files: FileList) => void
   onRemoveFile: (name: string) => void
+  onOpenInProjects?: (document: 'PRD' | 'TRD') => void
+}
+
+type ChatDocument = {
+  docType: 'PRD' | 'TRD'
+  content: string | null
+  updatedAt?: string | null
+  loading: boolean
+}
+
+// Buttons under an assistant reply (UX-9), sent by the backend for what the turn wrote or created
+function ReplyActions({
+  actions,
+  onOpenDocument,
+  onOpenInProjects,
+}: {
+  actions: ReplyAction[]
+  onOpenDocument: (document: 'PRD' | 'TRD') => void
+  onOpenInProjects?: (document: 'PRD' | 'TRD') => void
+}) {
+  return (
+    <div className="reply-actions">
+      {actions.map((action) => {
+        if (action.kind === 'link' && action.url) {
+          return (
+            <a
+              key={`${action.kind}-${action.url}`}
+              className="reply-action"
+              href={action.url}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              {action.label}
+              <ExternalLink size={13} aria-hidden="true" />
+            </a>
+          )
+        }
+        const document = action.document
+        if (!document) return null
+        if (action.kind === 'projects' && !onOpenInProjects) return null
+        return (
+          <button
+            key={`${action.kind}-${document}`}
+            type="button"
+            className="reply-action"
+            onClick={() => (action.kind === 'projects' ? onOpenInProjects?.(document) : onOpenDocument(document))}
+          >
+            {action.kind === 'projects' ? (
+              <LayoutGrid size={13} aria-hidden="true" />
+            ) : (
+              <FileText size={13} aria-hidden="true" />
+            )}
+            {action.label}
+          </button>
+        )
+      })}
+    </div>
+  )
 }
 
 
@@ -117,7 +179,29 @@ export function ChatPanel({
   onEditAndResend,
   onFilesAdded,
   onRemoveFile,
+  onOpenInProjects,
 }: ChatPanelProps) {
+  const [openDocument, setOpenDocument] = useState<ChatDocument | null>(null)
+  // a document drawer belongs to its chat: close it when another chat opens
+  useEffect(() => setOpenDocument(null), [project.id])
+
+  // "Open PRD" / "Open TRD": the latest stored version, in a drawer next to the chat
+  async function handleOpenDocument(docType: 'PRD' | 'TRD') {
+    if (!project.id) return
+    setOpenDocument({ docType, content: null, loading: true })
+    try {
+      const overview = await fetchProjectOverview(project.id)
+      const details = overview ? (docType === 'PRD' ? overview.prd : overview.trd) : null
+      setOpenDocument((current) =>
+        current && current.docType === docType
+          ? { docType, content: details?.content ?? null, updatedAt: details?.updated_at, loading: false }
+          : current,
+      )
+    } catch {
+      setOpenDocument((current) => (current && current.docType === docType ? { ...current, loading: false } : current))
+    }
+  }
+
   const [draft, setDraft] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -317,6 +401,13 @@ export function ChatPanel({
                     ) : (
                       <>
                         <MarkdownRenderer content={message.content} />
+                        {message.actions && message.actions.length > 0 && (
+                          <ReplyActions
+                            actions={message.actions}
+                            onOpenDocument={(document) => void handleOpenDocument(document)}
+                            onOpenInProjects={onOpenInProjects}
+                          />
+                        )}
                         <div className="bubble-actions">
                           <button
                             type="button"
@@ -462,6 +553,15 @@ export function ChatPanel({
           </div>
         </div>
       </div>
+      <DocumentDrawer
+        isOpen={openDocument !== null}
+        docType={openDocument?.docType ?? null}
+        projectName={project.name}
+        content={openDocument?.content ?? null}
+        loading={openDocument?.loading}
+        updatedAt={openDocument?.updatedAt}
+        onClose={() => setOpenDocument(null)}
+      />
     </section>
   )
 }

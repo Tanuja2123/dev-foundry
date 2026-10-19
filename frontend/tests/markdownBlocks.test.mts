@@ -129,6 +129,11 @@ test('tables', () => {
   assert.deepEqual(table.rows, [['Backend', 'FastAPI'], ['DB', 'PostgreSQL']])
 })
 
+test('a blank line ends a quote (review cards stay separate)', () => {
+  assert.deepEqual(types('> **1. Auth**\n> Add login\n\n> **2. Audit**\n> Add a log'), ['quote', 'quote'])
+  assert.deepEqual(types('> one\n> two'), ['quote'])
+})
+
 test('quotes and windows line endings', () => {
   assert.deepEqual(types('> note one\r\n> note two\r\n\r\nText'), ['quote', 'paragraph'])
 })
@@ -147,6 +152,32 @@ test('inline: unsafe links and globs stay text', () => {
   assert.deepEqual(parseInline('[x](javascript:alert(1))').map((t: { type: string }) => t.type), ['text'])
   assert.deepEqual(parseInline('match *.py and *.md files').map((t: { type: string }) => t.type), ['text'])
   assert.deepEqual(parseInline('/backend/app/__init__.py').map((t: { type: string }) => t.type), ['text'])
+})
+
+test('table rows without the closing pipe (seen: the architect review rendered as raw text)', () => {
+  const md = [
+    '| Area | Observation | Recommendation |',
+    '|------|-------------|----------------|',
+    '| **Authentication** | No password reset. | Add a **password reset flow**.',
+    '| **User Roles** | Roles implied. | Define a role model',
+    'After the table.',
+  ].join('\n')
+  const blocks = parseMarkdown(md)
+  assert.deepEqual(blocks.map((b: { type: string }) => b.type), ['table', 'paragraph'])
+  const table = blocks[0]
+  assert.equal(table.rows.length, 2)
+  assert.deepEqual(table.rows[0], ['**Authentication**', 'No password reset.', 'Add a **password reset flow**.'])
+})
+
+test('table cells: escaped pipes and short rows', () => {
+  const blocks = parseMarkdown('| A | B |\n|---|---|\n| x \\| y | z |\n| only one |')
+  assert.deepEqual(blocks[0].rows, [['x | y', 'z'], ['only one', '']])
+})
+
+test('inline: double-backtick code keeps backticks (seen: SQL template literal shown with quotes)', () => {
+  const tokens = parseInline('Code: `` db.query(`SELECT * FROM users WHERE name = ${q}`) `` here')
+  assert.deepEqual(tokens.map((t: { type: string }) => t.type), ['text', 'code', 'text'])
+  assert.equal(tokens[1].text, 'db.query(`SELECT * FROM users WHERE name = ${q}`)')
 })
 
 test('empty input', () => {

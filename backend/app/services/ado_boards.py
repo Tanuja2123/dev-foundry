@@ -87,61 +87,180 @@ def _criteria(value: Any) -> List[str]:
     return [_text(c, 600) for c in (value or []) if _text(c)][:12]
 
 
+TASK_LAYERS = ("Frontend", "Backend", "Database", "QA", "DevOps")
+MAX_ACTION_WORDS = 10
+_BRACKETS = re.compile(r"^\s*(\[[^\]]*\]\s*)+:?\s*")
+_AS_A = re.compile(r"^\s*as an?\s+.+?,\s*i\s+want\s+(?:to\s+)?(.+?)(?:\s+so\s+that\b.*)?$", re.IGNORECASE)
+
+
+def _words(text: str, limit: int) -> str:
+    words = _text(text).rstrip(".").split()
+    return " ".join(words[:limit])
+
+
+def _action(title: Any, fallback: str) -> str:
+    """The short action of a story title: no "[...]" prefixes, no "As a..., I want..." sentence, at most 10 words."""
+    text = _BRACKETS.sub("", _text(title))
+    match = _AS_A.match(text)
+    if match:
+        text = match.group(1)
+    if not text:
+        text = re.sub(r"^\s*the\s+system\s+shall\s+(?:let\s+|allow\s+)?", "", _text(fallback), flags=re.IGNORECASE)
+    text = _words(text, MAX_ACTION_WORDS)
+    return text[:1].upper() + text[1:] if text else "Requirement"
+
+
+def _domain(value: Any, fallback: str) -> str:
+    domain = re.sub(r"[^A-Za-z0-9 &/-]", "", _text(value or fallback))[:20].strip()
+    return (domain[:1].upper() + domain[1:]) if domain else "General"
+
+
+def _join_sections(*sections: Tuple[str, str]) -> str:
+    """Description text: "**Label:** content" paragraphs; lists as "- " lines (rendered as HTML for Azure DevOps)."""
+    parts = []
+    for label, content in sections:
+        if content:
+            separator = "" if content.startswith("\n") else " "      # a list starts on the next line
+            parts.append(f"**{label}:**{separator}{content}" if label else content)
+    return "\n\n".join(parts)
+
+
+def _bullets(items: List[str]) -> str:
+    return "\n" + "\n".join(f"- {item}" for item in items) if items else ""
+
+
+# A measurable non-functional goal (it needs technical work, not a feature): latency, availability, load, security...
+_NON_FUNCTIONAL = re.compile(r"\b(p9\d|latency|response time|load time|page load|availability|uptime|"
+                             r"concurren\w*|throughput|scal\w*|secur\w*|encrypt\w*|backup|recovery|ms\b|seconds?\b|minutes?\b|"
+                             r"\d+(\.\d+)?\s*%\s*(uptime|availability)|99\.\d+\s*%)", re.IGNORECASE)
+
+
 def normalize_backlog(draft: Any, prd: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], List[str]]:
     """
-    Validates the agent's draft against the PRD. Returns (backlog, notes):
-    - every PRD requirement appears exactly once as a story keyed by its id (missing ones are added under
-      "Other requirements" from the PRD text, duplicates and unknown ids are dropped);
-    - empty features are removed, feature keys are unique (F1, F2...), titles are trimmed.
+    Validates the agent's draft against the PRD and builds the board-ready backlog (FEATURES ADO-3). Returns
+    (backlog, notes):
+    - every PRD requirement is in exactly one story; a story groups related requirements, its key is its first
+      requirement id (stable for the sync), unknown ids and repeats are dropped, missing ones get their own story
+      under "Other requirements";
+    - titles are built by code: Epic / Feature as written (no brackets), Story "[FR-002, FR-003] [Domain]: <action>"
+      (action at most 10 words), Task "[Layer]: <action>";
+    - descriptions are assembled from the agent's parts (user story, context, covered requirements with their PRD
+      text, notes; epic goal / scope / success criteria; feature scope and out of scope).
     """
     requirements = prd_requirements(prd)
     known = {req_id: text for req_id, text in requirements}
+    order = {req_id: n for n, (req_id, _) in enumerate(requirements)}
     notes: List[str] = []
     draft = draft if isinstance(draft, dict) else {}
     epic_in = draft.get("epic") if isinstance(draft.get("epic"), dict) else {}
     objective = _text((prd or {}).get("Objective"))
-    epic = {"key": "EPIC", "title": _text(epic_in.get("title"), MAX_TITLE) or (objective[:120] or "Product backlog"),
-            "description": _text(epic_in.get("description")) or objective}
+    goals = [_text(g.get("goal") if isinstance(g, dict) else g, 300) for g in (prd or {}).get("Goals") or []]
+    epic = {"key": "EPIC",
+            "title": _words(_BRACKETS.sub("", _text(epic_in.get("title"))), 12) or (objective[:120] or "Product backlog"),
+            "description": _join_sections(
+                ("Goal", _text(epic_in.get("goal") or epic_in.get("description")) or objective),
+                ("Scope", _text(epic_in.get("scope"))),
+                ("Success criteria", _bullets(_criteria(epic_in.get("success_criteria")) or [g for g in goals if g])))}
 
-    features, seen_stories, seen_features = [], set(), set()
-    for index, feature_in in enumerate(draft.get("features") or [], start=1):
+    features, used, seen_features = [], set(), set()
+    for feature_in in draft.get("features") or []:
         if not isinstance(feature_in, dict) or len(features) >= MAX_FEATURES:
             continue
         key = str(feature_in.get("key") or "").strip().upper()
         if not re.match(r"^F\d{1,3}$", key) or key in seen_features:
             key = next(f"F{n}" for n in range(1, 1000) if f"F{n}" not in seen_features)
+        feature_title = _words(_BRACKETS.sub("", _text(feature_in.get("title"))), 8) or f"Feature {key}"
         stories = []
         for story_in in feature_in.get("stories") or []:
             if not isinstance(story_in, dict):
                 continue
-            story_key = str(story_in.get("key") or story_in.get("id") or "").strip().upper()
-            if story_key not in known:
-                if story_key:
-                    notes.append(f"dropped story '{story_key}' (not a PRD requirement)")
+            wanted = story_in.get("requirements") or [story_in.get("key") or story_in.get("id")]
+            wanted = [str(r or "").strip().upper() for r in (wanted if isinstance(wanted, list) else [wanted])]
+            unknown = [r for r in wanted if r and r not in known]
+            if unknown:
+                notes.append(f"dropped {', '.join(unknown)} (not PRD requirements)")
+            reqs = sorted({r for r in wanted if r in known and r not in used}, key=order.get)
+            if not reqs:
                 continue
-            if story_key in seen_stories:
-                continue
-            seen_stories.add(story_key)
-            stories.append({"key": story_key,
-                            "title": _text(story_in.get("title"), MAX_TITLE) or known[story_key][:MAX_TITLE],
-                            "description": _text(story_in.get("description")) or known[story_key],
-                            "acceptance_criteria": _criteria(story_in.get("acceptance_criteria"))})
+            used.update(reqs)
+            domain = _domain(story_in.get("domain"), feature_title.split()[0] if feature_title else "")
+            action = _action(story_in.get("title"), known[reqs[0]])
+            story = {
+                "key": reqs[0], "requirements": reqs, "domain": domain, "action": action,
+                "title": f"[{', '.join(reqs)}] [{domain}]: {action}"[:MAX_TITLE],
+                "description": _join_sections(
+                    ("User story", _text(story_in.get("user_story"), 600)),
+                    ("Context", _text(story_in.get("context") or story_in.get("description"), 1500)),
+                    ("Requirements covered", _bullets([f"{r}: {known[r]}" for r in reqs])),
+                    ("Notes", _text(story_in.get("notes"), 800))),
+                "acceptance_criteria": _criteria(story_in.get("acceptance_criteria")),
+                "tasks": [],
+            }
+            for n, task_in in enumerate(story_in.get("tasks") or [], start=1):
+                if not isinstance(task_in, dict) or n > 8:
+                    continue
+                layer = next((x for x in TASK_LAYERS if x.lower() == _text(task_in.get("layer")).lower()), "Backend")
+                task_action = _words(_BRACKETS.sub("", _text(task_in.get("title"))), 12)
+                if not task_action:
+                    continue
+                story["tasks"].append({
+                    "key": f"{reqs[0]}-T{n}", "layer": layer, "title": f"[{layer}]: {task_action}"[:MAX_TITLE],
+                    "description": _join_sections(("", _text(task_in.get("description"), 800)),
+                                                  ("Done when", _text(task_in.get("done_when"), 300)))})
+            stories.append(story)
         if not stories:
             continue
         seen_features.add(key)
-        features.append({"key": key, "title": _text(feature_in.get("title"), MAX_TITLE) or f"Feature {key}",
-                         "description": _text(feature_in.get("description")), "stories": stories})
+        features.append({"key": key, "title": feature_title,
+                         "description": _join_sections(
+                             ("", _text(feature_in.get("description"), 1000)),
+                             ("Out of scope", _bullets(_criteria(feature_in.get("out_of_scope"))))),
+                         "stories": stories})
 
-    missing = [(req_id, text) for req_id, text in requirements if req_id not in seen_stories]
+    # Technical enablers (FEATURES REV-9): stories for the non-functional goals, each linked to the goals it supports
+    goals = [_text(g.get("goal") if isinstance(g, dict) else g, 400) for g in (prd or {}).get("Goals") or []]
+    supported: set = set()
+    enabler_stories = []
+    for n, enabler in enumerate(draft.get("enablers") or [], start=1):
+        if not isinstance(enabler, dict) or n > 8:
+            continue
+        action = _action(enabler.get("title"), "Technical enabler")
+        numbers = [int(x) for x in enabler.get("goal_numbers") or [] if str(x).isdigit() and 1 <= int(x) <= len(goals)]
+        supported.update(numbers)
+        enabler_stories.append({
+            "key": f"TE-{n}", "requirements": [], "domain": "Enabler", "action": action,
+            "title": f"[TE-{n}] [Enabler]: {action}"[:MAX_TITLE],
+            "description": _join_sections(
+                ("", _text(enabler.get("description"), 1000)),
+                ("Supports", _bullets([f"Goal {g}: {goals[g - 1]}" for g in numbers]))),
+            "acceptance_criteria": _criteria(enabler.get("acceptance_criteria")), "tasks": []})
+
+    missing = [(req_id, text) for req_id, text in requirements if req_id not in used]
     if missing:
         notes.append("added " + ", ".join(req_id for req_id, _ in missing) + " (missing from the draft)")
         key = next(f"F{n}" for n in range(1, 1000) if f"F{n}" not in seen_features)
-        features.append({"key": key, "title": "Other requirements", "description": "", "stories": [
-            {"key": req_id, "title": text[:MAX_TITLE], "description": text, "acceptance_criteria": []}
-            for req_id, text in missing]})
+        stories = []
+        for req_id, text in missing:
+            action = _action("", text)
+            stories.append({"key": req_id, "requirements": [req_id], "domain": "General", "action": action,
+                            "title": f"[{req_id}] [General]: {action}"[:MAX_TITLE],
+                            "description": _join_sections(("Requirements covered", _bullets([f"{req_id}: {text}"]))),
+                            "acceptance_criteria": [], "tasks": []})
+        features.append({"key": key, "title": "Other requirements",
+                         "description": "Requirements the draft did not place in a feature.", "stories": stories})
+    if enabler_stories:
+        key = next(f"F{n}" for n in range(1, 1000) if f"F{n}" not in {f["key"] for f in features})
+        features.append({"key": key, "title": "Technical enablers",
+                         "description": "Work the product needs that no single feature delivers: the non-functional "
+                                        "goals and constraints of the PRD.", "stories": enabler_stories})
     if sum(len(f["stories"]) for f in features) > MAX_STORIES:
         raise BoardsError(f"The backlog has more than {MAX_STORIES} stories.", error_type="VALIDATION_ERROR")
-    return {"epic": epic, "features": features}, notes
+    backlog = {"epic": epic, "features": features}
+    uncovered = [f"Goal {n}: {g}" for n, g in enumerate(goals, start=1)
+                 if n not in supported and _NON_FUNCTIONAL.search(g)]
+    if uncovered:
+        backlog["uncovered_goals"] = uncovered
+    return backlog, notes
 
 
 def backlog_counts(backlog: Optional[Dict[str, Any]]) -> Tuple[int, int]:
@@ -150,16 +269,22 @@ def backlog_counts(backlog: Optional[Dict[str, Any]]) -> Tuple[int, int]:
 
 
 def flatten(backlog: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Items in creation order (parents first): {"key", "level", "parent", "title", "description", "criteria"}."""
+    """Items in creation order (parents first): {"key", "level", "parent", "title", "description", "criteria", "tags"}."""
     items = [{"key": "EPIC", "level": "epic", "parent": None, "title": backlog["epic"]["title"],
-              "description": backlog["epic"].get("description", ""), "criteria": []}]
+              "description": backlog["epic"].get("description", ""), "criteria": [], "tags": []}]
     for feature in backlog["features"]:
         items.append({"key": feature["key"], "level": "feature", "parent": "EPIC", "title": feature["title"],
-                      "description": feature.get("description", ""), "criteria": []})
+                      "description": feature.get("description", ""), "criteria": [], "tags": []})
         for story in feature["stories"]:
             items.append({"key": story["key"], "level": "story", "parent": feature["key"], "title": story["title"],
                           "description": story.get("description", ""),
-                          "criteria": story.get("acceptance_criteria") or []})
+                          "criteria": story.get("acceptance_criteria") or [],
+                          "tags": list(story.get("requirements") or [story["key"]]) + (
+                              [story["domain"]] if story.get("domain") else [])})
+            for task in story.get("tasks") or []:
+                items.append({"key": task["key"], "level": "task", "parent": story["key"], "title": task["title"],
+                              "description": task.get("description", ""), "criteria": [],
+                              "tags": [task["layer"]] if task.get("layer") else []})
     return items
 
 
@@ -178,11 +303,13 @@ def render_backlog(backlog: Dict[str, Any], types: Optional[Dict[str, str]] = No
 
     lines = [f"**{types['epic']}:** {backlog['epic']['title']}{ref('EPIC')}", ""]
     for feature in backlog["features"]:
-        lines.append(f"**{types.get('feature') or 'Group'} {feature['key']}: {feature['title']}**{ref(feature['key'])}")
+        lines.append(f"**{types.get('feature') or 'Group'}: {feature['title']}**{ref(feature['key'])}")
         for story in feature["stories"]:
-            lines.append(f"- **{story['key']}** {story['title']}{ref(story['key'])}")
+            lines.append(f"- {story['title']}{ref(story['key'])}")
             for criterion in story.get("acceptance_criteria") or []:
                 lines.append(f"  - {criterion}")
+            for task in story.get("tasks") or []:
+                lines.append(f"  - Task {task['title']}{ref(task['key'])}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -251,11 +378,29 @@ def detect_work_item_types(api: _Api) -> Dict[str, Any]:
     fields = api.json(api.request("GET", f"wit/workitemtypes/{quote(story)}/fields", f"read the {story} fields"),
                       f"read the {story} fields")
     has_criteria = any(f.get("referenceName") == ACCEPTANCE_FIELD for f in fields.get("value") or [])
-    return {"epic": epic, "feature": feature, "story": story, "story_has_criteria": has_criteria}
+    return {"epic": epic, "feature": feature, "story": story, "task": "Task", "story_has_criteria": has_criteria}
 
 
 def _html(text: str) -> str:
-    return html.escape(text or "").replace("\n", "<br>")
+    """Description text -> HTML for Azure DevOps: "**Label:**" in bold, "- " lines as lists, paragraphs kept."""
+    blocks = []
+    for paragraph in (text or "").split("\n\n"):
+        lines, out, bullets = paragraph.split("\n"), [], []
+        for line in lines:
+            if line.startswith("- "):
+                bullets.append(f"<li>{html.escape(line[2:])}</li>")
+                continue
+            if bullets:
+                out.append("<ul>" + "".join(bullets) + "</ul>")
+                bullets = []
+            escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(line))
+            if escaped:
+                out.append(escaped)
+        if bullets:
+            out.append("<ul>" + "".join(bullets) + "</ul>")
+        if out:
+            blocks.append("<br>".join(out).replace("<br><ul>", "<ul>").replace("</ul><br>", "</ul>"))
+    return "".join(f"<div>{block}</div>" for block in blocks)
 
 
 def _criteria_html(criteria: List[str]) -> str:
@@ -263,7 +408,8 @@ def _criteria_html(criteria: List[str]) -> str:
 
 
 def _content_hash(item: Dict[str, Any], work_item_type: str) -> str:
-    payload = [work_item_type, item["title"], item["description"], item["criteria"], item["parent"]]
+    payload = [work_item_type, item["title"], item["description"], item["criteria"], item["parent"],
+               item.get("tags") or []]
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
@@ -274,9 +420,10 @@ def _fields_patch(item: Dict[str, Any], types: Dict[str, Any], op: str = "add") 
         if types["story_has_criteria"]:
             patch.append({"op": op, "path": f"/fields/{ACCEPTANCE_FIELD}", "value": _criteria_html(item["criteria"])})
         else:
-            description += "<br><br><b>Acceptance criteria</b>" + _criteria_html(item["criteria"])
+            description += "<div><b>Acceptance criteria</b></div>" + _criteria_html(item["criteria"])
     patch.append({"op": op, "path": "/fields/System.Description", "value": description})
-    tags = TAG + (f"; {item['key']}" if item["level"] == "story" else "")
+    # Tags: DevFoundry + the requirement ids and domain of a story (managers filter by them) / the layer of a task
+    tags = "; ".join([TAG] + [t for t in item.get("tags") or [] if t])
     patch.append({"op": op, "path": "/fields/System.Tags", "value": tags})
     return patch
 
@@ -287,6 +434,8 @@ def _parent_relation(api: _Api, parent_id: int) -> Dict[str, Any]:
 
 
 def _work_item_type(level: str, types: Dict[str, Any]) -> str:
+    if level == "task":
+        return types.get("task") or "Task"
     return types["epic"] if level == "epic" else (types["feature"] if level == "feature" else types["story"])
 
 

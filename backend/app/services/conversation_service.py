@@ -4,7 +4,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import UploadFile
 from dotenv import load_dotenv
 
@@ -19,12 +19,17 @@ from app.services.mcp.ado_mcp_server import sanitize_ado_project_name
 from app.services import project_store as store
 from app.services import progress, tech_fit
 from app.services.backlog_service import run_backlog_operation
-from app.services import pr_review_service
+from app.services import pr_review_service, prd_review
+from app.services.reply_actions import reply_actions
+from app.services.stack_check import stack_check
+from app.services.scaffold_verify import render_verification, verify_structure
 from app.services.repo_structure import layer_changes, render_structure_tree
 from app.services.scaffold_service import describe_toolchains
 from app.services.workflow_routing import (RoutingDecision, blocked_reply, effective_stage, next_steps,
                                            parse_routing_decision, routing_context, validate_decision,
-                                           apply_intent_rules, answers_different_product_question, allowed_operations)
+                                           apply_intent_rules, answers_different_product_question, allowed_operations,
+    question_chips,
+)
 from app.utils.document_markdown import prd_json_to_markdown, trd_json_to_markdown
 from app.core.logger import logger
 
@@ -548,10 +553,19 @@ def render_commands_for_display(state: Dict) -> Optional[str]:
               + (", followed by the changes you asked for" if notes or changes["delete"] else "") + "):")
     return f"{title}\n\n{header}\n\n{_format_commands(commands)}"
 
-def partial_success_reply(before: Optional[Dict], after: Optional[Dict], reference: str) -> Optional[str]:
+PARTIAL_REASONS = {
+    "busy": "the AI service is busy, so I couldn't write the full reply",
+    "error": "something went wrong while writing the reply",
+    "blocked": "the final safety check stopped the reply I had written",
+}
+
+
+def partial_success_reply(before: Optional[Dict], after: Optional[Dict], reference: str,
+                          reason: str = "busy") -> Optional[str]:
     """
     What a turn really changed (compared with the state before it), rendered by code, for when the final reply step
-    failed after tools had already acted. None when nothing changed (then "Nothing was changed" is true).
+    failed (or was blocked) after tools had already acted. None when nothing changed (then "Nothing was changed" is
+    true). Principle (ISSUES AGT-28): every change is reported in the reply of the same turn.
     """
     if not after or after.get("error"):
         return None
@@ -577,7 +591,7 @@ def partial_success_reply(before: Optional[Dict], after: Optional[Dict], referen
         done.append(f"{len(a_project.get('work_items'))} work items now exist in Azure Boards.")
     if not done and not structure_changed:
         return None
-    parts = ["Part of your request was completed, but the AI service is busy, so I couldn't write the full reply "
+    parts = [f"Part of your request was completed, but {PARTIAL_REASONS.get(reason, PARTIAL_REASONS['busy'])} "
              f"(Reference: {reference}). Here is what was saved:"]
     parts.append("\n".join(f"- {item}" for item in done) if done else "")
     if structure_changed and not pushed_now:
@@ -651,21 +665,247 @@ def stored_document_reply(document: Optional[str], workflow_state: Optional[Dict
 
 GUARDRAIL_ERROR_NAMES = {"ServiceUnavailable", "ExecutionError", "ConfigError"}
 GUARDRAIL_UNAVAILABLE_MESSAGE = ("The safety check could not run just now, so your message was not processed and nothing "
-                                 "changed. Please try again in a minute.")
-_GUARDRAIL_REASONS = {
-    "Off Topic Prompts": "it doesn't seem related to planning or setting up a software project",
-    "NSFW Text": "it contains inappropriate content",
+                                 "changed.\n\n---\n\nPlease send it again in a minute.")
+# What was paused and how to continue (FEATURES REV-2); every block ends with the usual closing line
+_GUARDRAIL_BLOCKS = {
+    "Off Topic Prompts": (
+        "That's outside what I can help with here, so nothing was done. I help you plan and set up software: the PRD "
+        "and TRD, the Azure DevOps project and repository, work items and pull request reviews.",
+        "What would you like to work on?"),
+    "NSFW Text": (
+        "I can't help with that message because it contains inappropriate content, so nothing was done.",
+        "Please rephrase it, and I'll continue with your project."),
 }
+_ATTACK_BLOCK = (
+    "I paused this message because it reads like an instruction to change how I work, so nothing was done. If you "
+    "meant to change your project, say it directly, for example \"Keep the TRD as it was\" or \"Use MySQL instead of "
+    "PostgreSQL\".",
+    "What would you like to change in your project?")
 
 
 def guardrail_block_message(check: Any) -> str:
-    """User-facing text for a blocked message: short and honest; the details stay in the log."""
+    """User-facing text for a blocked message: what was paused and how to continue; the details stay in the log."""
     name = getattr(check, "guardrail_name", None) or ""
     if name in GUARDRAIL_ERROR_NAMES:          # the guardrail model failed: not the user's fault
         return GUARDRAIL_UNAVAILABLE_MESSAGE
-    reason = _GUARDRAIL_REASONS.get(name, "it looks like an attempt to change or reveal my instructions")
-    return (f"I can't help with that message because {reason}. I can help you plan software: describe a product, "
-            "ask about your PRD or TRD, or continue with the next step.")
+    text, closing = _GUARDRAIL_BLOCKS.get(name, _ATTACK_BLOCK)
+    return f"{text}\n\n---\n\n{closing}"
+
+
+def scaffold_reply(operation: Optional[str], outcome: Dict[str, Any], before: Dict, after: Dict) -> str:
+    """
+    The reply after the generator commands ran (code-built, ISSUES AGT-29): what was created, the stored structure as a
+    tree (exactly what will be pushed) and how to continue. On a failure: what went wrong and that nothing was saved.
+    """
+    b_repo, a_repo = (before or {}).get("repository") or {}, (after or {}).get("repository") or {}
+    repo_name = a_repo.get("repo_name") or "the repository"
+    created_now = bool(a_repo.get("ado_repo_id")) and a_repo.get("ado_repo_id") != b_repo.get("ado_repo_id")
+    created = f"The repository **{repo_name}** was created. " if created_now else ""
+    if outcome.get("status") != "success":
+        message = str(outcome.get("message") or "the generator commands failed").rstrip(".")
+        return (f"{created}I couldn't generate the structure: {message}. Nothing was saved for the structure."
+                "\n\n---\n\nAsk me to generate the structure again, or tell me which template or stack to use.")
+    if operation == "CREATE_REPOSITORY" or created_now:
+        intro = f"{created}Its starting structure was generated with the official tools for your stack."
+    elif operation == "UPDATE_REPOSITORY_STRUCTURE":
+        intro = "The structure was generated again to match the updated TRD."
+    else:
+        intro = "The structure was generated again."
+    parts = [intro]
+    check = stack_check(((after or {}).get("project") or {}).get("trd"), a_repo.get("scaffold_commands"))
+    if check:
+        parts.append(check)
+    if outcome.get("kept_requested_files"):
+        parts.append("Your added files were kept: " + ", ".join(f"`{p}`" for p in outcome["kept_requested_files"]) + ".")
+    if outcome.get("note"):
+        parts.append(str(outcome["note"]))
+    tree = render_structure_for_display(after)
+    if tree:
+        parts.append(tree)
+    parts.append("---")
+    parts.append("Review it, then say **push to main** or tell me what to change.")
+    return "\n\n".join(parts)
+
+
+READINESS_ITEMS = ("R1", "R2", "R3", "R4", "R5")
+_GUARDRAIL_KNOWN = "Request flagged by requirements security guardrail."
+
+
+def _outdated_lines(state: Dict) -> List[str]:
+    items = store.outdated_items(state) if state and not state.get("error") else []
+    return [store.OUTDATED_DESCRIPTIONS[item] for item in items if item in store.OUTDATED_DESCRIPTIONS]
+
+
+def requirements_reply(operation: Optional[str], data: Dict, before: Dict, after: Dict) -> Optional[str]:
+    """
+    The Requirements agent's result as a reply, rendered by code (FEATURES LLM-11, REV-3, REV-4): no synthesizer call,
+    so the reply is fast, always matches what was saved and never drifts in format. None for anything else (the
+    synthesizer handles it).
+    - clarification questions: what is known so far, "N of 5 essentials known", numbered questions with their options;
+    - a new PRD / TRD: the stored document (and, for a PRD, how to change an assumption);
+    - an update: only what changed, the new version and what is now out of date (the full document stays one ask away).
+    """
+    status = data.get("status")
+    if status == "CLARIFICATION_REQUIRED":
+        questions = data.get("questions") or data.get("clarification_questions") or []
+        if data.get("known_so_far") == _GUARDRAIL_KNOWN and questions:
+            return str((questions[0] or {}).get("question") or "") or None          # the guardrail's own message
+        trd = data.get("workflow_stage") == "TRD"
+        lines = [f"Before I can write the {'TRD' if trd else 'PRD'}, I need a few more details."]
+        readiness = data.get("readiness") if isinstance(data.get("readiness"), dict) else None
+        known_text = str(data.get("known_so_far") or "").strip()
+        if readiness and not trd:
+            known = sum(1 for item in READINESS_ITEMS if readiness.get(item) in ("provided", "declined", "assumed"))
+            known_text = (known_text + " " if known_text else "") + f"(**{known} of 5** essentials known.)"
+        if known_text:
+            lines += ["", f"**What I know so far:** {known_text}"]
+        lines.append("")
+        for number, question in enumerate(questions, start=1):
+            if isinstance(question, dict):
+                lines.append(f"{number}. **{str(question.get('question') or '').strip()}**")
+                lines += [f"   - {choice}" for choice in question.get("choices") or []]
+            else:
+                lines.append(f"{number}. **{str(question).strip()}**")
+        lines += ["", "---", ""]
+        lines.append("You can answer in one message (for example \"1: ..., 2: ...\"), or say **make reasonable "
+                     "assumptions** and I'll fill the gaps and list them." if not trd else
+                     "Answer in one message (for example \"1: ..., 2: ...\") and I'll write the TRD.")
+        return "\n".join(lines)
+    if status != "COMPLETE" or operation not in ("GENERATE_PRD", "UPDATE_PRD", "GENERATE_TRD", "UPDATE_TRD"):
+        return None
+    document = "PRD" if operation.endswith("PRD") else "TRD"
+    key = "prd_version" if document == "PRD" else "trd_version"
+    b_project, a_project = (before or {}).get("project") or {}, (after or {}).get("project") or {}
+    old_version, new_version = b_project.get(key) or 0, a_project.get(key) or 0
+    if operation.startswith("GENERATE") or not old_version:
+        reply = stored_document_reply(document, after)
+        if not reply:
+            return None
+        reply = reply.replace("Here is the current, suggested", "Here is the suggested", 1)
+        if document == "PRD" and (a_project.get("prd") or {}).get("Assumptions"):
+            reply = insert_before_closing(reply, "To change an assumption, say \"change assumption 2 to ...\" (by its "
+                                                 "number).")
+        return reply
+    notes = data.get("change_notes")
+    notes = [n.strip(" -•\t") for n in (notes if isinstance(notes, list) else str(notes or "").splitlines())
+             if str(n).strip(" -•\t")]
+    name = "PRD" if document == "PRD" else "TRD"
+    if new_version <= old_version:
+        lines = [f"Nothing changed in the {name}" + (f": {notes[0]}" if notes else ".")]
+    else:
+        lines = [f"The {name} was updated (version {old_version} → {new_version}). What changed:", ""]
+        lines += [f"- {n}" for n in notes[:12]] or ["- The requested change."]
+    outdated = _outdated_lines(after)
+    if outdated:
+        lines += ["", "Now out of date because of this change:"] + [f"- {o}" for o in outdated]
+    lines += ["", "---", "", f"Say **show me the {name}** to see the whole document, or tell me what else to change."]
+    return "\n".join(lines)
+
+
+STRUCTURE_EDIT_OPERATIONS = ("UPDATE_REPOSITORY_STRUCTURE", "GENERATE_REPOSITORY_STRUCTURE")
+
+
+def structure_update_reply(before: Dict, after: Dict) -> str:
+    """After a requested structure change: what changed in one sentence and the updated tree (code-built)."""
+    from app.services.repo_structure import layer_changes
+    old = ((before or {}).get("repository") or {}).get("structure") or []
+    new = ((after or {}).get("repository") or {}).get("structure") or []
+    changes = layer_changes(old, new)
+    counts = [f"{len(changes[k])} {'file' if len(changes[k]) == 1 else 'files'} {verb}" for k, verb in
+              (("add", "added"), ("edit", "changed"), ("delete", "removed")) if changes.get(k)]
+    summary = ", ".join(counts) if counts else "no file changed"
+    parts = [f"The structure was updated as you asked: {summary}."]
+    tree = render_structure_for_display(after)
+    if tree:
+        parts.append(tree)
+    parts += ["---", "Review it, then say **push to main** or tell me what else to change."]
+    return "\n\n".join(parts)
+
+
+def insert_before_closing(text: str, note: str) -> str:
+    """Puts a note paragraph just above the closing divider (or at the end when there is none)."""
+    index = text.rfind("\n\n---\n\n")
+    if index == -1:
+        return f"{text.rstrip()}\n\n{note}"
+    return f"{text[:index]}\n\n{note}{text[index:]}"
+
+
+_ROLE_SPLIT = re.compile(r"\s+[-–—:]\s+|\s*\(")
+
+
+def _role_words(role: str) -> List[str]:
+    """'Doctors' -> ['doctor'], 'Front desk receptionist' -> ['receptionist', ...]: words to look for in requirements."""
+    words = [w for w in re.findall(r"[a-z]+", role.lower()) if len(w) > 2 and w not in {"the", "and", "user", "users"}]
+    return [w[:-1] if w.endswith("s") and not w.endswith("ss") else w for w in words]
+
+
+def role_coverage_note(prd: Optional[Dict]) -> Optional[str]:
+    """
+    A note when a target user role has no functional requirement mentioning it (FEATURES REV-7), e.g. "Doctors" is a
+    target user but nothing says what doctors do. None when every role is covered.
+    """
+    users = (prd or {}).get("Target Users") or []
+    requirements = [str(r.get("requirement") if isinstance(r, dict) else r).lower()
+                    for r in (prd or {}).get("Functional Requirements") or []]
+    if not users or not requirements:
+        return None
+
+    def acts_in(word: str, text: str) -> bool:
+        # the role is the actor ("doctors shall see…", "let patients book…", "allow the admin to…"), not merely
+        # mentioned ("…edit a doctor's schedule")
+        w = re.escape(word) + r"(?:s|es)?"
+        return bool(re.search(rf"\b(?:let|lets|allow|allows|enable|enables|permit|permits)\s+(?:the\s+|a\s+|an\s+|each\s+)?"
+                              rf"(?:[a-z-]+\s+)?{w}\b(?!')", text)
+                    or re.search(rf"\b{w}\b(?!')\s+(?:shall|can|must|may|should|will)\b", text))
+
+    missing = []
+    for item in users:
+        role = _ROLE_SPLIT.split(str(item), maxsplit=1)[0].strip()
+        words = _role_words(role)
+        if role and words and not any(acts_in(word, text) for word in words for text in requirements):
+            missing.append(role)
+    if not missing:
+        return None
+    names = ", ".join(f"**{m}**" for m in missing)
+    return (f"Note: {names} {'is a target user' if len(missing) == 1 else 'are target users'}, but no requirement "
+            "says what they do in the product yet. Tell me what they need to do, or ask me to remove "
+            f"{'this role' if len(missing) == 1 else 'these roles'}.")
+
+
+# Version numbers ("create-next-app 16.0.10") look like phone numbers to the PII filter (ISSUES SEC-17): they are
+# shielded during the output check and restored afterwards
+_VERSION = re.compile(r"(?<![\w.])v?\d+\.\d+\.\d+(?:[-+.][0-9A-Za-z.-]+)?(?![\w.])")
+_PII_NAMES = {"EMAIL_ADDRESS": "an email address", "PHONE_NUMBER": "a phone number", "CREDIT_CARD": "a card number",
+              "US_SSN": "a social security number", "IN_PAN": "a PAN number", "IN_AADHAAR": "an Aadhaar number",
+              "IBAN_CODE": "a bank account number", "US_PASSPORT": "a passport number", "IP_ADDRESS": "an IP address"}
+
+
+def shield_versions(text: str) -> Tuple[str, Dict[str, str]]:
+    found: Dict[str, str] = {}
+
+    def keep(match: "re.Match[str]") -> str:
+        token = f"VERSIONTOKEN{len(found)}X"
+        found[token] = match.group(0)
+        return token
+
+    return _VERSION.sub(keep, text or ""), found
+
+
+def restore_versions(text: str, found: Dict[str, str]) -> str:
+    for token, value in found.items():
+        text = text.replace(token, value)
+    return text
+
+
+def redaction_note(before: str, after: str) -> Optional[str]:
+    """Says which personal details the output filter replaced (FEATURES REV-7), e.g. a support email address."""
+    added = [m for m in dict.fromkeys(re.findall(r"<([A-Z_]{3,})>", after or "")) if f"<{m}>" not in (before or "")]
+    if not added:
+        return None
+    kinds = [_PII_NAMES.get(m, "a personal detail") for m in added]
+    listed = kinds[0] if len(kinds) == 1 else ", ".join(kinds[:-1]) + " and " + kinds[-1]
+    return (f"Note: for privacy I replaced {listed} with a placeholder such as `<{added[0]}>`. In the project, keep "
+            "such values in configuration (for example a `SUPPORT_EMAIL` setting) instead of the documents.")
 
 
 def presents_document(reply: str) -> bool:
@@ -824,6 +1064,26 @@ def insert_structure_tree(text: str, tree_markdown: Optional[str], commands_mark
 DEFAULT_HISTORY_TOKEN_BUDGET = 60_000
 
 
+ROUTING_HISTORY_MESSAGES = 8
+ROUTING_MESSAGE_CHARS = 900
+
+
+def routing_history(messages: List[Message], keep: int = ROUTING_HISTORY_MESSAGES,
+                    max_chars: int = ROUTING_MESSAGE_CHARS) -> List[Message]:
+    """
+    The last `keep` messages for the routing decision, each at most `max_chars` (start and end kept, so a question at the
+    end of a long reply - "Shall I create the TRD?" - is still seen).
+    """
+    result = []
+    for message in messages[-keep:]:
+        text = getattr(message, "text", None) or "".join(str(getattr(c, "text", c) or "") for c in message.contents or [])
+        if len(text) > max_chars:
+            head = max_chars * 2 // 3
+            text = text[:head] + "\n[…]\n" + text[-(max_chars - head):]
+        result.append(Message(role=message.role, contents=[text]))
+    return result
+
+
 def history_token_budget() -> int:
     """
     CHAT_HISTORY_TOKEN_BUDGET: how much of the conversation (in tokens) every agent receives. The default fits the MAQ AI
@@ -902,23 +1162,30 @@ AVAILABLE CHILD AGENTS AND OPERATIONS:
    - UPDATE_PRD: change functional requirements (features, users, roles, flows, goals) of an existing PRD.
    - GENERATE_TRD: create the Technical Requirements Document from the PRD.
    - UPDATE_TRD: change, add, remove or confirm technologies in an existing TRD.
+   - REVIEW_PRD: review the existing PRD for gaps and risks ("act as a senior architect and review the PRD", "what is
+     missing in the PRD?", "review the requirements for security gaps"); nothing changes. Adding the suggested items
+     afterwards is UPDATE_PRD.
 2. Repo_Setup_Agent
    - GENERATE_PROJECT_PROPOSAL / UPDATE_PROJECT_PROPOSAL: propose / change the Azure DevOps project name and description (before it exists). Azure DevOps project names must use ONLY letters, numbers, spaces, and hyphens (max 64 chars); never use '&' or special characters, always write 'and'.
    - CREATE_PROJECT: create the Azure DevOps project (explicit approval only); it also suggests a repository name.
    - UPDATE_ADO_PROJECT: rename / change the description of the already created Azure DevOps project.
    - GENERATE_REPOSITORY_PROPOSAL / UPDATE_REPOSITORY_PROPOSAL: propose / rename the repository.
    - CREATE_REPOSITORY: create the empty repository (explicit approval only); it then generates the folder structure by
-     running the stack's official generator commands (e.g. create-vite, uv init) and shows it.
+     running the official generator commands for the TRD's stack and shows it. Never name generators yourself in a reply:
+     the system reports the commands that really ran.
    - GENERATE_REPOSITORY_STRUCTURE: generate the structure again with different generator commands (the user does not accept
      the generated approach, or wants another generator / template).
    - UPDATE_REPOSITORY_STRUCTURE: add / change / remove the files the user explicitly asks for on top of the generated
      structure, or bring the structure in line with the latest TRD (STRUCTURE_OUTDATED).
    - PUSH_REPOSITORY_STRUCTURE: push the approved structure to the main branch (explicit approval only); if it was pushed
      before, only the changes are pushed as a follow-up commit.
+   - VERIFY_REPOSITORY_STRUCTURE: check that the saved structure installs and builds ("verify the scaffold", "does it
+     build?", "check the project works"); nothing changes. Only when the user asks.
 3. Backlog_Agent (Azure Boards work items; only once the Azure DevOps project exists, see allowed_operations)
-   - GENERATE_WORK_ITEMS_PROPOSAL: draft the backlog from the PRD (epic, features, one story per requirement with
-     acceptance criteria), or redraft it after the PRD changed (WORK_ITEMS_OUTDATED, "update the work items").
-   - UPDATE_WORK_ITEMS_PROPOSAL: change the draft (rename/merge/split features, reword stories, acceptance criteria).
+   - GENERATE_WORK_ITEMS_PROPOSAL: draft the backlog from the PRD (epic, 2-3 features, a few stories that group the
+     requirements, with acceptance criteria), or redraft it after the PRD changed (WORK_ITEMS_OUTDATED, "update the work items").
+   - UPDATE_WORK_ITEMS_PROPOSAL: change the draft (rename/merge/split features, reword stories, acceptance criteria),
+     including adding or removing tasks ("add tasks", "break the stories into tasks").
    - CREATE_WORK_ITEMS: create / sync the drafted work items in Azure Boards (explicit approval only, e.g. "the work
      items look good, create them", "yes, create them in Azure Boards").
 4. Security_Review_Agent (pull requests of the project's repository; only once the repository exists in Azure DevOps)
@@ -1043,8 +1310,10 @@ DECISION FIELDS:
         # 1. Execute the Orchestrator: a structured routing decision (Agent Framework response_format)
         logger.info(f"[Orchestrator] Running Orchestrator Agent (Provider: {provider_name}, Model: {deployment}, History: {len(history)} messages, Stage: {stage})...")
         orch_start = time.time()
-        # Orchestrator: the whole conversation (within the token budget) + latest query with state
-        recent_orch_history = message_list[:-1]
+        # Orchestrator: only the recent turns, shortened, + the latest query with the state block (ISSUES AGT-26). The
+        # routing decision needs the last question and answer, not whole PRDs; a full history filled Groq's per-minute
+        # token budget in one call, so the next messages fell back to slow MAQ AI. The agents keep the full history.
+        recent_orch_history = routing_history(message_list[:-1])
         orchestrator_messages = recent_orch_history + [Message(role="user", contents=[user_query + state_note])]
         progress.step("Deciding the next step")
         orchestrator_response = await orchestrator.run(
@@ -1110,6 +1379,12 @@ DECISION FIELDS:
             decision = RoutingDecision(reasoning="explicit pull request request", user_intent="explicit_next_step",
                                        action="delegate", agent="Security_Review_Agent", operation=pr_operation,
                                        pull_request_id=decision.pull_request_id)
+        # An explicit "review the PRD" request always gets the structured review, never a free-form table (FE-11)
+        if (decision.action == "respond" and "REVIEW_PRD" in allowed_operations(stage, workflow_state)
+                and prd_review.is_review_request(user_query)):
+            logger.warning("[Routing Guard] respond -> REVIEW_PRD (explicit PRD review request)")
+            decision = RoutingDecision(reasoning="explicit PRD review request", user_intent="explicit_next_step",
+                                       action="delegate", agent="Requirements_Agent", operation="REVIEW_PRD")
         # Posting review comments on a pull request needs an explicit request (like a push)
         if (decision.action == "delegate" and decision.operation == "POST_PR_REVIEW_COMMENTS"
                 and not pr_review_service.is_post_request(user_query, history)):
@@ -1137,7 +1412,14 @@ DECISION FIELDS:
                 response_text = gate_reply
                 decision.show_document = None
 
-        if route_agent == "Requirements_Agent":
+        if route_agent == "Requirements_Agent" and operation == "REVIEW_PRD":
+            # Typed review rendered by code as cards by priority, with Add to PRD chips (FE-11); nothing is stored
+            logger.info("[Routing Decision] -> PRD architect review (typed answer, rendered by code)")
+            progress.step(OPERATION_STEPS["REVIEW_PRD"])
+            response_text = await prd_review.review_prd(small_client, user_query,
+                                                        ((workflow_state or {}).get("project")) or {})
+
+        elif route_agent == "Requirements_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Requirements_Agent ({operation})")
 
             workflow_context_note = f"\n[Workflow Context from Orchestrator: Operation = {operation}]"
@@ -1335,8 +1617,15 @@ Put a blank line before and after every heading, divider (---) and list; never p
                 instructions=synthesis_prompt,
                 client=client,
             )
+            code_reply = None
+            if not unsaved_document and conversation_id:
+                code_reply = requirements_reply(operation, parse_agent_json(child_raw_json) or {}, workflow_state or {},
+                                                store.get_workflow_state(conversation_id))
             if unsaved_document:
                 response_text = document_not_saved_message(operation)
+            elif code_reply:
+                response_text = code_reply                     # rendered by code: no synthesizer call (LLM-11)
+                logger.info("[Orchestrator] Reply rendered by code from the saved document (no synthesizer)")
             else:
                 progress.step("Preparing the reply")
                 synthesis_result = await synthesizer_agent.run(
@@ -1353,6 +1642,21 @@ Put a blank line before and after every heading, divider (---) and list; never p
                                    "the database")
                     response_text = (stored_document_reply(document, store.get_workflow_state(conversation_id))
                                      or response_text)
+                if saved and operation in ("GENERATE_PRD", "UPDATE_PRD"):
+                    # Every target role must be covered by a requirement (seen in review: Doctors listed, no FR)
+                    prd = (store.get_project(conversation_id) or {}).get("prd") if conversation_id else None
+                    note = role_coverage_note(prd)
+                    if note:
+                        logger.warning(f"[Readiness Guard] {note}")
+                        response_text = insert_before_closing(response_text, note)
+
+        elif route_agent == "Repo_Setup_Agent" and operation == "VERIFY_REPOSITORY_STRUCTURE":
+            # Code only (FEATURES SCAF-R12): install + build each part in a temporary copy, report per part
+            logger.info("[Routing Decision] -> Scaffold verification (code)")
+            progress.step(OPERATION_STEPS["VERIFY_REPOSITORY_STRUCTURE"])
+            structure = (((workflow_state or {}).get("repository")) or {}).get("structure") or []
+            results = await asyncio.to_thread(verify_structure, structure)
+            response_text = render_verification(results)
 
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
@@ -1375,14 +1679,30 @@ Put a blank line before and after every heading, divider (---) and list; never p
             # Invoke Repo Setup Child Agent
             logger.info(f"[Repo_Setup_Agent] Processing request with operation: {operation}...")
             child_start = time.time()
-            # Built per operation: only the tools this operation allows (none for proposals)
-            repo_setup_agent = get_repo_setup_agent(client, conversation_id, operation)
+            # Built per operation: only the tools this operation allows (none for proposals). Generator commands the
+            # agent plans are run by code AFTER its turn (AGT-29): no model waits on them, the reply is built by code.
+            deferred: Dict[str, Any] = {}
+            repo_setup_agent = get_repo_setup_agent(client, conversation_id, operation, deferred)
             progress.step(OPERATION_STEPS.get(operation, "Working on your request"))
             child_response = await repo_setup_agent.run(messages=repo_messages)
             child_duration = round((time.time() - child_start) * 1000, 1)
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
             persist_repo_setup_output(conversation_id, child_raw_json)
+            if (not deferred.get("run") and conversation_id and operation in STRUCTURE_EDIT_OPERATIONS):
+                after = store.get_workflow_state(conversation_id)
+                if ((after.get("repository") or {}).get("structure_version") or 0) > \
+                        (((workflow_state or {}).get("repository") or {}).get("structure_version") or 0):
+                    # A requested structure change: one sentence + the tree, never a list of paths (ISSUES AGT-33)
+                    return title_prefix + structure_update_reply(workflow_state or {}, after)
+            if deferred.get("run") and conversation_id:
+                progress.step("Generating the repository structure")
+                gen_start = time.time()
+                outcome = await asyncio.to_thread(deferred["run"])
+                logger.info(f"[Repo_Setup_Agent] Generator commands finished in {time.time() - gen_start:.0f}s "
+                            f"({outcome.get('status')})")
+                return title_prefix + scaffold_reply(operation, outcome, workflow_state or {},
+                                                     store.get_workflow_state(conversation_id))
             follow_ups = follow_up_note(conversation_id)
 
             # The structure shown to the user is rendered from the stored files (the same files that get pushed)
@@ -1513,6 +1833,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
             stored_document = stored_document_reply(decision.show_document, workflow_state)
             if stored_document:
                 logger.info(f"[Routing Decision] Showing the stored {decision.show_document}")
+                progress.note("show_document", decision.show_document)     # an "Open PRD" button (UX-9)
             response_text = enforce_closing_line(stored_document or normalize_reply(response_text))
             if not stored_document and should_attach_structure_tree(response_text, workflow_state):
                 tree = render_structure_for_display(workflow_state)
@@ -1530,32 +1851,41 @@ Put a blank line before and after every heading, divider (---) and list; never p
                     "contains text that looks like instructions to the AI (a possible prompt injection). Please remove that text "
                     "and try again. Nothing was changed.")
         reference = uuid.uuid4().hex[:8]
-        if isinstance(e, AllProvidersFailedError):
+        busy = isinstance(e, AllProvidersFailedError)
+        if busy:
             logger.error(f"[Agent Pipeline] [ref {reference}] No AI model could answer:\n  " + "\n  ".join(e.errors))
-            # Seen live: the repository was created and its structure generated, then only the reply step failed and
-            # the user was told "Nothing was changed". Report what was really done, from the stored state.
-            before = locals().get("workflow_state")
-            if conversation_id and before is not None:
-                partial = partial_success_reply(before, store.get_workflow_state(conversation_id), reference)
-                if partial:
-                    logger.warning(f"[Agent Pipeline] [ref {reference}] The reply failed after changes were saved; "
-                                   "showing them from the database")
-                    return partial
-            return SERVICE_UNAVAILABLE_MESSAGE.format(reference=reference)
-        logger.exception(f"[Agent Pipeline] [ref {reference}] Unexpected error: {type(e).__name__}: {e}")
-        return UNEXPECTED_ERROR_MESSAGE.format(reference=reference)
+        else:
+            logger.exception(f"[Agent Pipeline] [ref {reference}] Unexpected error: {type(e).__name__}: {e}")
+        # Seen live: the repository was created and its structure generated, then only the reply step failed and the
+        # user was told "Nothing was changed". Wait for tools still running (a generator thread outlives an abandoned
+        # model call), then report what was really done, from the final stored state.
+        before = locals().get("workflow_state")
+        if conversation_id and before is not None:
+            if progress.tools_running(conversation_id):
+                logger.info(f"[Agent Pipeline] [ref {reference}] Waiting for running tools before replying")
+                await progress.wait_for_tools(conversation_id)
+            partial = partial_success_reply(before, store.get_workflow_state(conversation_id), reference,
+                                            "busy" if busy else "error")
+            if partial:
+                logger.warning(f"[Agent Pipeline] [ref {reference}] The reply failed after changes were saved; "
+                               "showing them from the database")
+                return partial
+        return (SERVICE_UNAVAILABLE_MESSAGE if busy else UNEXPECTED_ERROR_MESSAGE).format(reference=reference)
 
 async def generate_chat_response(user_query: str, history: List[Dict], conversation_id: Optional[str] = None) -> str:
     """Runs the agent pipeline on the tiered fallback client (Azure OpenAI -> Groq models -> streamed MAQ AI)."""
     client = get_agent_framework_client()
     return await _execute_agent_pipeline(client, getattr(client, "current_model", ""), user_query, history, conversation_id)
 
-def get_suggestions(conversation_id: Optional[str]) -> List[Dict[str, str]]:
-    """Next-step suggestions (label + prompt) for the chips above the chat input."""
+def get_suggestions(conversation_id: Optional[str], last_reply: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Chips above the chat input: the answers to the question the last reply asked (UX-10), otherwise the next steps
+    from the stored workflow state.
+    """
     if not conversation_id:
         return []
     try:
-        return next_steps(store.get_workflow_state(conversation_id))
+        return question_chips(last_reply) or next_steps(store.get_workflow_state(conversation_id))
     except Exception as e:
         logger.error(f"[Suggestions] Could not compute suggestions: {e}")
         return []
@@ -1572,6 +1902,8 @@ OPERATION_STEPS = {
     "UPDATE_REPOSITORY_STRUCTURE": "Updating the repository structure", "PUSH_REPOSITORY_STRUCTURE": "Pushing to Azure DevOps",
     "GENERATE_WORK_ITEMS_PROPOSAL": "Drafting the work items", "UPDATE_WORK_ITEMS_PROPOSAL": "Updating the work items draft",
     "CREATE_WORK_ITEMS": "Creating the work items in Azure Boards",
+    "VERIFY_REPOSITORY_STRUCTURE": "Checking that the project installs and builds",
+    "REVIEW_PRD": "Reviewing the PRD as an architect",
     "LIST_PULL_REQUESTS": "Reading the pull requests", "REVIEW_PULL_REQUEST": "Reviewing the pull request",
     "POST_PR_REVIEW_COMMENTS": "Posting the review comments",
 }
@@ -1742,24 +2074,33 @@ async def _process_chat_request(conversation_id: Optional[str], user_query: str,
             suggestions=get_suggestions(conversation_id),
         )
 
-    # Generate response via multi-agent pipeline
+    # Generate response via multi-agent pipeline (the state before it lets a blocked reply still report real changes)
+    state_before = store.get_workflow_state(conversation_id)
     response_text = await generate_chat_response(user_query, content_array, conversation_id)
 
     # 2. Orchestrator Output Guardrail Boundary (redacts PII / blocks restricted URLs)
     progress.step("Final safety check")
-    output_check = await check_output_guardrail(response_text)
+    shielded, versions = shield_versions(response_text)
+    output_check = await check_output_guardrail(shielded)
     if not output_check.allowed:
         logger.warning(
             f"[Orchestrator Guardrail Block] Synthesized response blocked by '{output_check.guardrail_name}': {output_check.blocked_reason}"
         )
-        response_text = (
+        # If the turn already changed something (e.g. created the project or pushed), say so (ISSUES AGT-28)
+        changed = partial_success_reply(state_before, store.get_workflow_state(conversation_id),
+                                        uuid.uuid4().hex[:8], "blocked")
+        response_text = changed or (
             GUARDRAIL_UNAVAILABLE_MESSAGE if output_check.guardrail_name in GUARDRAIL_ERROR_NAMES else
-            "I apologize, but the generated response was blocked by our security and safety filters. "
-            "Please try rephrasing your request."
+            "I couldn't show the reply I had written because the final safety check stopped it. Nothing was changed."
+            "\n\n---\n\nPlease rephrase your request and try again."
         )
     elif output_check.response_text:
-        response_text = output_check.response_text
-    
+        # Say when personal details were replaced (never silently drop what the user gave), then restore versions
+        note = redaction_note(shielded, output_check.response_text)
+        response_text = restore_versions(output_check.response_text, versions)
+        if note:
+            response_text = insert_before_closing(response_text, note)
+
     llm_title = None
     if response_text.startswith("TITLE:"):
         parts = response_text.split("\n\n", 1)
@@ -1784,9 +2125,12 @@ async def _process_chat_request(conversation_id: Optional[str], user_query: str,
         except Exception as e:
             logger.error(f"[Supabase] Failed to update title: {str(e)}")
 
+    # Buttons under the reply (UX-9): what this turn wrote or created, from the stored state (not the reply text)
+    actions = reply_actions(state_before, store.get_workflow_state(conversation_id), progress.noted("show_document"))
+
     # Persist updated conversation history
     content_array.append({"role": "user", "text": user_query})
-    content_array.append({"role": "assistant", "text": response_text})
+    content_array.append({"role": "assistant", "text": response_text, **({"actions": actions} if actions else {})})
     supabase = get_supabase_client()
     try:
         supabase.table("Conversation").update({"content": content_array}).eq("conv_id", conversation_id).execute()
@@ -1799,7 +2143,7 @@ async def _process_chat_request(conversation_id: Optional[str], user_query: str,
     logger.info(f"=== Chat pipeline completed successfully in {total_time}ms ===")
 
     return ChatResponse(conversation_id=conversation_id, response=response_text,
-                        suggestions=get_suggestions(conversation_id),
-                        title=current_title)
+                        suggestions=get_suggestions(conversation_id, response_text),
+                        title=current_title, actions=actions)
 
 

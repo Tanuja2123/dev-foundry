@@ -5,6 +5,7 @@ Orchestrator routing: the structured decision the Orchestrator returns (Microsof
 The model decides *what the user wants*; this module decides *whether that step is allowed now*,
 so the workflow can never skip a stage (e.g. jump from the TRD to the ADO project proposal).
 """
+import re
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from pydantic import BaseModel, Field
@@ -16,12 +17,15 @@ REPO_SETUP_OPERATIONS = (
     "GENERATE_PROJECT_PROPOSAL", "UPDATE_PROJECT_PROPOSAL", "CREATE_PROJECT", "UPDATE_ADO_PROJECT",
     "GENERATE_REPOSITORY_PROPOSAL", "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY",
     "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE",
+    "VERIFY_REPOSITORY_STRUCTURE",
 )
 # Azure Boards work items from the PRD: a parallel track, available once the Azure DevOps project exists
 BACKLOG_OPERATIONS = ("GENERATE_WORK_ITEMS_PROPOSAL", "UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS")
 # Security review of pull requests: available once the repository exists in Azure DevOps
 PR_REVIEW_OPERATIONS = ("LIST_PULL_REQUESTS", "REVIEW_PULL_REQUEST", "POST_PR_REVIEW_COMMENTS")
-OPERATION_AGENT = {op: "Requirements_Agent" for op in REQUIREMENTS_OPERATIONS}
+# Architect review of the PRD (FE-11): read-only, rendered by code; available whenever a PRD exists
+REVIEW_OPERATIONS = ("REVIEW_PRD",)
+OPERATION_AGENT = {op: "Requirements_Agent" for op in REQUIREMENTS_OPERATIONS + REVIEW_OPERATIONS}
 OPERATION_AGENT.update({op: "Repo_Setup_Agent" for op in REPO_SETUP_OPERATIONS})
 OPERATION_AGENT.update({op: "Backlog_Agent" for op in BACKLOG_OPERATIONS})
 OPERATION_AGENT.update({op: "Security_Review_Agent" for op in PR_REVIEW_OPERATIONS})
@@ -31,8 +35,10 @@ Operation = Literal[
     "GENERATE_PROJECT_PROPOSAL", "UPDATE_PROJECT_PROPOSAL", "CREATE_PROJECT", "UPDATE_ADO_PROJECT",
     "GENERATE_REPOSITORY_PROPOSAL", "UPDATE_REPOSITORY_PROPOSAL", "CREATE_REPOSITORY",
     "GENERATE_REPOSITORY_STRUCTURE", "UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE",
+    "VERIFY_REPOSITORY_STRUCTURE",
     "GENERATE_WORK_ITEMS_PROPOSAL", "UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS",
     "LIST_PULL_REQUESTS", "REVIEW_PULL_REQUEST", "POST_PR_REVIEW_COMMENTS",
+    "REVIEW_PRD",
 ]
 
 
@@ -163,6 +169,8 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
         operations.append("UPDATE_TRD")
     if has_prd and not has_trd and "GENERATE_TRD" not in operations:
         operations.append("GENERATE_TRD")
+    if has_prd:
+        operations.append("REVIEW_PRD")
     # Azure Boards work items: once the ADO project exists, in any later stage
     project = (state or {}).get("project") or {}
     if has_prd and project.get("ado_project_id"):
@@ -171,6 +179,9 @@ def allowed_operations(stage: Optional[str], state: Optional[Dict[str, Any]] = N
             operations += ["UPDATE_WORK_ITEMS_PROPOSAL", "CREATE_WORK_ITEMS"]
     # Pull request security reviews: once the repository exists in Azure DevOps, in any stage
     repository = (state or {}).get("repository") or {}
+    # "Verify the scaffold" (on request): once a structure is saved
+    if repository.get("structure"):
+        operations.append("VERIFY_REPOSITORY_STRUCTURE")
     if repository.get("ado_repo_id") and project.get("ado_project_id"):
         operations += ["LIST_PULL_REQUESTS", "REVIEW_PULL_REQUEST"]
         if repository.get("pr_reviews"):
@@ -377,6 +388,9 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
             "Request folder structure or file adjustments",
             "Please adjust the repository folder structure. I would like to add or change: <describe files, directories, or modules to add or remove>"
         ))
+        if repository.get("structure"):
+            suggestions.append(("Verify the scaffold installs and builds",
+                                "Verify the scaffold: install the dependencies and build each part."))
     # Azure Boards work items: offered once the repository is pushed (or as soon as a draft is waiting for approval)
     project = (state or {}).get("project") or {}
     if (project.get("ado_project_id") and store.has_work_item_columns(project)
@@ -410,6 +424,61 @@ def next_steps(state: Optional[Dict[str, Any]], limit: int = 3) -> List[Dict[str
             suggestions.append(("Review open pull request for security issues",
                                 "Review the active pull request for security issues."))
     return [{"label": label, "prompt": prompt} for label, prompt in suggestions[:limit]]
+
+
+def question_chips(last_reply: Optional[str]) -> Optional[List[Dict[str, str]]]:
+    """
+    Chips that answer the question the last reply asked (FEATURES UX-10), e.g. "Yes, switch to COBOL anyway" / "No,
+    keep Node.js / Express" after the technology fit question, instead of the generic next step (seen: "Proceed to
+    repository setup" while the fit question was open). Each chip sends an explicit answer, so the confirmation guards
+    still apply. None when the reply asked no known question (the workflow chips are used then).
+    """
+    from app.services import tech_fit                       # local imports: these modules import this one
+    from app.services.pr_review_service import POST_MARKER
+    from app.services.prd_review import REVIEW_MARKER, review_chips
+    text = last_reply or ""
+    if not text.strip():
+        return None
+    chips: List[Tuple[str, str]] = []
+    if tech_fit.CONFIRMATION_MARKER.lower() in text.lower():
+        replace = re.search(r"\*\*(.+?)\*\* fits this project less well than the current \*\*(.+?)\*\*", text)
+        addition = re.search(r"(adding|removing) \*\*(.+?)\*\* doesn't fit this project", text)
+        if replace:
+            requested, current = replace.group(1), replace.group(2)
+            chips = [(f"Yes, switch to {requested} anyway", "Yes, switch anyway."),
+                     (f"No, keep {current} as it is", f"No, keep {current}.")]
+        elif addition:
+            verb, requested = addition.group(1), addition.group(2)
+            chips = [(f"Yes, {verb[:-3]} {requested} anyway", "Yes, go ahead anyway."),
+                     ("No, leave the TRD as it is", "No, leave the TRD as it is.")]
+        else:                                                # the fit check could not run: the user decides
+            chips = [("Yes, apply the change anyway", "Yes, apply it anyway."),
+                     ("No, leave the TRD as it is", "No, leave the TRD as it is.")]
+    elif REVIEW_MARKER in text:
+        chips = review_chips(text)                           # "Add to PRD" chips (FE-11)
+    elif DIFFERENT_PRODUCT_MARKER in text:
+        chips = [("Yes, continue with this project", "Yes, continue with the current project."),
+                 ("Replace this PRD with the new product", "Replace the PRD with this product.")]
+    elif POST_MARKER in text or "post the review findings as comments" in text:
+        pr = re.search(r"PR #(\d+)", text)
+        target = f" to PR #{pr.group(1)}" if pr else ""
+        chips = [(f"Post the security review findings{target}",
+                  f"Post the security review findings as comments{(' on pull request #' + pr.group(1)) if pr else ''}."),
+                 ("Don't post the findings yet", "Don't post the findings yet.")]
+    elif text.rstrip().endswith("?"):
+        transition = next((op for op, question in _DOCUMENT_TRANSITIONS.items() if question in text), None)
+        if transition == "GENERATE_TRD":
+            chips = [("Yes, create the TRD now", "Yes, create the TRD."),
+                     ("Not yet, I'll review the PRD", "Not yet, I want to review the PRD first.")]
+        elif transition == "GENERATE_PROJECT_PROPOSAL":
+            chips = [("Yes, proceed with project setup", "Yes, proceed with project setup."),
+                     ("Not yet, I'll review the TRD", "Not yet, I want to review the TRD first.")]
+        elif transition == "CREATE_WORK_ITEMS":
+            chips = [("Yes, create them in Azure Boards", "Yes, create the work items in Azure Boards."),
+                     ("Not yet, change the draft first", "Not yet, I want to change the draft first.")]
+    if not chips and "make reasonable assumptions" in text.lower():
+        chips = [("Make reasonable assumptions for the rest", "make reasonable assumptions")]
+    return [{"label": label, "prompt": prompt} for label, prompt in chips] or None
 
 
 def _draft_not_created(project: Dict[str, Any]) -> bool:

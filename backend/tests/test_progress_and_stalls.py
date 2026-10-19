@@ -225,3 +225,116 @@ def test_the_pipeline_reports_its_steps():
     for marker in ('progress.step("Deciding the next step")', "OPERATION_STEPS.get(operation", 'progress.step("Preparing the reply")'):
         assert marker in source
     assert cs.OPERATION_STEPS["GENERATE_TRD"] == "Writing the TRD"
+
+
+# ---------------------------------------------------------------------------- tools inside a model turn (AGT-28/34)
+
+def test_tool_time_is_neither_a_stall_nor_part_of_the_total(fast_limits):
+    # seen live: 166 s of generator commands inside the Repo Setup agent's turn were taken for a stalled model
+    stream = FakeStream([0.01, 0.6, 0.01])        # 0.6 s gap > stall 0.2 s, but a tool runs meanwhile
+
+    async def scenario():
+        progress.start("conv-tool", "u")
+
+        async def tool_runs_during_the_gap():
+            await asyncio.sleep(0.02)
+            progress.tool_started()
+            await asyncio.sleep(0.55)
+            progress.tool_finished()
+
+        asyncio.ensure_future(tool_runs_during_the_gap())
+        try:
+            return await lc.read_stream_with_watchdog(stream, Provider())
+        finally:
+            progress.finish("conv-tool")
+
+    assert asyncio.run(scenario()) == "the TRD" and not stream.closed
+
+
+def test_a_real_stall_is_still_caught_after_a_tool(fast_limits):
+    stream = FakeStream([0.01, 5.0])
+
+    async def scenario():
+        progress.start("conv-stall", "u")
+        try:
+            return await lc.read_stream_with_watchdog(stream, Provider())
+        finally:
+            progress.finish("conv-stall")
+
+    with pytest.raises(lc.StreamStalledError, match="no new text"):
+        asyncio.run(scenario())
+
+
+def test_wait_for_tools_returns_when_the_thread_is_done():
+    async def scenario():
+        progress.start("conv-wait", "u")
+        progress.tool_started()
+
+        def generator_thread():
+            time.sleep(0.3)
+            progress.tool_finished()
+
+        worker = asyncio.ensure_future(asyncio.to_thread(generator_thread))
+        finished = await progress.wait_for_tools("conv-wait", timeout=5)
+        await worker
+        progress.finish("conv-wait")
+        return finished
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_a_once_per_turn_tool_runs_once_and_tools_are_tracked():
+    from types import SimpleNamespace
+    from app.services.agents.repo_setup_agent import tool_run_middleware
+    middleware = tool_run_middleware()
+    pushes, seen_running = [], []
+
+    async def scenario():
+        progress.start("conv-mw", "u")
+        results = []
+        for _ in range(2):
+            context = SimpleNamespace(function=SimpleNamespace(name="push_repository_structure"), result=None)
+
+            async def call_next(context=context):
+                seen_running.append(progress.tools_running())
+                pushes.append(1)
+                context.result = {"status": "success", "commit_id": "abc"}
+
+            await middleware(context, call_next)
+            results.append(context.result)
+        progress.finish("conv-mw")
+        return results
+
+    results = asyncio.run(scenario())
+    assert len(pushes) == 1 and seen_running == [1]               # second call returned the first result
+    assert results[0] == results[1] == {"status": "success", "commit_id": "abc"}
+
+
+def test_a_failed_once_per_turn_tool_may_be_retried():
+    from types import SimpleNamespace
+    from app.services.agents.repo_setup_agent import tool_run_middleware
+    middleware, calls = tool_run_middleware(), []
+
+    async def scenario():
+        for status in ("error", "success"):
+            context = SimpleNamespace(function=SimpleNamespace(name="push_repository_structure"), result=None)
+
+            async def call_next(context=context, status=status):
+                calls.append(status)
+                context.result = {"status": status}
+
+            await middleware(context, call_next)
+
+    asyncio.run(scenario())
+    assert calls == ["error", "success"]
+
+
+def test_the_bubble_says_when_a_backup_model_answers():
+    from types import SimpleNamespace
+    first = SimpleNamespace(name="Azure OpenAI", stream=False)
+    maq = SimpleNamespace(name="MAQ AI (SLM)", stream=True)
+    groq = SimpleNamespace(name="Groq (gpt-oss-20b)", stream=False)
+    assert lc.backup_notice(first, []) == "Using Azure OpenAI"
+    assert lc.backup_notice(maq, ["[Azure OpenAI]: 403"]) == (
+        "The main model is busy, so a backup (MAQ AI (SLM)) is answering; this can take a few minutes")
+    assert lc.backup_notice(groq, ["[Azure OpenAI]: 403"]).endswith("is answering")

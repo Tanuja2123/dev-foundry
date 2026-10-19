@@ -55,8 +55,12 @@ class TechFitAssessment(BaseModel):
     requested_choice: str = Field("", description="What the user asks for, e.g. 'COBOL'.")
     current_fit: float = Field(0, description="1-10: how well the current choice fits THIS project's PRD and TRD.")
     requested_fit: float = Field(0, description="1-10: how well the requested choice fits THIS project's PRD and TRD.")
-    pros: List[str] = Field(default_factory=list, description="2-4 genuine advantages of the requested choice here.")
-    cons: List[str] = Field(default_factory=list, description="2-4 concrete drawbacks of the requested choice here.")
+    pros: List[str] = Field(default_factory=list, description="Genuine advantages of the requested choice FOR THIS PROJECT "
+                                                               "(0-4); [] when there is no real one - never invent one.")
+    cons: List[str] = Field(default_factory=list, description="2-4 concrete reasons it fits worse here (shown first).")
+    alternatives: List[str] = Field(default_factory=list, description="1-2 closest viable options if the request comes "
+                                    "from a company standard, team skills or an existing system (e.g. 'Java with Spring "
+                                    "Boot - if the company standardises on the JVM'); [] if the current choice is it.")
     recommendation: str = Field("", description="One sentence: what you recommend for this project and why.")
 
 
@@ -73,6 +77,12 @@ trade-offs; 3-4 a poor fit that adds significant risk or effort; 1-2 unsuitable.
 niche or mismatched technology for this kind of product must score low even if the user insists (e.g. COBOL for a modern
 web API with a JavaScript frontend scores 1-3). Score the current choice by the same standard.
 
+pros: only genuine advantages for THIS project; return [] when there is no real one (never invent pros to balance the
+answer). cons: the concrete reasons it fits worse here. alternatives: people rarely ask for a worse fit without a
+reason (company standard, team skills, an existing system, a client requirement); name the 1-2 closest options that
+serve such a reason AND fit this project well (e.g. COBOL for a web API because of an enterprise standard -> "Java with
+Spring Boot" or "C# with ASP.NET Core"), each with when it makes sense; [] when the current choice already is that.
+
 changes_technology is false when the message keeps or re-states the current choice (e.g. "use PostgreSQL" when the TRD
 already uses PostgreSQL), or when it is not about technology.
 
@@ -84,8 +94,8 @@ reasonable, common addition scores 6-9 even if the project could also work witho
 
 Return ONE JSON object with exactly these fields and nothing else:
 {"changes_technology": true, "change_kind": "replace", "confirms_previous_warning": false, "area": "...", "current_choice": "...",
- "requested_choice": "...", "current_fit": 8, "requested_fit": 2, "pros": ["..."], "cons": ["..."],
- "recommendation": "..."}
+ "requested_choice": "...", "current_fit": 8, "requested_fit": 2, "pros": [], "cons": ["..."],
+ "alternatives": ["..."], "recommendation": "..."}
 """
 
 
@@ -217,25 +227,39 @@ def _warned_choice_matches(assessment: "TechFitAssessment", history: List[Dict[s
     return bool(choice) and choice in _last_assistant(history).lower()
 
 
+def fit_label(score: float) -> str:
+    """A rough label instead of a falsely precise number (decided D8): the score is one model's judgment."""
+    value = _scale(score)
+    return "strong fit" if value >= 8 else "fair fit" if value >= 5 else "weak fit"
+
+
 def confirmation_reply(assessment: TechFitAssessment) -> str:
+    """
+    The fit question (FEATURES REV-6): the reasons first, the fit as a rough label, an honest "no real advantage", what
+    might be behind the request with the closest viable alternatives, the recommendation and one question.
+    """
     current, requested = assessment.current_choice or "the current choice", assessment.requested_choice or "the change"
     area = f" for the {assessment.area[0].lower() + assessment.area[1:]}" if assessment.area else ""
     if is_addition(assessment):
         verb = "adding" if (assessment.change_kind or "").lower() == "add" else "removing"
         lines = [f"Before changing the TRD, I want to double-check: {verb} **{requested}** doesn't fit this project "
-                 f"well{area}. {CONFIRMATION_MARKER}.",
-                 "",
-                 f"**Fit for this project:** {verb} {requested} {_scale(assessment.requested_fit):g}/10"]
+                 f"well{area}. {CONFIRMATION_MARKER}."]
+        fit = f"**Fit for this project:** {verb} {requested}: {fit_label(assessment.requested_fit)}"
     else:
         lines = [f"Before changing the TRD, I want to double-check: **{requested}** fits this project less well than "
-                 f"the current **{current}**{area}. {CONFIRMATION_MARKER}.",
-                 "",
-                 f"**Fit for this project:** {current} {_scale(assessment.current_fit):g}/10 · "
-                 f"{requested} {_scale(assessment.requested_fit):g}/10"]
-    if assessment.pros:
-        lines += ["", f"**Pros of {requested}:**"] + [f"- {p}" for p in assessment.pros[:4]]
+                 f"the current **{current}**{area}. {CONFIRMATION_MARKER}."]
+        fit = (f"**Fit for this project:** {current}: {fit_label(assessment.current_fit)} · "
+               f"{requested}: {fit_label(assessment.requested_fit)}")
     if assessment.cons:
-        lines += ["", f"**Cons of {requested}:**"] + [f"- {c}" for c in assessment.cons[:4]]
+        lines += ["", "**Why:**"] + [f"- {c}" for c in assessment.cons[:4]]
+    lines += ["", fit]
+    if assessment.pros:
+        lines += ["", f"**Advantages of {requested} here:**"] + [f"- {p}" for p in assessment.pros[:4]]
+    else:
+        lines += ["", f"**Advantages of {requested} here:** none for this project."]
+    if assessment.alternatives:
+        lines += ["", "**If there is a reason behind the request** (a company standard, team skills, an existing "
+                      "system), these fit better while serving it:"] + [f"- {a}" for a in assessment.alternatives[:2]]
     if assessment.recommendation:
         lines += ["", f"**Recommendation:** {assessment.recommendation}"]
     question = (f"Do you still want to go ahead with it (say \"yes, switch anyway\"), or leave the TRD as it is?"

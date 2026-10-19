@@ -23,10 +23,23 @@ const BULLET = /^(\s*)[-*+•]\s+(.*)$/
 const ORDERED = /^(\s*)(\d+)[.)]\s+(.*)$/
 const QUOTE = /^\s*>\s?(.*)$/
 const TABLE_ROW = /^\s*\|.*\|\s*$/
+// Body rows may omit the closing pipe (valid GitHub Markdown; seen from the model: rows rendered as raw text)
+const TABLE_BODY_ROW = /^\s*\|.*[^\\]\|/
 const TABLE_SEPARATOR = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/
 
 function splitRow(line: string): string[] {
-  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.trim())
+  // split on pipes that are not escaped ("\|" stays a literal pipe inside a cell)
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/(?<!\\)\|$/, '')
+    .split(/(?<!\\)\|/)
+    .map((cell) => cell.trim().replace(/\\\|/g, '|'))
+}
+
+function fitRow(cells: string[], width: number): string[] {
+  if (cells.length >= width) return cells.slice(0, width)
+  return [...cells, ...Array(width - cells.length).fill('')]
 }
 
 function indentOf(spaces: string): number {
@@ -36,6 +49,7 @@ function indentOf(spaces: string): number {
 export function parseMarkdown(content: string): Block[] {
   const lines = (content ?? '').replace(/\r\n?/g, '\n').split('\n')
   const blocks: Block[] = []
+  let quoteOpen = false // a blank line ends a quote, so two quotes in a row stay two (e.g. review cards)
   let paragraph: string[] = []
   // Open lists, outermost first, with the indentation of their items
   let listStack: { list: ListBlock; indent: number }[] = []
@@ -97,6 +111,7 @@ export function parseMarkdown(content: string): Block[] {
 
     if (!line.trim()) {
       flushParagraph() // lists stay open across blank lines ("loose" lists)
+      quoteOpen = false
       continue
     }
 
@@ -123,8 +138,8 @@ export function parseMarkdown(content: string): Block[] {
       const header = splitRow(line)
       const rows: string[][] = []
       i += 2
-      while (i < lines.length && TABLE_ROW.test(lines[i])) {
-        rows.push(splitRow(lines[i]))
+      while (i < lines.length && TABLE_BODY_ROW.test(lines[i])) {
+        rows.push(fitRow(splitRow(lines[i]), header.length))
         i++
       }
       i--
@@ -158,8 +173,9 @@ export function parseMarkdown(content: string): Block[] {
     if (quote) {
       flushParagraph()
       const previous = blocks[blocks.length - 1]
-      if (previous && previous.type === 'quote') previous.lines.push(quote[1])
+      if (quoteOpen && previous && previous.type === 'quote') previous.lines.push(quote[1])
       else blocks.push({ type: 'quote', lines: [quote[1]] })
+      quoteOpen = true
       continue
     }
 
@@ -187,7 +203,7 @@ export type InlineToken =
   | { type: 'italic'; text: string }
 
 // Italic needs non-space characters right inside both asterisks, so "*.py and *.md" stays plain text
-const INLINE = /(`[^`]+`)|(\[[^\]]+\]\(https?:\/\/[^)\s]+\))|(\*\*[^*]+\*\*)|(\*[^*\s](?:[^*]*[^*\s])?\*)/g
+const INLINE = /(``(?:[^`]|`(?!`))+``|`[^`]+`)|(\[[^\]]+\]\(https?:\/\/[^)\s]+\))|(\*\*[^*]+\*\*)|(\*[^*\s](?:[^*]*[^*\s])?\*)/g
 
 export function parseInline(text: string): InlineToken[] {
   const tokens: InlineToken[] = []
@@ -197,7 +213,10 @@ export function parseInline(text: string): InlineToken[] {
     if (index > last) tokens.push({ type: 'text', text: text.slice(last, index) })
     const value = match[0]
     if (match[1]) {
-      tokens.push({ type: 'code', text: value.slice(1, -1) })
+      // ``code with a ` backtick`` (double backticks) or `code`
+      const ticks = value.startsWith('``') ? 2 : 1
+      const inner = value.slice(ticks, -ticks)
+      tokens.push({ type: 'code', text: ticks === 2 ? inner.replace(/^ (.*) $/, '$1') : inner })
     } else if (match[2]) {
       const link = value.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/)!
       tokens.push({ type: 'link', text: link[1], href: link[2] })

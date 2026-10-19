@@ -205,3 +205,113 @@ def test_prompts_ask_for_suggested_documents_and_the_closing_rule():
     assert source.count("CLOSING RULE (every case)") == 2
     assert 'no "Proposed Azure DevOps Project" title' in source
     assert "do NOT mention or list any commands" in source
+
+
+# ---------------------------------------------------------------------------- REV-7 / SEC-17
+
+def test_version_numbers_are_shielded_from_the_pii_filter():
+    from app.services import conversation_service as cs
+    text = "```bash\nnpx create-next-app@latest frontend    # create-next-app 16.0.10\nmix phx.new . # Mix 1.18.2-otp-27\n```"
+    shielded, found = cs.shield_versions(text)
+    assert "16.0.10" not in shielded and "1.18.2-otp-27" not in shielded and len(found) == 2
+    assert cs.restore_versions(shielded, found) == text
+    assert cs.shield_versions("Call 040 2345 6789 or v2 of the API")[1] == {}      # only dotted versions
+
+
+def test_a_redaction_is_mentioned_once():
+    from app.services import conversation_service as cs
+    before = "Support contact: support@clinic.example\n\n---\n\nShall I create the TRD?"
+    after = "Support contact: <EMAIL_ADDRESS>\n\n---\n\nShall I create the TRD?"
+    note = cs.redaction_note(before, after)
+    assert note.startswith("Note: for privacy I replaced an email address with a placeholder such as `<EMAIL_ADDRESS>`")
+    reply = cs.insert_before_closing(after, note)
+    assert reply.endswith("Shall I create the TRD?") and reply.index("Note: for privacy") < reply.index("---")
+    assert cs.redaction_note(after, after) is None                 # already a placeholder before the check
+
+
+def test_every_target_role_needs_a_requirement():
+    from app.services import conversation_service as cs
+    prd = {"Target Users": ["Patients - book appointments", "Receptionists - manage schedules",
+                            "Doctors - see their own day"],
+           "Functional Requirements": [
+               {"id": "FR-001", "requirement": "The system shall let patients book an appointment."},
+               {"id": "FR-002", "requirement": "The system shall let a receptionist edit a doctor's schedule."}]}
+    note = cs.role_coverage_note(prd)
+    assert note.startswith("Note: **Doctors** is a target user, but no requirement says what they do")
+    prd["Functional Requirements"].append({"id": "FR-003", "requirement": "Doctors shall see their appointments for the day."})
+    assert cs.role_coverage_note(prd) is None
+    assert cs.role_coverage_note({"Target Users": ["Admin (IT staff)"], "Functional Requirements": [
+        {"requirement": "The admin shall manage user accounts."}]}) is None
+
+
+def test_requirements_prompt_covers_roles_jurisdiction_and_compliance_wording():
+    from app.services.agents import requirements_agent as ra
+    import inspect
+    prompt = inspect.getsource(ra)
+    assert "I6. Jurisdiction - ONLY for regulated domains" in prompt and "never pick a regime yourself" in prompt
+    assert "must be the actor of at least one Functional Requirement" in prompt
+    assert "Assumed role:" in prompt
+    assert "Designed to support <regime>; needs a compliance" in prompt and "never\n    \"<regime>-compliant\"" in prompt
+
+
+def test_routing_sees_recent_turns_shortened_with_the_last_question_kept():
+    from agent_framework import Message
+    from app.services import conversation_service as cs
+    long_prd = "PRD section. " * 400 + "Shall I create the TRD now?"
+    history = [Message(role="user" if n % 2 == 0 else "assistant", contents=[f"message {n}"]) for n in range(12)]
+    history.append(Message(role="assistant", contents=[long_prd]))
+    routed = cs.routing_history(history)
+    assert len(routed) == cs.ROUTING_HISTORY_MESSAGES
+    assert routed[0].text == "message 5" and routed[-1].text.endswith("Shall I create the TRD now?")
+    assert len(routed[-1].text) <= cs.ROUTING_MESSAGE_CHARS + 10
+    import inspect
+    assert "routing_history(message_list[:-1])" in inspect.getsource(cs._execute_agent_pipeline)
+
+
+# ---------------------------------------------------------------------------- LLM-11 / REV-3 / REV-4: code-rendered
+
+def _req_state(prd_version=1, trd=None, trd_version=0, trd_prd_version=0):
+    prd = {"Objective": "Clinic booking.", "Target Users": ["Patients - book"],
+           "Functional Requirements": [{"id": "FR-001", "requirement": "Patients shall book a slot."}],
+           "Assumptions": ["Email sign-in", "One clinic location"]}
+    return {"project": {"prd": prd, "prd_version": prd_version, "trd": trd, "trd_version": trd_version,
+                        "trd_prd_version": trd_prd_version, "workflow_stage": "PRD_REVIEW"}, "repository": None}
+
+
+def test_clarifications_show_progress_and_numbered_questions():
+    from app.services import conversation_service as cs
+    data = {"status": "CLARIFICATION_REQUIRED", "workflow_stage": "PRD", "known_so_far": "A clinic booking app.",
+            "readiness": {"R1": "provided", "R2": "provided", "R3": "missing", "R4": "assumed", "R5": "missing"},
+            "questions": [{"question": "What must receptionists be able to do?", "choices": ["Manage schedules", "Other"]},
+                          {"question": "How do you measure success?", "choices": []}]}
+    reply = cs.requirements_reply("GENERATE_PRD", data, {}, {})
+    assert "**What I know so far:** A clinic booking app. (**3 of 5** essentials known.)" in reply
+    assert "1. **What must receptionists be able to do?**\n   - Manage schedules" in reply
+    assert "say **make reasonable assumptions**" in reply and reply.count("\n---\n") == 1
+    assert cs.question_chips(reply)[0]["prompt"] == "make reasonable assumptions"          # the chip (UX-10)
+    blocked = {"status": "CLARIFICATION_REQUIRED", "known_so_far": cs._GUARDRAIL_KNOWN,
+               "clarification_questions": [{"question": "I paused this message...", "choices": []}]}
+    assert cs.requirements_reply("UPDATE_PRD", blocked, {}, {}) == "I paused this message..."
+
+
+def test_a_new_prd_is_the_saved_document_with_numbered_assumptions():
+    from app.services import conversation_service as cs
+    reply = cs.requirements_reply("GENERATE_PRD", {"status": "COMPLETE"}, {}, _req_state())
+    assert reply.startswith("Here is the suggested **Product Requirements Document (PRD)** (version 1):")
+    assert "## Assumptions\n\n1. Email sign-in\n2. One clinic location" in reply
+    assert "To change an assumption, say \"change assumption 2 to ...\"" in reply
+
+
+def test_an_update_shows_only_what_changed_and_what_is_now_outdated():
+    from app.services import conversation_service as cs
+    before = _req_state(prd_version=2, trd={"Backend Technology Stack": {}}, trd_version=1, trd_prd_version=2)
+    after = _req_state(prd_version=3, trd={"Backend Technology Stack": {}}, trd_version=1, trd_prd_version=2)
+    data = {"status": "COMPLETE", "change_notes": "FR-008: added the waiting list\nUser Flow: added the waiting step"}
+    reply = cs.requirements_reply("UPDATE_PRD", data, before, after)
+    assert reply.startswith("The PRD was updated (version 2 → 3). What changed:\n\n- FR-008: added the waiting list")
+    assert "Now out of date because of this change:" in reply and "## Functional Requirements" not in reply
+    assert reply.endswith("Say **show me the PRD** to see the whole document, or tell me what else to change.")
+    same = cs.requirements_reply("UPDATE_TRD", {"status": "COMPLETE", "change_notes": "Redis is already in the TRD"},
+                                 before, before)
+    assert same.startswith("Nothing changed in the TRD: Redis is already in the TRD")
+    assert cs.requirements_reply("UPDATE_TRD", {"status": "CONFIRMATION_REQUIRED"}, before, after) is None

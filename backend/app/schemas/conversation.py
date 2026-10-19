@@ -7,6 +7,13 @@ class Suggestion(BaseModel):
     prompt: str = Field(..., description="Message sent when the user clicks the suggestion")
 
 
+class ReplyAction(BaseModel):
+    kind: str = Field(..., description="document (open in the chat), projects (Projects page) or link (Azure DevOps)")
+    label: str = Field(..., description="Button text")
+    document: Optional[str] = Field(None, description="PRD or TRD, for document and projects buttons")
+    url: Optional[str] = Field(None, description="Web address, for link buttons")
+
+
 class ConversationItem(BaseModel):
     conversation_id: str = Field(..., description="Unique identifier for the conversation")
     title: str = Field(..., description="Short title shown in the UI")
@@ -24,3 +31,4 @@ class ChatResponse(BaseModel):
     response: str = Field(..., description="LLM-generated answer for the user query")
     suggestions: List[Suggestion] = Field(default_factory=list, description="Next-step suggestions for the user")
     title: Optional[str] = Field(None, description="Current or updated title for the conversation")
+    actions: List[ReplyAction] = Field(default_factory=list, description="Buttons under the reply (UX-9)")

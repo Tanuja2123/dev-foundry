@@ -7,6 +7,7 @@ type DocumentDrawerProps = {
   docType: 'PRD' | 'TRD' | null
   projectName: string
   content: string | null
+  loading?: boolean
   updatedAt?: string | null
   onClose: () => void
 }
@@ -16,6 +17,7 @@ export function DocumentDrawer({
   docType,
   projectName,
   content,
+  loading = false,
   updatedAt,
   onClose,
 }: DocumentDrawerProps) {
@@ -124,7 +126,11 @@ export function DocumentDrawer({
 
         {/* Drawer Scrollable Content */}
         <div className="drawer-body">
-          {content ? (
+          {loading ? (
+            <div className="drawer-empty-state" role="status">
+              <p>Loading the document…</p>
+            </div>
+          ) : content ? (
             <div className="drawer-markdown-wrapper">
               <MarkdownRenderer content={content} />
             </div>

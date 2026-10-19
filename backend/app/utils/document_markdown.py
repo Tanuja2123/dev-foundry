@@ -58,6 +58,11 @@ def prd_json_to_markdown(data: Any) -> str:
                         lines.append(f"- {', '.join(f'{k}: {v}' for k, v in item.items())}")
                 else:
                     lines.append(f"- {item}")
+            if key == "Assumptions":
+                # numbered, so one can be confirmed or changed by its number ("change assumption 2 to ...", REV-4)
+                bullets = [n for n, line in enumerate(lines) if line.startswith("- ")][-len(value):]
+                for number, index in enumerate(bullets, start=1):
+                    lines[index] = f"{number}. {lines[index][2:]}"
             lines.append("")
         elif isinstance(value, dict):
             for sub_key, sub_val in value.items():

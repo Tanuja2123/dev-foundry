@@ -276,7 +276,7 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
                     repos = list_res.json().get("value", [])
                     # If a repository already has this name, return it idempotently
                     for r in repos:
-                        if r.get("name") == repository_name:
+                        if str(r.get("name") or "").lower() == repository_name.lower():   # ADO names ignore case
                             logger.info(f"[ADO MCP] Repository '{repository_name}' already exists in project '{project_id_or_name}'.")
                             return {
                                 "status": "success",
@@ -286,7 +286,12 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
                             }
 
                     # If an empty default repository exists (e.g. auto-created with the project, no branch/commits), rename it
-                    for r in repos:
+                    # the project's own empty default repository first (named like the project), then any empty one
+                    project_name = str(project_id_or_name).lower()
+                    empty = sorted((r for r in repos if r.get("defaultBranch") is None and not r.get("size")),
+                                   key=lambda r: str((r.get("project") or {}).get("name") or "").lower() != str(r.get("name") or "").lower()
+                                   and str(r.get("name") or "").lower() != project_name)
+                    for r in empty[:1]:
                         if r.get("defaultBranch") is None:
                             patch_url = f"{org_url}/{encoded_project}/_apis/git/repositories/{r['id']}?api-version=7.1"
                             patch_res = client.patch(patch_url, json={"name": repository_name}, headers=headers)
@@ -304,7 +309,8 @@ def create_ado_repository(project_id_or_name: str, repository_name: str) -> Dict
                                     "url": repo_url
                                 }
             except Exception as e:
-                logger.debug(f"[ADO MCP] Checking/renaming existing repository skipped: {e}")
+                logger.warning(f"[ADO MCP] Checking/renaming the existing repository failed ({e}); creating a new "
+                               "repository instead (the project may end up with an extra empty repository)")
 
             # 2. Otherwise create a new repository as fallback
             response = client.post(url, json=payload, headers=headers)
