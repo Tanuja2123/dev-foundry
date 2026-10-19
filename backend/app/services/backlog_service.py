@@ -107,10 +107,16 @@ def render_draft_reply(project: Dict[str, Any], backlog: Dict[str, Any], operati
         if change_summary:
             intro += f" {str(change_summary).strip()}"
     else:
+        requirements = len(ado_boards.prd_requirements(project.get("prd")))
+        tasks = sum(len(s.get("tasks") or []) for f in backlog.get("features") or [] for s in f.get("stories") or [])
         intro = (f"Here is the suggested **Azure Boards backlog** for **{name}**, drafted from the PRD (version "
-                 f"{project.get('prd_version') or 1}): 1 epic, {features} features and {stories} stories, one per "
-                 "functional requirement, each with acceptance criteria.")
+                 f"{project.get('prd_version') or 1}): 1 epic, {features} features and {stories} stories covering "
+                 f"all {requirements} requirements, each with acceptance criteria"
+                 + (f", and {tasks} tasks" if tasks else "") + ". Each item has a full description in Azure Boards.")
     parts = [intro, ado_boards.render_backlog(backlog, GENERIC_TYPES)]
+    if backlog.get("uncovered_goals"):
+        parts.append("Not covered by any work item yet: " + "; ".join(backlog["uncovered_goals"]) + ". Say \"add an "
+                     "enabler for it\", or leave it out on purpose.")
     if project.get("work_items"):
         parts.append("Work items that already exist in Azure Boards will be updated and new ones added; nothing is "
                      "deleted.")
@@ -123,7 +129,7 @@ async def create_work_items(project: Dict[str, Any]) -> str:
     draft = project.get("work_items_proposal")
     if not draft:
         return NO_DRAFT_MESSAGE
-    backlog = {key: value for key, value in draft.items() if key != "synced"}
+    backlog = {key: value for key, value in draft.items() if key not in ("synced", "uncovered_goals")}
     progress.begin_side_effect("Creating the work items in Azure Boards")    # Stop can no longer cancel the turn
     result = await asyncio.to_thread(ado_boards.create_work_items, project["ado_project_id"], backlog,
                                      project.get("work_items"))
@@ -154,16 +160,18 @@ def render_create_reply(backlog: Dict[str, Any], result: Dict[str, Any]) -> str:
         parts.append(f"Some work items could not be created ({summary} so far): {error.get('message')} Ask me to "
                      "create the work items again to continue; the ones already created will not be duplicated.")
     elif not created and not updated:
-        parts.append(f"These work items already exist in Azure Boards and match the current draft, so nothing was "
-                     f"created again (no duplicates). [Open the backlog]({result.get('backlog_url')})")
+        # Nothing new: a short confirmation, never the whole list again (ISSUES AGT-30)
+        return (f"All {unchanged} work items already exist in Azure Boards and match the current draft, so nothing "
+                f"was created again (no duplicates). [Open the backlog]({result.get('backlog_url')})\n\n---\n\n"
+                "When the PRD changes, ask me to update the work items and I'll sync them.")
     else:
-        parts.append(f"The work items are in Azure Boards ({summary}): one {names['epic']}, "
-                     f"{names['feature']}s and one {names['story']} per requirement, with acceptance criteria. "
-                     f"[Open the backlog]({result.get('backlog_url')})")
+        parts.append(f"The work items are in Azure Boards ({summary}): one {names['epic']}, a few "
+                     f"{names['feature']}s and {names['story']}s that cover every requirement, with acceptance "
+                     f"criteria. [Open the backlog]({result.get('backlog_url')})")
     parts.append(ado_boards.render_backlog(backlog, names, result.get("items")))
     if result.get("not_in_prd"):
-        parts.append("Not in the PRD any more (kept, not deleted): " + ", ".join(result["not_in_prd"]) +
-                     ". Remove them in Azure Boards if they are no longer needed.")
+        parts.append("No longer in the backlog (kept in Azure Boards, not deleted): " + ", ".join(result["not_in_prd"])
+                     + ". Remove them there if they are no longer needed.")
     parts.append("---")
     parts.append("When the PRD changes, ask me to update the work items and I'll sync them.")
     return "\n\n".join(parts)

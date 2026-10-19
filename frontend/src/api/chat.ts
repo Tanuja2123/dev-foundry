@@ -1,5 +1,5 @@
 import { getIdToken } from '../auth/token'
-import type { ChatApiResponse, Conversation, Suggestion } from '../types'
+import type { ChatApiResponse, Conversation, ReplyAction, Suggestion } from '../types'
 
 function apiBaseUrl() {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim()
@@ -40,7 +40,7 @@ export async function listConversations(): Promise<Conversation[]> {
 export async function getConversation(conversationId: string): Promise<{
   conv_id: string
   title: string
-  content?: Array<{ role: 'user' | 'assistant'; text: string }>
+  content?: Array<{ role: 'user' | 'assistant'; text: string; actions?: ReplyAction[] }>
   suggestions?: Suggestion[]
 }> {
   const response = await authFetch(`${apiBaseUrl()}/api/conversation/${conversationId}`)

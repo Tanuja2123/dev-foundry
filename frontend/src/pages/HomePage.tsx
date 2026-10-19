@@ -167,6 +167,7 @@ export function HomePage() {
             id: createId(),
             role: m.role,
             content: m.text,
+            actions: m.actions,
           }))
           setMessagesByConversation((prev) => ({
             ...prev,
@@ -424,6 +425,7 @@ export function HomePage() {
         id: createId(),
         role: 'assistant',
         content: result.response,
+        actions: result.actions,
       }
       setSuggestionsByConversation((prev) => ({ ...prev, [key]: result.suggestions ?? [] }))
       if (result.title) {
@@ -578,6 +580,10 @@ export function HomePage() {
             onEditAndResend={(messageId, newContent) => void handleEditAndResend(messageId, newContent)}
             onFilesAdded={addFiles}
             onRemoveFile={removeFile}
+            onOpenInProjects={(document) =>
+              conversation &&
+              navigate(`/projects?project=${encodeURIComponent(conversation.id)}&doc=${document.toLowerCase()}`)
+            }
           />
         )}
       </div>

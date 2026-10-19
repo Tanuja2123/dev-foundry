@@ -3501,3 +3501,46 @@ code {
   background: rgba(0, 0, 0, 0.08);
   color: #0f172a;
 }
+
+/* Buttons under an assistant reply (UX-9): open the PRD / TRD, the Projects page or Azure DevOps */
+.reply-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.reply-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 4px 12px;
+  border-radius: var(--ms-radius-sm);
+  border: 1px solid var(--ms-border);
+  background: var(--ms-bg-card);
+  color: var(--ms-link);
+  font: inherit;
+  font-size: 13px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.reply-action:hover {
+  background: var(--ms-bg-card-hover);
+  border-color: var(--ms-border-hover);
+  color: var(--ms-link-hover);
+}
+
+.reply-action:focus-visible {
+  outline: 2px solid var(--ms-primary);
+  outline-offset: 2px;
+}
+
+/* Projects page: the row opened from a chat's "View in Projects" button */
+.projects-table-row.projects-table-row--focused {
+  background: var(--ms-primary-subtle);
+  box-shadow: inset 3px 0 0 var(--ms-primary);
+  transition: background 0.6s ease;
+}

@@ -131,9 +131,13 @@ GENERATORS: Tuple[Generator, ...] = (
               "gradle init --type java-application --dsl kotlin --test-framework junit-jupiter --project-name <name> --package <pkg>",
               auto_flags=("--use-defaults", "--no-daemon"), expected=("settings.gradle*",), verified=True),
     # ------------------------------------------------------------------ Mobile / Dart
+    # Platforms (decided D4): Android + iOS by default; add web only when the TRD mentions a browser/web version of the
+    # app, desktop (windows, macos, linux) only when the TRD asks for a desktop app
     Generator("flutter", "Dart / Flutter (mobile, web, desktop)", "Flutter app", "flutter", ("create",),
-              "flutter create --org com.example --project-name <name_with_underscores> <folder or .>",
-              auto_flags=("--no-pub",), expected=("pubspec.yaml", "lib/main.dart"), verified=True),
+              "flutter create --org com.example --project-name <name_with_underscores> --platforms=android,ios <folder or .>",
+              auto_flags=("--no-pub", "--platforms=android,ios"), expected=("pubspec.yaml", "lib/main.dart"),
+              notes="--platforms=android,ios by default; add web only if the TRD mentions a web/browser version, "
+                    "desktop platforms only if the TRD asks for a desktop app", verified=True),
     Generator("dart", "Dart / Flutter (mobile, web, desktop)", "Dart (console, package, server)", "dart", ("create",),
               "dart create -t console <name>", auto_flags=("--no-pub",), expected=("pubspec.yaml",), verified=True),
     # ------------------------------------------------------------------ PHP / Ruby / Elixir / Go / Rust / Swift

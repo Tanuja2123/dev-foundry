@@ -149,4 +149,9 @@ _access = logging.getLogger("uvicorn.access")
 if not any(isinstance(f, QuietPollingFilter) for f in _access.filters):
     _access.addFilter(QuietPollingFilter())
 
+# Presidio logs "Entity CARDINAL is not mapped…" / "…doesn't have the corresponding recognizer" on EVERY output
+# check (ISSUES OPS-14): harmless, and it buried the real warnings
+for _noisy in ("presidio-analyzer", "presidio_analyzer", "presidio-anonymizer", "presidio_anonymizer"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
+
 logger = logging.getLogger("DevFoundry")

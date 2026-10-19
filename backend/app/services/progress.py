@@ -47,6 +47,18 @@ def detail(text: str, conversation_id: Optional[str] = None) -> None:
         entry.update(detail=text, updated=time.time())
 
 
+def note(name: str, value: object) -> None:
+    """Remembers a fact about the running turn for the end of it (e.g. which document was shown, for UX-9 buttons)."""
+    entry = _progress.get(_current_conversation.get() or "")
+    if entry is not None:
+        entry.setdefault("notes", {})[name] = value
+
+
+def noted(name: str, conversation_id: Optional[str] = None) -> object:
+    entry = _progress.get(conversation_id or _current_conversation.get() or "") or {}
+    return (entry.get("notes") or {}).get(name)
+
+
 def finish(conversation_id: Optional[str]) -> None:
     if conversation_id:
         _progress.pop(conversation_id, None)
@@ -76,6 +88,44 @@ def begin_side_effect(action: str) -> None:
 def side_effect(action: str) -> Iterator[None]:
     begin_side_effect(action)
     yield
+
+
+def tool_started() -> None:
+    """A tool (e.g. the generator commands) started inside the current turn: the stream watchdog pauses meanwhile."""
+    entry = _progress.get(_current_conversation.get() or "")
+    if entry is not None:
+        with _lock:
+            entry["tools_running"] = int(entry.get("tools_running") or 0) + 1
+
+
+def tool_finished() -> None:
+    entry = _progress.get(_current_conversation.get() or "")
+    if entry is not None:
+        with _lock:
+            entry["tools_running"] = max(0, int(entry.get("tools_running") or 0) - 1)
+
+
+def tools_running(conversation_id: Optional[str] = None) -> int:
+    """How many tools of the conversation (default: the current one) are running right now."""
+    entry = _progress.get(conversation_id or _current_conversation.get() or "")
+    return int((entry or {}).get("tools_running") or 0)
+
+
+async def wait_for_tools(conversation_id: Optional[str] = None, timeout: float = 900.0) -> bool:
+    """
+    Waits until no tool of the conversation is running (e.g. a generator thread that outlived an abandoned model call),
+    so the reply is written from the final stored state. True when nothing is running any more.
+    """
+    deadline = time.time() + timeout
+    while tools_running(conversation_id) and time.time() < deadline:
+        await asyncio.sleep(1.0)
+    return not tools_running(conversation_id)
+
+
+def cancel_requested(conversation_id: Optional[str] = None) -> bool:
+    """True once Stop was clicked for the running turn (work still in a thread must not save its result)."""
+    entry = _progress.get(conversation_id or _current_conversation.get() or "")
+    return bool((entry or {}).get("cancel_requested"))
 
 
 def cancel(conversation_id: str, user_id: str) -> Dict[str, object]:

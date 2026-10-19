@@ -1,7 +1,8 @@
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Optional
 from pydantic import BaseModel, Field
-from agent_framework import Agent, FunctionTool, tool
+from agent_framework import Agent, FunctionInvocationContext, FunctionTool, function_middleware, tool
 from agent_framework.openai import OpenAIChatCompletionClient
 from app.services.mcp.ado_mcp_server import (
     create_ado_project,
@@ -12,9 +13,10 @@ from app.services.mcp.ado_mcp_server import (
 )
 from app.services.mcp.ado_git_push import AdoPushError, DEFAULT_COMMIT_MESSAGE, MAX_FILES, MAX_FILE_BYTES
 from app.services import progress
+from app.services.project_readme import README_PATH, build_readme
 from app.services import project_store as store
 from app.services.repo_structure import apply_structure_update, layer_changes, normalize_structure
-from app.services.scaffold_service import MAX_COMMANDS, run_scaffold_commands
+from app.services.scaffold_service import MAX_COMMANDS, run_scaffold_commands, validate_scaffold_plan
 from app.core.logger import logger
 
 # The only operations in which each tool may run. The agent for an operation only receives these tools, so a model
@@ -67,11 +69,59 @@ def scaffold_commit_message(commands: List[Dict[str, str]]) -> str:
     return SCAFFOLD_COMMIT_MESSAGE + ("\n\nGenerated with:\n" + "\n".join(lines) if lines else "")
 
 
+_DOC_FILE = re.compile(r"(^|/)(docs?/|README|CHANGELOG|CONTRIBUTING|LICENSE)|\.(md|mdx|rst|txt|adoc)$", re.IGNORECASE)
+_CONFIG_FILE = re.compile(r"(^|/)\.[^/]+$|\.(json|ya?ml|toml|ini|cfg|conf|properties|lock|xml|gradle|kts|plist)$|"
+                          r"(^|/)(Dockerfile|Makefile)$", re.IGNORECASE)
+
+
+def _areas(paths: List[str], limit: int = 3) -> str:
+    """'frontend/linux, frontend/macos and 2 more' – the folders (two levels deep) the changed paths are in."""
+    areas: List[str] = []
+    for path in paths:
+        parts = path.strip("/").split("/")
+        area = "/".join(parts[:2]) if len(parts) > 2 else (parts[0] if len(parts) > 1 else "/".join(parts))
+        if area not in areas:
+            areas.append(area)
+    shown = ", ".join(areas[:limit])
+    return shown + (f" and {len(areas) - limit} more" if len(areas) > limit else "")
+
+
+def changes_commit_message(base_files: List[Dict[str, Any]], files: List[Dict[str, Any]],
+                           versions: Optional[str] = None) -> str:
+    """
+    A commit message that describes the commit (FEATURES SCAF-R11), built from the actual change set: a conventional
+    type from what changed (only removals -> chore, docs -> docs, code -> feat, edits -> refactor), a subject with the
+    areas and counts, and a body listing the counts and the structure version.
+    """
+    changes = layer_changes(base_files, files)
+    added, edited, removed = changes.get("add") or [], changes.get("edit") or [], changes.get("delete") or []
+    if not (added or edited or removed):
+        return CHANGES_COMMIT_MESSAGE
+    if (added or edited) and all(_DOC_FILE.search(p) for p in added + edited) and not removed:
+        kind, verb, paths = "docs", ("add" if added and not edited else "update"), added + edited
+    elif added and all(_DOC_FILE.search(p) or _CONFIG_FILE.search(p) for p in added) and not removed:
+        kind, verb, paths = "chore", "add", added
+    elif added:
+        kind, verb, paths = "feat", "add", added
+    elif removed and not edited:
+        kind, verb, paths = "chore", "remove", removed
+    else:
+        kind, verb, paths = "refactor", "update", edited + removed
+    count = len(paths)
+    subject = (f"{kind}: {verb} {paths[0].lstrip('/')}" if count == 1
+               else f"{kind}: {verb} {count} files in {_areas(paths)}")
+    body = [f"Requested in DevFoundry: {len(added)} added, {len(edited)} changed, {len(removed)} removed."]
+    if versions:
+        body.append(f"Structure {versions}.")
+    return subject[:120] + "\n\n" + " ".join(body)
+
+
 def _error(message: str, error_type: str = "STATE_ERROR", details: str = "") -> Dict[str, Any]:
     return {"status": "error", "error_type": error_type, "message": message, "details": details}
 
 
-def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[str] = None) -> List[FunctionTool]:
+def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[str] = None,
+                           deferred: Optional[Dict[str, Any]] = None) -> List[FunctionTool]:
     """
     Builds the Repo Setup Agent tools bound to one conversation. ADO results and the reviewed repository
     structure are persisted in the Project/Repository tables, so the structure shown to the user is exactly
@@ -193,6 +243,9 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         Stores a new structure version (tagged with the TRD version it reflects) and reopens the review.
         `scaffold` = scaffold_commands / scaffold_structure (only stored once migration 005 exists).
         """
+        if progress.cancel_requested():
+            # Stop was clicked while the generators ran in this worker thread: nothing is saved after the fact
+            raise store.StoreError("The request was stopped, so the structure was not saved.")
         project = load_state()["project"] or {}
         if not store.has_scaffold_columns(repository):
             scaffold = {}
@@ -300,6 +353,31 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
     ) -> Dict[str, Any]:
         """TOOL 3b — SCAFFOLD REPOSITORY STRUCTURE (runs the commands, stores their exact output)."""
         try:
+            _created_repository()
+        except store.StoreError as e:
+            return _error(str(e))
+        if deferred is None:
+            return run_scaffold_plan(commands, initializers)
+        # AGT-29: the commands take minutes; they run after the model's turn, not inside it (the model would wait,
+        # the stall watchdog fired and the structure was saved after the reply). Validate now, run later.
+        if deferred.get("run"):
+            return {"status": "success", "planned": True,
+                    "message": "The generator commands are already planned for this turn; finish with your JSON."}
+        try:
+            validate_scaffold_plan(commands or [], initializers or [])
+        except AdoPushError as e:
+            return _error(e.message, e.error_type, e.details)
+        deferred["run"] = lambda: run_scaffold_plan(commands, initializers)
+        return {"status": "success", "planned": True,
+                "commands": [getattr(c, "command", None) or str(c) for c in commands or []],
+                "message": ("The commands are valid. They run right after this step (a few minutes) and the system "
+                            "then shows the generated structure to the user. Do not call scaffold_repository_structure "
+                            "or update_repository_structure again in this turn: finish with your JSON (status "
+                            "SUCCESS).")}
+
+    def run_scaffold_plan(commands: Optional[List[Any]], initializers: Optional[List[Any]]) -> Dict[str, Any]:
+        """Runs the generator commands, stores their exact output, and re-adds the files the user had added."""
+        try:
             repository = _created_repository()
         except store.StoreError as e:
             return _error(str(e))
@@ -311,8 +389,26 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         except AdoPushError as e:
             return _error(e.message, e.error_type, e.details)
         command_list = [c.to_dict() for c in result.commands]
+        files = result.files
+        # A regeneration keeps the files the user ADDED (e.g. docs/architecture.md) when their path is free; edits to
+        # generated files can't be carried over (the generated files changed) and are reported instead
+        kept: List[str] = []
+        if previous_changes and previous_changes.get("add"):
+            current = {f["path"]: f for f in repository.get("structure") or []}
+            taken = {f["path"] for f in files}
+            extra = [current[p] for p in previous_changes["add"] if p in current and p not in taken]
+            if extra:
+                files = files + extra
+                kept = [f["path"] for f in extra]
+        # A root README that says how to set the project up and run it (FEATURES SCAF-R12): written by code from the
+        # generated files; it is a requested change (commit 2), so the generator commit stays pure output
+        project = load_state()["project"] or {}
+        readme = build_readme(project.get("project_name") or repository.get("repo_name") or "Project",
+                              project.get("project_description"), files)
+        if readme:
+            files = [f for f in files if f["path"] != README_PATH] + [{"path": README_PATH, "content": readme}]
         try:
-            row = _save(repository, result.files, scaffold_commands=command_list, scaffold_structure=result.files)
+            row = _save(repository, files, scaffold_commands=command_list, scaffold_structure=result.files)
         except store.StoreError as e:
             return _error(str(e))
         response = _structure_result(row)
@@ -321,10 +417,12 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
             response["skipped"] = result.skipped
         if result.warnings:
             response["warnings"] = result.warnings
-        if previous_changes and any(previous_changes.values()):
-            response["previous_requested_changes"] = previous_changes
-            response["note"] = ("The structure was regenerated, so earlier requested changes are no longer applied. "
-                                "Re-add those that still fit the new stack with update_repository_structure.")
+        if kept:
+            response["kept_requested_files"] = kept
+        dropped = [p for key in ("edit", "delete") for p in (previous_changes or {}).get(key) or []]
+        if dropped:
+            response["note"] = ("The structure was regenerated, so earlier changes to generated files are no longer "
+                                "applied: " + ", ".join(dropped[:10]) + ".")
         if not store.has_scaffold_columns(repository):
             response["warning"] = ("Migration 005 (scaffold columns) is not applied: the generator output and the "
                                    "requested changes will be pushed as one commit.")
@@ -343,6 +441,9 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         remove_paths: Annotated[Optional[List[str]], Field(description="File or folder paths to remove.")] = None,
     ) -> Dict[str, Any]:
         """TOOL 4 — UPDATE REPOSITORY STRUCTURE (applies a change set to the stored structure)."""
+        if deferred is not None and deferred.get("run"):
+            return _error("The structure is generated right after this step; further changes can be requested in the "
+                          "next message.", "PLANNED")
         try:
             repository = _created_repository()
             if not repository.get("structure"):
@@ -382,8 +483,16 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         project_ref = _project_ref(project, project.get("project_name"))
         repo_name = repository["repo_name"]
         previously_pushed = repository.get("pushed_structure")
-        if previously_pushed is None and repository.get("status") == store.REPO_PUSHED:
-            return _error("This structure was already pushed.", "ALREADY_PUSHED")
+        unchanged = previously_pushed is not None and repo_structure_key(previously_pushed) == repo_structure_key(structure)
+        if unchanged or (previously_pushed is None and repository.get("status") == store.REPO_PUSHED):
+            # Nothing new since the last push: a success that says so, never an error (seen live: a repeated call's
+            # "NO_CHANGES" error made the reply report a failed push although both commits were in Azure DevOps)
+            logger.info(f"[Repo_Setup_Agent] push_repository_structure: '{repo_name}' is already up to date "
+                        f"(commit {repository.get('commit_id')}); nothing new to push")
+            return {"status": "success", "already_pushed": True, "repository_name": repo_name,
+                    "commit_id": repository.get("commit_id"), "branch": repository.get("branch"),
+                    "structure_version": repository.get("structure_version"),
+                    "message": "Already pushed: the repository is up to date and there is nothing new to push."}
 
         def record(result: Dict[str, Any], pushed: List[Dict[str, str]]) -> Optional[str]:
             fields = {"status": store.REPO_PUSHED, "commit_id": result.get("commit_id"),
@@ -426,7 +535,8 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
             if has_changes:
                 second = push_repository_changes(project_id_or_name=project_ref, repository_name=repo_name,
                                                  base_files=scaffold, files=structure,
-                                                 commit_message=commit_message or CHANGES_COMMIT_MESSAGE,
+                                                 commit_message=commit_message or changes_commit_message(
+                                                     scaffold, structure, f"v{repository.get('structure_version')}"),
                                                  branch=first.get("branch"), allow_empty=True)
                 if second.get("status") != "success":
                     logger.error(f"[Repo_Setup_Agent] Requested-changes push failed: {second.get('message')}")
@@ -447,7 +557,10 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         if previously_pushed is not None:
             result = push_repository_changes(project_id_or_name=project_ref, repository_name=repo_name,
                                              base_files=previously_pushed, files=structure,
-                                             commit_message=commit_message, branch=repository.get("branch"),
+                                             commit_message=commit_message or changes_commit_message(
+                                                 previously_pushed, structure,
+                                                 f"v{repository.get('pushed_structure_version')} -> v{repository.get('structure_version')}"),
+                                             branch=repository.get("branch"),
                                              allow_empty=True)
         else:
             result = push_repository_files(project_id_or_name=project_ref, repository_name=repo_name,
@@ -471,7 +584,7 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
 
 
 def get_repo_setup_agent(client: OpenAIChatCompletionClient, conversation_id: Optional[str] = None,
-                         operation: Optional[str] = None) -> Agent:
+                         operation: Optional[str] = None, deferred: Optional[Dict[str, Any]] = None) -> Agent:
     """
     Creates and returns the Repo Setup Agent using Microsoft Agent Framework. With `operation`, the agent only gets
     the tools that operation allows (see TOOL_OPERATIONS); proposal operations get no tools at all.
@@ -617,9 +730,9 @@ G. GENERATE_REPOSITORY_STRUCTURE:
   that the TRD should be updated to match).
 - If the user just chose one of the STRUCTURE_OPTIONS offered earlier, use exactly that option.
 - If the requested stack cannot be generated on this server, return STRUCTURE_OPTIONS instead of scaffolding.
-- Call `scaffold_repository_structure` (it replaces the saved structure). If the user explicitly asked for extra files or folders
-  (now, or earlier - see previous_requested_changes in the tool result) that still fit the new stack, add them afterwards with
-  ONE `update_repository_structure` call.
+- Call `scaffold_repository_structure` ONCE (it replaces the saved structure). It validates the commands and returns
+  "planned": the system runs them right after your turn, keeps the files the user added earlier, and shows the result.
+  Do not call any other structure tool in the same turn; extra files the user asks for now are added in the next message.
 - Return status "COMPLETE", workflow_stage "STRUCTURE_REVIEW", the structure (version, files_count, commands, summary), and
   next_action state "STRUCTURE_REVIEW" with allowed_operations: ["UPDATE_REPOSITORY_STRUCTURE", "PUSH_REPOSITORY_STRUCTURE"].
 
@@ -843,5 +956,49 @@ then ask again"}.
         name="Repo_Setup_Agent",
         instructions=repo_setup_system_prompt,
         client=client,
-        tools=build_repo_setup_tools(conversation_id, operation)
+        tools=build_repo_setup_tools(conversation_id, operation, deferred),
+        middleware=[tool_run_middleware()],
     )
+
+
+def repo_structure_key(files: Optional[List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """path -> (content, encoding): two structures with the same key push the same files."""
+    return {f.get("path"): (f.get("content"), f.get("encoding")) for f in files or [] if isinstance(f, dict)}
+
+
+# Tools whose action must happen at most once per turn (seen live: the model called push_repository_structure a second
+# time two minutes after a successful push; the repeat returned an error and the reply could claim the push failed)
+ONCE_PER_TURN_TOOLS = frozenset({"create_ado_project", "create_ado_repository", "push_repository_structure"})
+
+
+def _succeeded(result: Any) -> bool:
+    text = str(result)
+    return "'status': 'success'" in text or '"status": "success"' in text
+
+
+def tool_run_middleware():
+    """
+    Agent Framework function middleware, one per agent (= per turn):
+    - marks a tool as running (progress.tool_started / tool_finished), so the stream watchdog doesn't take the time a
+      generator or a push needs for a silent model;
+    - a successful once-per-turn action called again in the same turn returns the first result instead of running again.
+    """
+    done: Dict[str, Any] = {}
+
+    @function_middleware
+    async def track_tool_runs(context: FunctionInvocationContext, call_next) -> None:
+        name = getattr(context.function, "name", "")
+        if name in done:
+            logger.warning(f"[Repo_Setup_Agent] {name} was already done in this turn; returning that result instead "
+                           "of running it again")
+            context.result = done[name]
+            return
+        progress.tool_started()
+        try:
+            await call_next()
+        finally:
+            progress.tool_finished()
+        if name in ONCE_PER_TURN_TOOLS and _succeeded(context.result):
+            done[name] = context.result
+
+    return track_tool_runs

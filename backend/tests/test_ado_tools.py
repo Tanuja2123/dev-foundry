@@ -254,6 +254,18 @@ def test_create_ado_repository_returns_existing_repo(scripted):
                       "url": "https://dev.azure.com/fake-org/Proj/_git/my-repo"}
 
 
+def test_repository_reuse_ignores_case_and_prefers_the_projects_own_empty_repo(scripted):
+    # AGT-25: Azure DevOps repository names ignore case; the project's own default repo (named like the project) is
+    # renamed, not some other empty repository the user created
+    _ScriptedClient.reset([], repos=[{"id": "existing-id", "name": "My-Repo", "defaultBranch": "refs/heads/main"}])
+    assert server.create_ado_repository("Proj", "my-repo")["id"] == "existing-id"
+    _ScriptedClient.reset([], repos=[{"id": "other-empty", "name": "scratch", "defaultBranch": None},
+                                     {"id": "default-id", "name": "Proj", "defaultBranch": None}])
+    assert server.create_ado_repository("Proj", "my-repo")["id"] == "default-id"
+    renames = [r for r in _ScriptedClient.requests if r.method == "PATCH"]
+    assert len(renames) == 1 and renames[0].url.path.endswith("/default-id")
+
+
 def test_existing_tools_report_missing_config(no_ado_config):
     assert server.create_ado_project("P", "D")["status"] == "error"
     assert server.create_ado_repository("P", "r")["status"] == "error"

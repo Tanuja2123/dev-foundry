@@ -295,7 +295,7 @@ def test_review_is_stored_shown_and_never_leaks_secrets(db, fake_ado, monkeypatc
     assert "Checked **2 of 4 changed files** (skipped: 1 lock file, 1 binary or minified)" in reply
     assert "### Critical (1)" in reply and "AWS access key" in reply
     assert "Environment file `.env` committed" in reply and "SQL query built from request input" in reply
-    assert "Nothing has been posted yet. Say **post the findings to PR #12**" in reply
+    assert "Nothing is posted until you say so: say **post the findings to PR #12**" in reply
     assert AWS_KEY not in reply and DB_PASSWORD not in reply
     # the PR's code reached the AI only as data, with the injection attempt inside it
     sent = agent.calls[0][0][0].contents[0]
@@ -470,3 +470,42 @@ def test_the_feature_is_wired_into_the_pipeline():
     assert "pr_review_service.explicit_operation(user_query, allowed_operations(stage, workflow_state))" in source
     assert "4. Security_Review_Agent" in source and "7c. Pull request" in source
     assert cs.OPERATION_STEPS["REVIEW_PULL_REQUEST"] == "Reviewing the pull request"
+
+
+def test_yes_to_a_model_worded_posting_offer_posts():
+    # seen live (AGT-35): the Orchestrator asked in its own words and "yes" was asked again by the guard
+    asked = [{"role": "assistant", "text": "Got it – the review is approved.\n\n---\n\nWould you like me to post the "
+                                           "high- and medium-severity findings as comments on **PR #5** now?"}]
+    assert prs.is_post_request("yes", asked)
+    assert not prs.is_post_request("yes", [{"role": "assistant", "text": "Shall I create the TRD now?"}])
+
+
+def test_chips_answer_the_question_of_the_last_reply():
+    from app.services import tech_fit
+    fit = tech_fit.confirmation_reply(tech_fit.TechFitAssessment(
+        changes_technology=True, area="Backend", current_choice="Node.js / Express", requested_choice="COBOL",
+        current_fit=9, requested_fit=1, pros=[], cons=["No web framework"], recommendation="Keep Node.js."))
+    assert wr.question_chips(fit) == [{"label": "Yes, switch to COBOL anyway", "prompt": "Yes, switch anyway."},
+                                      {"label": "No, keep Node.js / Express as it is", "prompt": "No, keep Node.js / Express."}]
+    assert tech_fit.is_plain_confirmation("Yes, switch anyway.", [{"role": "assistant", "text": fit}])   # chip works
+    posting = wr.question_chips(prs.POST_QUESTION.format(pr_id=5))
+    assert posting[0] == {"label": "Post the security review findings to PR #5",
+                          "prompt": "Post the security review findings as comments on pull request #5."}
+    assert prs.is_post_request(posting[0]["prompt"], [])
+    trd = wr.question_chips(wr._DOCUMENT_TRANSITIONS["GENERATE_TRD"])
+    assert [c["label"] for c in trd] == ["Yes, create the TRD now", "Not yet, I'll review the PRD"]
+    assert wr.question_chips(wr.different_product_reply({}))[0]["label"] == "Yes, continue with this project"
+    assert wr.question_chips("Here is the suggested PRD.\n\n---\n\nTell me what to change.") is None   # no question
+
+
+def test_review_reply_has_one_closing_line_and_exact_code():
+    from app.services.conversation_service import enforce_closing_line
+    review = {"pr_id": 3, "title": "Add routes", "url": "https://dev.azure.com/o/p/_git/r/pullrequest/3",
+              "source": "f", "target": "main", "author": "A", "status": "active", "files_scanned": 1,
+              "files_changed": 1, "posted": {}, "counts": {"high": 1},
+              "findings": [{"fingerprint": "abc", "severity": "high", "title": "SQL injection", "file": "/a.js",
+                            "line": 8, "snippet": "db.query(`SELECT * FROM t WHERE n = '${q}'`)",
+                            "explanation": "x", "recommendation": "y", "source": "ai", "rule": "SEC-A5-AI-REVIEW"}]}
+    reply = prs.render_review(review)
+    assert enforce_closing_line(reply).count("\n---\n") == 1                 # AGT-31: no second divider
+    assert "`` db.query(`SELECT * FROM t WHERE n = '${q}'`) ``" in reply   # the code exactly as written

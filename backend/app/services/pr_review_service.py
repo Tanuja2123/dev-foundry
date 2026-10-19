@@ -41,6 +41,7 @@ MIN_AI_CONFIDENCE = 0.6
 _PR_NUMBER = re.compile(r"(?:\bPR|\bpull\s+request|\bpullrequest)\s*(?:#|no\.?|number)?\s*(\d{1,7})\b|#(\d{1,7})\b",
                         re.IGNORECASE)
 _POST_REQUEST = re.compile(r"\b(post\w*|comment\w*|publish\w*)\b", re.IGNORECASE)
+_OFFER_TO_POST = re.compile(r"\b(post|add|publish)\b[^?]{0,140}\b(findings?|comments?)\b[^?]{0,80}\?", re.IGNORECASE)
 _SECRET_WORDS = re.compile(r"secret|password|credential|token|api[ -]?key|private key", re.IGNORECASE)
 
 
@@ -103,7 +104,10 @@ def is_post_request(user_query: str, history: List[Dict[str, Any]]) -> bool:
     if _POST_REQUEST.search(user_query or ""):
         return True
     last = next((m.get("text") or "" for m in reversed(history or []) if m.get("role") == "assistant"), "")
-    return POST_MARKER in last and looks_affirmative(user_query)
+    # The offer to post may be worded by the model ("Would you like me to post the findings as comments on PR #5?"),
+    # not only by our code (seen: "yes" was asked again, ISSUES AGT-35)
+    offered = POST_MARKER in last or bool(_OFFER_TO_POST.search(last))
+    return offered and looks_affirmative(user_query)
 
 
 async def run_pr_operation(client: Any, operation: str, user_query: str, decided_pr: Optional[int],
@@ -334,7 +338,9 @@ def defang(text: str) -> str:
 
 
 def _code(text: str) -> str:
-    return "`" + defang(text).replace("`", "'") + "`"
+    """Inline code exactly as written: double backticks when the code itself has one (e.g. a JS template literal)."""
+    code = defang(text).replace("``", "` `")
+    return f"`` {code} ``" if "`" in code else f"`{code}`"
 
 
 def _location(finding: Dict[str, Any]) -> str:
@@ -386,13 +392,14 @@ def render_review(review: Dict[str, Any]) -> str:
     if len(waiting) < len(findings):
         parts.append(f"{len(findings) - len(waiting)} of these were already posted to the pull request earlier.")
     parts.append("---")
+    # One closing sentence (two sentences after the divider were split again into a second divider, ISSUES AGT-31)
     if waiting:
-        new = "Nothing has been posted yet" if len(waiting) == len(findings) else \
-            f"The {len(waiting)} new finding{'s have' if len(waiting) != 1 else ' has'} not been posted yet"
-        parts.append(f"{new}. Say **post the findings to PR #{pr_id}** to add them as comments on the pull request "
-                     "(one on each line, plus a summary).")
+        what = "the findings" if len(waiting) == len(findings) else \
+            f"the {len(waiting)} new finding{'s' if len(waiting) != 1 else ''}"
+        parts.append(f"Nothing is posted until you say so: say **post the findings to PR #{pr_id}** to add {what} as "
+                     "comments on the pull request.")
     else:
-        parts.append(f"Every finding is already on the pull request. Ask me to review PR #{pr_id} again after new "
+        parts.append(f"Every finding is already on the pull request, so ask me to review PR #{pr_id} again after new "
                      "commits.")
     return "\n\n".join(parts)
 

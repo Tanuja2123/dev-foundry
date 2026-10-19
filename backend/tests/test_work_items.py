@@ -59,8 +59,10 @@ def test_render_shows_the_hierarchy_and_created_links():
     backlog, _ = ado_boards.normalize_backlog(DRAFT, PRD)
     text = ado_boards.render_backlog(backlog, created={"FR-001": {"id": 7, "url": "https://dev.azure.com/o/p/_workitems/edit/7"}})
     assert "**Epic:** Online clinic booking" in text
-    assert "**Feature F1: Booking**" in text
-    assert "- **FR-001** As a patient, I want to book so that I save time ([#7](https://dev.azure.com/o/p/_workitems/edit/7))" in text
+    assert "**Feature: Booking**" in text
+    # ADO-3: short board titles built by code; the "As a…" sentence moved to the description
+    assert "- [FR-001] [Booking]: Book so that I save time ([#7](https://dev.azure.com/o/p/_workitems/edit/7))" in text \
+        or "- [FR-001] [Booking]: Book ([#7](https://dev.azure.com/o/p/_workitems/edit/7))" in text
     assert "  - A reminder is sent 24 hours before" in text
 
 
@@ -134,7 +136,7 @@ def test_creates_epic_features_and_stories_with_parents(boards):
     assert [boards.items[result["items"][k]["id"]]["type"] for k in ("EPIC", "F1", "FR-001")] == \
         ["Epic", "Feature", "Product Backlog Item"]
     story = boards.items[result["items"]["FR-001"]["id"]]
-    assert _field(story["patch"], "System.Tags") == "DevFoundry; FR-001"
+    assert _field(story["patch"], "System.Tags") == "DevFoundry; FR-001; Booking"      # requirement id + domain
     assert "<li>Given a free slot, when I book, then it is mine</li>" in _field(story["patch"], ado_boards.ACCEPTANCE_FIELD)
     parent_id = result["items"]["F1"]["id"]
     assert story["relations"][0]["rel"] == ado_boards.PARENT_LINK
@@ -283,9 +285,10 @@ def test_creating_again_says_nothing_was_created():
     result = {"status": "success", "items": {"EPIC": {"id": 1}}, "created": [], "updated": [],
               "unchanged": ["EPIC", "F1"], "not_in_prd": [], "types": {}, "backlog_url": "https://b"}
     reply = backlog_service.render_create_reply(backlog, result)
-    assert reply.startswith("These work items already exist in Azure Boards and match the current draft, so nothing "
+    assert reply.startswith("All 2 work items already exist in Azure Boards and match the current draft, so nothing "
                             "was created again (no duplicates).")
     assert "The work items are in Azure Boards" not in reply
+    assert "[FR-001]" not in reply and "**Epic:**" not in reply         # AGT-30: no list repeated
     result.update(created=["F2"])                                        # something new -> the usual summary
     assert backlog_service.render_create_reply(backlog, result).startswith(
         "The work items are in Azure Boards (1 created, 2 unchanged)")
@@ -334,3 +337,113 @@ def test_approval_alone_does_not_create_work_items():
                                   operation="CREATE_WORK_ITEMS")
     corrected = wr.apply_intent_rules(decision, store.STAGE_COMPLETE, {})
     assert corrected.action == "respond" and "create the work items in Azure Boards" in corrected.reply
+
+
+# ---------------------------------------------------------------------------- ADO-3: board titles, grouping, tasks
+
+PRD5 = {"Objective": "Let patients book clinic appointments online.",
+        "Goals": [{"goal": "80% of bookings online", "metric": "share of bookings"}],
+        "Functional Requirements": [
+            {"id": "FR-001", "requirement": "The system shall let patients register and sign in."},
+            {"id": "FR-002", "requirement": "The system shall let patients filter slots by doctor and date."},
+            {"id": "FR-003", "requirement": "The system shall let patients book a free slot."},
+            {"id": "FR-004", "requirement": "The system shall email a reminder 24 hours before."},
+            {"id": "FR-005", "requirement": "The system shall let receptionists manage doctors' schedules."}]}
+GROUPED = {"epic": {"title": "[EPIC] Patient Online Booking & Schedule Management", "goal": "Patients book online.",
+                    "scope": "Booking, reminders and schedules.", "success_criteria": ["80% of bookings online"]},
+           "features": [
+               {"key": "F1", "title": "Patient Booking Wizard", "description": "Patients find and book a slot.",
+                "out_of_scope": ["Payments"],
+                "stories": [
+                    {"requirements": ["FR-002", "FR-003", "FR-099"], "domain": "booking",
+                     "title": "As a patient, I want to filter slots by doctor and date and book one so that I save time",
+                     "user_story": "As a patient, I want to book online so that I save time.",
+                     "context": "Slots are 15 minutes.", "acceptance_criteria": ["Given a free slot, when I book, then it is mine"],
+                     "notes": "", "tasks": [
+                         {"layer": "backend", "title": "Implement GET /api/v1/doctors/slots query",
+                          "description": "Return free slots.", "done_when": "Slots are filtered by doctor and date."},
+                         {"layer": "Frontend", "title": "Build calendar slot picker component", "description": "",
+                          "done_when": ""}]},
+                    {"requirements": ["FR-003", "FR-004"], "domain": "Notifications",
+                     "title": "Dispatch automated 24h prior reminder email"}]},
+               {"key": "F2", "title": "Doctor Schedules", "stories": [
+                   {"requirements": ["FR-005"], "domain": "Schedules", "title": "[FR-005] [Schedules]: Edit weekly schedules"}]}]}
+
+
+def test_stories_group_requirements_with_short_board_titles():
+    backlog, notes = ado_boards.normalize_backlog(GROUPED, PRD5)
+    stories = [s for f in backlog["features"] for s in f["stories"]]
+    # every requirement exactly once (FR-003 kept in its first story, FR-099 dropped, FR-001 missing -> added)
+    covered = [r for s in stories for r in s["requirements"]]
+    assert sorted(covered) == ["FR-001", "FR-002", "FR-003", "FR-004", "FR-005"] and len(covered) == 5
+    assert any("FR-099" in n for n in notes) and any("FR-001" in n for n in notes)
+    titles = [s["title"] for s in stories]
+    assert titles[0] == "[FR-002, FR-003] [Booking]: Filter slots by doctor and date and book one"
+    assert titles[1] == "[FR-004] [Notifications]: Dispatch automated 24h prior reminder email"
+    assert titles[2] == "[FR-005] [Schedules]: Edit weekly schedules"                   # model's prefix not doubled
+    assert titles[3].startswith("[FR-001] [General]: ")
+    for story in stories:
+        action = story["title"].split("]: ", 1)[1]
+        assert len(action.split()) <= ado_boards.MAX_ACTION_WORDS and not action.lower().startswith("as a")
+    assert backlog["epic"]["title"] == "Patient Online Booking & Schedule Management"     # no brackets
+    assert [f["title"] for f in backlog["features"]][:2] == ["Patient Booking Wizard", "Doctor Schedules"]
+
+
+def test_descriptions_are_thorough_and_rendered_as_html():
+    backlog, _ = ado_boards.normalize_backlog(GROUPED, PRD5)
+    story = backlog["features"][0]["stories"][0]
+    for part in ("**User story:** As a patient, I want to book online", "**Context:** Slots are 15 minutes.",
+                 "**Requirements covered:**", "- FR-002: The system shall let patients filter slots"):
+        assert part in story["description"]
+    epic = backlog["epic"]["description"]
+    assert "**Goal:** Patients book online." in epic and "**Success criteria:**" in epic and "- 80% of bookings" in epic
+    assert "**Out of scope:**" in backlog["features"][0]["description"]
+    html_text = ado_boards._html(story["description"])
+    assert "<b>User story:</b>" in html_text and "<ul><li>FR-002: The system shall" in html_text
+    assert "**" not in html_text and "<script" not in ado_boards._html("<script>alert(1)</script>")
+
+
+def test_tasks_are_created_as_children_with_their_layer(boards):
+    backlog, _ = ado_boards.normalize_backlog(GROUPED, PRD5)
+    tasks = backlog["features"][0]["stories"][0]["tasks"]
+    assert [t["title"] for t in tasks] == ["[Backend]: Implement GET /api/v1/doctors/slots query",
+                                           "[Frontend]: Build calendar slot picker component"]
+    assert tasks[0]["key"] == "FR-002-T1" and "**Done when:** Slots are filtered" in tasks[0]["description"]
+    result = ado_boards.create_work_items("proj-id", backlog)
+    assert result["status"] == "success" and "FR-002-T1" in result["created"]
+    task = boards.items[result["items"]["FR-002-T1"]["id"]]
+    assert task["type"] == "Task" and _field(task["patch"], "System.Tags") == "DevFoundry; Backend"
+    assert task["relations"][0]["url"].endswith(f"/_apis/wit/workItems/{result['items']['FR-002']['id']}")
+    story = boards.items[result["items"]["FR-002"]["id"]]
+    assert _field(story["patch"], "System.Tags") == "DevFoundry; FR-002; FR-003; Booking"
+
+
+def test_backlog_prompt_asks_for_parts_not_full_titles():
+    from app.services.agents.backlog_agent import BACKLOG_PROMPT
+    for rule in ("2-3 features", "groups 1-4 closely related requirements", "ONLY when the user asks for tasks",
+                 "The system adds \"[FR-ids] [Domain]: \" in front", "\"user_story\"", "\"done_when\""):
+        assert rule in BACKLOG_PROMPT
+
+
+def test_technical_enablers_and_uncovered_goals():
+    prd = dict(PRD5, Goals=["80% of bookings made online within 3 months",
+                            "p95 page load under 2 s", "99.5% availability during clinic hours"])
+    draft = dict(GROUPED, enablers=[
+        {"title": "Add caching and a performance budget for slot search", "goal_numbers": [2, 9],
+         "description": "Keep page loads fast.", "acceptance_criteria": ["p95 under 2 s in a load test"]},
+        {"title": "Set up the CI pipeline with tests per pull request", "goal_numbers": []}])
+    backlog, _ = ado_boards.normalize_backlog(draft, prd)
+    enablers = backlog["features"][-1]
+    assert enablers["title"] == "Technical enablers"
+    assert [s["title"] for s in enablers["stories"]] == [
+        "[TE-1] [Enabler]: Add caching and a performance budget for slot search",
+        "[TE-2] [Enabler]: Set up the CI pipeline with tests per pull request"]
+    assert "**Supports:**\n- Goal 2: p95 page load under 2 s" in enablers["stories"][0]["description"]
+    # goal 3 (availability) is non-functional and no enabler supports it -> named; goal 1 is a product outcome
+    assert backlog["uncovered_goals"] == ["Goal 3: 99.5% availability during clinic hours"]
+    reply = backlog_service.render_draft_reply({"project_name": "Clinic", "prd": prd, "prd_version": 1}, backlog,
+                                               "GENERATE_WORK_ITEMS_PROPOSAL")
+    assert "Not covered by any work item yet: Goal 3: 99.5% availability" in reply
+    # every FR is still in exactly one story; enablers have no requirement ids
+    covered = [r for f in backlog["features"] for s in f["stories"] for r in s["requirements"]]
+    assert sorted(covered) == ["FR-001", "FR-002", "FR-003", "FR-004", "FR-005"]

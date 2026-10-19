@@ -196,7 +196,8 @@ def test_guards_prevent_out_of_order_and_duplicate_actions(db, ado):
     call(t, "save_repository_structure", files=STRUCTURE)
     call(t, "push_repository_structure")
     again = call(t, "push_repository_structure")                      # nothing changed since the push
-    assert again["status"] == "error" and again["error_type"] == "NO_CHANGES"
+    # AGT-34: a repeat is a success that says so (an error made replies claim the push failed)
+    assert again["status"] == "success" and again["already_pushed"] is True
     assert [c[0] for c in ado].count("push_repository_files") == 1
     assert [c[0] for c in ado].count("create_ado_project") == 1
 
@@ -367,3 +368,44 @@ def test_render_structure_for_display_marks_pushed(db):
     assert cs.render_structure_for_display(store.get_workflow_state(CONV)).startswith("**Proposed repository structure** (version 1, 3 files)")
     store.update_repository(repo["repo_id"], status=store.REPO_PUSHED)
     assert cs.render_structure_for_display(store.get_workflow_state(CONV)).startswith("**Pushed repository structure**")
+
+
+def test_a_stopped_turn_never_saves_a_structure_afterwards(db, ado):
+    # The generators run in a worker thread that Stop can't interrupt; when they finish, nothing may be saved
+    from app.services import progress
+    t = tools()
+    store.ensure_project(CONV)
+    call(t, "create_ado_project", project_name="Svc", project_description="d")
+    call(t, "create_ado_repository", project_id_or_name="Svc", repository_name="svc")
+
+    async def stopped_turn():
+        progress.start(CONV, "u")
+        progress._progress[CONV]["cancel_requested"] = True       # Stop clicked while the tool ran
+        try:
+            return json.loads((await t["save_repository_structure"].invoke(arguments={"files": STRUCTURE}))[0].text)
+        finally:
+            progress.finish(CONV)
+
+    result = asyncio.run(stopped_turn())
+    assert result["status"] == "error" and "stopped" in result["message"]
+    assert not (store.get_workflow_state(CONV)["repository"] or {}).get("structure")
+
+
+@pytest.mark.parametrize("change, expected", [
+    ({"remove": ["/frontend/.idea/a.xml", "/frontend/linux/x.cc", "/frontend/macos/y.swift", "/frontend/windows/z.cpp"]},
+     "chore: remove 4 files in frontend/.idea, frontend/linux, frontend/macos and 1 more"),
+    ({"add": ["/docs/architecture.md"]}, "docs: add docs/architecture.md"),
+    ({"add": ["/backend/app/auth.py", "/backend/app/users.py"]}, "feat: add 2 files in backend/app"),
+    ({"edit": ["/backend/main.go"]}, "refactor: update backend/main.go"),
+])
+def test_commit_messages_describe_the_commit(change, expected):
+    base = [{"path": p, "content": "old"} for p in change.get("remove", []) + change.get("edit", [])] + \
+           [{"path": "/README.md", "content": "# app"}]
+    files = [f for f in base if f["path"] not in change.get("remove", [])]
+    files = [dict(f, content="new") if f["path"] in change.get("edit", []) else f for f in files]
+    files += [{"path": p, "content": "x"} for p in change.get("add", [])]
+    message = rsa.changes_commit_message(base, files, "v2 -> v3")
+    subject, body = message.split("\n\n", 1)
+    assert subject == expected
+    assert body.startswith("Requested in DevFoundry:") and "Structure v2 -> v3." in body
+    assert rsa.changes_commit_message(base, base) == rsa.CHANGES_COMMIT_MESSAGE      # nothing changed

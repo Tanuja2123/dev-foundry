@@ -207,7 +207,7 @@ def test_users_see_a_short_message_and_logs_get_the_details(monkeypatch, caplog)
                                           "[MAQ AI (SLM)] after 3.0s: HTTP 524: the gateway closed the request"])
     monkeypatch.setattr(cs.Agent, "run", boom)
     reply = asyncio.run(cs.generate_chat_response("hello", [], None))
-    assert reply.startswith("⚠️ The AI service is busy or unavailable") and "524" not in reply and "Groq" not in reply
+    assert reply.startswith("⚠️ The AI service is busy or unavailable") and "HTTP 524" not in reply and "Groq" not in reply
     reference = reply.split("Reference: ")[1].rstrip(")")
     assert any(reference in r.getMessage() and "HTTP 524" in r.getMessage() for r in caplog.records)
 

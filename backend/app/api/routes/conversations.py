@@ -38,7 +38,8 @@ def get_single_conversation(conversation_id: str, user: CurrentUser = Depends(ge
     conv = get_conversation_by_id(conversation_id, user.user_id)
     if not conv:
         raise _not_found(conversation_id)
-    return {**conv, "suggestions": get_suggestions(conversation_id)}
+    last_reply = next((m.get("text") for m in reversed(conv.get("content") or []) if m.get("role") == "assistant"), None)
+    return {**conv, "suggestions": get_suggestions(conversation_id, last_reply)}
 
 
 @router.post("/conversation", response_model=ConversationItem)

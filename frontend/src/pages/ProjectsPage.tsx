@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   Check,
   Circle,
@@ -115,6 +116,32 @@ export function ProjectsPage({
       cancelled = true
     }
   }, [])
+
+  // "View in Projects" from a chat reply (UX-9): /projects?project=<conversation id>&doc=prd highlights that project's
+  // row and opens the document. The parameters are removed once handled, so a reload doesn't reopen it.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [focusedId, setFocusedId] = useState<string | null>(null)
+  useEffect(() => {
+    const focusId = searchParams.get('project')
+    if (loading || !focusId) return
+    const project = projects.find((p) => p.conversation_id === focusId)
+    const doc = searchParams.get('doc')?.toUpperCase()
+    setSearchParams({}, { replace: true })
+    if (!project) return
+    setSearchQuery('')
+    setFocusedId(focusId)
+    if (doc === 'PRD' || doc === 'TRD') {
+      const details = doc === 'PRD' ? project.prd : project.trd
+      handleOpenDoc(doc, project.project_name, details.content, details.updated_at)
+    }
+  }, [loading, projects, searchParams, setSearchParams])
+
+  useEffect(() => {
+    if (!focusedId) return
+    document.getElementById(`project-row-${focusedId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    const timer = window.setTimeout(() => setFocusedId(null), 4000)
+    return () => window.clearTimeout(timer)
+  }, [focusedId])
 
   // Filter projects by search query
   const filteredProjects = useMemo(() => {
@@ -279,7 +306,11 @@ export function ProjectsPage({
                   const isTrdCreated = project.trd.status === 'created'
 
                   return (
-                    <tr key={project.conversation_id} className="projects-table-row">
+                    <tr
+                      key={project.conversation_id}
+                      id={`project-row-${project.conversation_id}`}
+                      className={`projects-table-row${focusedId === project.conversation_id ? ' projects-table-row--focused' : ''}`}
+                    >
                       {/* 1. Project Name & Description */}
                       <td className="td-project-name">
                         <div className="project-name-cell">
