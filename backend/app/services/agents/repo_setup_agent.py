@@ -108,9 +108,14 @@ def changes_commit_message(base_files: List[Dict[str, Any]], files: List[Dict[st
     else:
         kind, verb, paths = "refactor", "update", edited + removed
     count = len(paths)
-    subject = (f"{kind}: {verb} {paths[0].lstrip('/')}" if count == 1
+    names = [p.lstrip("/") for p in paths]
+    listed = names[0] if count == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    # Name the files when there are few (seen: "docs: add 2 files in README.md, docs"), else the areas
+    subject = (f"{kind}: {verb} {listed}" if count <= 3 and len(listed) <= 60
                else f"{kind}: {verb} {count} files in {_areas(paths)}")
-    body = [f"Requested in DevFoundry: {len(added)} added, {len(edited)} changed, {len(removed)} removed."]
+    body = [f"On top of the generator output: {len(added)} added, {len(edited)} changed, {len(removed)} removed."]
+    if README_PATH in added + edited:
+        body.append("README.md is written by DevFoundry from the generated files.")
     if versions:
         body.append(f"Structure {versions}.")
     return subject[:120] + "\n\n" + " ".join(body)
@@ -470,6 +475,12 @@ def build_repo_setup_tools(conversation_id: Optional[str], operation: Optional[s
         commit_message: Annotated[Optional[str], Field(description="Commit message for the user's changes (or for the single commit). Omit to use the default.")] = None,
     ) -> Dict[str, Any]:
         """TOOL 5 — PUSH REPOSITORY STRUCTURE (reads the approved structure from the database and pushes it)."""
+        result = push_structure(commit_message)
+        if deferred is not None:
+            deferred["push"] = result          # the reply is built by code from the real commits (ISSUES AGT-49)
+        return result
+
+    def push_structure(commit_message: Optional[str] = None) -> Dict[str, Any]:
         try:
             state = load_state()
             project = state["project"]
@@ -786,8 +797,13 @@ I. PUSH_REPOSITORY_STRUCTURE:
 - Commands run without a terminal; the system adds the known headless / skip-install flags automatically, but still pass every
   option a generator would otherwise ask for (template, language, name ...). Never install dependencies into node_modules or a
   virtualenv: prefer `uv add --no-sync`, `npm install --package-lock-only`.
-- Dependencies the TRD names are added with the package manager (`uv add --no-sync typer`, `npm install commander
-  --package-lock-only`, `dotnet add package <name>`) or the initializer's dependencies option, never by editing files.
+- Runtime libraries the TRD names that the generator did not add (an ORM, a validation or auth library) are added with
+  the package manager (`uv add --no-sync typer`, `npm install commander --package-lock-only`, `dotnet add package
+  <name>`) or the initializer's dependencies option, never by editing files. Do NOT add test, lint, formatting or other
+  dev tools (Vitest, Jest, Playwright, Prettier, pytest...) unless the user explicitly asks for them in this
+  conversation: the generators already include what the template needs, and extra dev tools conflict with the
+  template's pinned versions (seen: Vitest needing @types/node 22 while Next.js pins 20). Use the plain package name
+  (never a pre-release, rc, beta or canary tag).
 - ONE command per entry: no '&&', pipes, redirects, quotes, environment variables or 'cd' (use cwd). No version ranges with
   '<' / '>'; use the plain package name, an extra (fastapi[standard]) or '==<version>'. No URLs or absolute paths. Always use
   the latest generator versions (`@latest`); never pin old versions.

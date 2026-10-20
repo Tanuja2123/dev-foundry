@@ -516,8 +516,12 @@ def render_structure_for_display(state: Dict) -> Optional[str]:
     if not pushed and repository.get("pushed_structure") is None and scaffold and any(changes.values()):
         counts = ", ".join(f"{len(changes[k])} {label}" for k, label in
                            (("add", "added"), ("edit", "edited"), ("delete", "removed")) if changes[k])
+        touched = changes["add"] + changes["edit"]
+        # The README is written by DevFoundry, not requested by the user (ISSUES AGT-45)
+        what = ("the README DevFoundry wrote" if touched == ["/README.md"] and not changes["delete"] else
+                "your requested changes and the README" if "/README.md" in touched else "your requested changes")
         parts.append(f"On approval this is pushed to `main` in two commits: the generator output ({len(scaffold)} files), "
-                     f"then your requested changes ({counts}).")
+                     f"then {what} ({counts}).")
     return "\n\n".join(parts)
 
 
@@ -717,6 +721,8 @@ def scaffold_reply(operation: Optional[str], outcome: Dict[str, Any], before: Di
         parts.append(check)
     if outcome.get("kept_requested_files"):
         parts.append("Your added files were kept: " + ", ".join(f"`{p}`" for p in outcome["kept_requested_files"]) + ".")
+    if outcome.get("warnings"):          # skipped / retried dependency steps, missing expected files (AGT-37)
+        parts.append("**Note:** " + " ".join(str(w) for w in outcome["warnings"]))
     if outcome.get("note"):
         parts.append(str(outcome["note"]))
     tree = render_structure_for_display(after)
@@ -736,6 +742,30 @@ def _outdated_lines(state: Dict) -> List[str]:
     return [store.OUTDATED_DESCRIPTIONS[item] for item in items if item in store.OUTDATED_DESCRIPTIONS]
 
 
+_FIELD_PATH = re.compile(r"\b([A-Z][A-Za-z&/ ]*?(?:Stack|Infrastructure|Security|Requirements|Experience|Flow|Goals|"
+                         r"Assumptions|Constraints|Questions|Users))\.([a-z][a-z_]*)\b")
+
+
+def readable_change_notes(notes: Any) -> List[str]:
+    """
+    The agent's change notes as short bullets (ISSUES AGT-41: one ~10-sentence bullet, and field paths such as
+    "Database Technology Stack.database: PostgreSQL -> MySQL"): one note per line or sentence, paths in plain words.
+    """
+    items = notes if isinstance(notes, list) else str(notes or "").splitlines()
+    result: List[str] = []
+    for item in items:
+        text = str(item or "").strip(" -•\t")
+        if not text:
+            continue
+        pieces = _split_sentences(text) if len(text) > 220 else [text]
+        for piece in pieces:
+            piece = _FIELD_PATH.sub(lambda m: f"{m.group(1)} ({m.group(2).replace('_', ' ')})", piece)
+            piece = piece.replace(" -> ", " → ").strip()
+            if piece:
+                result.append(piece)
+    return result
+
+
 def requirements_reply(operation: Optional[str], data: Dict, before: Dict, after: Dict) -> Optional[str]:
     """
     The Requirements agent's result as a reply, rendered by code (FEATURES LLM-11, REV-3, REV-4): no synthesizer call,
@@ -751,6 +781,20 @@ def requirements_reply(operation: Optional[str], data: Dict, before: Dict, after
         if data.get("known_so_far") == _GUARDRAIL_KNOWN and questions:
             return str((questions[0] or {}).get("question") or "") or None          # the guardrail's own message
         trd = data.get("workflow_stage") == "TRD"
+        if operation in ("UPDATE_PRD", "UPDATE_TRD"):
+            # A question about a requested change, not the readiness questionnaire (ISSUES AGT-40: "Before I can write
+            # the PRD… (5 of 5 essentials known)… make reasonable assumptions" for "change assumption 2")
+            document = "PRD" if operation == "UPDATE_PRD" else "TRD"
+            lines = [f"Before I change the {document}, I need to check one thing. Nothing has been changed yet.", ""]
+            if str(data.get("known_so_far") or "").strip():
+                lines += [str(data["known_so_far"]).strip(), ""]
+            for number, question in enumerate(questions, start=1):
+                text = str(question.get("question") if isinstance(question, dict) else question).strip()
+                lines.append(f"{number}. **{text}**" if len(questions) > 1 else f"**{text}**")
+                if isinstance(question, dict):
+                    lines += [f"   - {choice}" for choice in question.get("choices") or []]
+            lines += ["", "---", "", f"Answer and I'll update the {document}."]
+            return "\n".join(lines)
         lines = [f"Before I can write the {'TRD' if trd else 'PRD'}, I need a few more details."]
         readiness = data.get("readiness") if isinstance(data.get("readiness"), dict) else None
         known_text = str(data.get("known_so_far") or "").strip()
@@ -786,9 +830,7 @@ def requirements_reply(operation: Optional[str], data: Dict, before: Dict, after
             reply = insert_before_closing(reply, "To change an assumption, say \"change assumption 2 to ...\" (by its "
                                                  "number).")
         return reply
-    notes = data.get("change_notes")
-    notes = [n.strip(" -•\t") for n in (notes if isinstance(notes, list) else str(notes or "").splitlines())
-             if str(n).strip(" -•\t")]
+    notes = readable_change_notes(data.get("change_notes"))
     name = "PRD" if document == "PRD" else "TRD"
     if new_version <= old_version:
         lines = [f"Nothing changed in the {name}" + (f": {notes[0]}" if notes else ".")]
@@ -803,6 +845,106 @@ def requirements_reply(operation: Optional[str], data: Dict, before: Dict, after
 
 
 STRUCTURE_EDIT_OPERATIONS = ("UPDATE_REPOSITORY_STRUCTURE", "GENERATE_REPOSITORY_STRUCTURE")
+
+
+_SETUP_REQUEST = re.compile(
+    r"\b(proceed|go\s+ahead|move\s+on|continue|start|begin|let'?s\s+(do|start|begin))\b[^.?!]{0,40}?"
+    r"\b(repo(sitory)?|project|azure\s+devops|ado)\s+set\s*-?up\b"
+    r"|\bset\s+up\s+the\s+(azure\s+devops\s+)?(project|repository|repo)\b", re.IGNORECASE)
+_NOT_YET = re.compile(r"^\s*(no|not\s+yet|don'?t|do\s+not|wait|hold)\b", re.IGNORECASE)
+_PLAIN_APPROVAL = re.compile(r"^\s*(approved?|looks\s+good|lgtm|great|good|ok(ay)?|fine|nice|perfect|thanks|"
+                             r"thank\s+you|yes|sure)\b[\s.!]*(thanks|thank\s+you)?[\s.!]*$", re.IGNORECASE)
+
+
+def is_setup_request(text: str) -> bool:
+    """"Let's proceed with repository setup", "The TRD looks good. Let's proceed with repository setup." - but not
+    "Not yet, I want to review the TRD first"."""
+    return bool(_SETUP_REQUEST.search(text or "")) and not _NOT_YET.match(text or "")
+
+
+def project_created_reply(before: Dict[str, Any], after: Dict[str, Any]) -> Optional[str]:
+    """
+    The reply after the Azure DevOps project was created, from the stored state (ISSUES AGT-44: the model-written reply
+    showed the raw project GUID). None when no project was created in this turn (errors keep the agent's wording).
+    """
+    old, new = (before or {}).get("project") or {}, (after or {}).get("project") or {}
+    if not new.get("ado_project_id") or old.get("ado_project_id"):
+        return None
+    name = new.get("project_name") or "the project"
+    link = f"[{name}]({new['ado_project_url']})" if new.get("ado_project_url") else name
+    repository = (after or {}).get("repository") or {}
+    suggested = repository.get("repo_name") if repository.get("status") == store.REPO_PROPOSED else None
+    parts = [f"The Azure DevOps project **{link}** was created."]
+    if suggested:
+        parts.append(f"Suggested repository name: **{suggested}**.")
+    parts += ["---", "Say **create the repository** to create it with this name, or tell me a different name."
+              if suggested else "Tell me the repository name to use, and I'll create it."]
+    return normalize_reply("\n\n".join(parts))
+
+
+def _commit_line(commit: Dict[str, Any]) -> str:
+    """'`6a9b1c78` chore: initial scaffold from generator commands: the generator output (24 files) ([view](url))'."""
+    subject = str(commit.get("commit_message") or "").split("\n", 1)[0].strip()
+    changes = commit.get("changes") or {}
+    if commit.get("kind") == "generator output":
+        what = f"the generator output ({commit.get('files_count')} files)"
+    else:
+        counts = [f"{len(changes.get(k) or [])} {verb}" for k, verb in (("add", "added"), ("edit", "changed"),
+                                                                          ("delete", "removed")) if changes.get(k)]
+        what = ", ".join(counts) or "no file changes"
+    view = f" ([view the commit]({commit['commit_url']}))" if commit.get("commit_url") else ""
+    return f"`{str(commit.get('commit_id') or '')[:8]}` {subject}: {what}{view}"
+
+
+def push_reply(result: Dict[str, Any], after: Dict[str, Any]) -> str:
+    """
+    The reply after a push, built from the push result (ISSUES AGT-49: the model-written reply named a commit message
+    that was never used and called a 2-file commit "26 files"). The tree is not repeated: the user just reviewed it.
+    """
+    repository = (after or {}).get("repository") or {}
+    name = repository.get("repo_name") or result.get("repository_name") or result.get("repository") or "the repository"
+    branch = result.get("branch") or repository.get("branch") or "main"
+    if result.get("status") != "success":
+        message = str(result.get("message") or "the push failed").rstrip(".")
+        if result.get("generator_commit"):
+            return (f"The generator output was pushed to **{branch}** ({_commit_line(result['generator_commit'])}), "
+                    f"but pushing your changes failed: {message}.\n\n---\n\nAsk me to push again; only the missing "
+                    "changes will be pushed.")
+        return f"The push failed: {message}. Nothing was pushed.\n\n---\n\nFix the issue and ask me to push again."
+    if result.get("already_pushed"):
+        return (f"**{name}** is already up to date on **{branch}** (commit `{str(result.get('commit_id') or '')[:8]}`), "
+                "so nothing was pushed again.\n\n---\n\nTell me what to change next, or ask me to plan the work items.")
+    commits = result.get("commits") or []
+    parts = [f"Pushed to **{branch}** of **{name}** in {len(commits)} commit{'s' if len(commits) != 1 else ''}:",
+             "\n".join(f"{n}. {_commit_line(c)}" for n, c in enumerate(commits, start=1))]
+    commands = [c.get("command") for c in repository.get("scaffold_commands") or [] if c.get("command")]
+    if commands and any(c.get("kind") == "generator output" for c in commits):
+        parts.append("The first commit is exactly what these commands produced:\n\n```bash\n" + "\n".join(commands)
+                     + "\n```")
+    if result.get("warning"):
+        parts.append(f"**Note:** {result['warning']}")
+    parts += ["---", "Ask me to plan the work items in Azure Boards, or tell me what to change next."]
+    return "\n\n".join(parts)
+
+
+async def verification_reply(repository: Dict[str, Any]) -> str:
+    """
+    "Verify the scaffold" (SCAF-R12): installs and builds ONLY the generators' output (scaffold_structure). Files the
+    user added or changed through the chat are never run on the server, because a build executes project code
+    (package.json scripts, mix.exs, build.gradle) and the chat can edit any file. SCAFFOLD_VERIFY=off switches it off.
+    """
+    generated = repository.get("scaffold_structure") or []
+    if os.getenv("SCAFFOLD_VERIFY", "on").strip().lower() in ("off", "false", "0", "no"):
+        return ("Scaffold verification is switched off on this DevFoundry server, so nothing was checked.\n\n---\n\n"
+                "Say **push to main** when the structure looks right.")
+    if not generated:
+        return ("I can only verify a structure that was generated with the official tools, and this one wasn't, so "
+                "nothing was checked.\n\n---\n\nAsk me to regenerate the structure, or say **push to main** when it "
+                "looks right.")
+    changes = layer_changes(generated, repository.get("structure") or [])
+    excluded = [p for key in ("add", "edit") for p in changes.get(key) or [] if p != "/README.md"]
+    results = await asyncio.to_thread(verify_structure, generated)
+    return render_verification(results, excluded=len(excluded))
 
 
 def structure_update_reply(before: Dict, after: Dict) -> str:
@@ -948,6 +1090,8 @@ def normalize_reply(text: str) -> str:
     if "\\n" in text and text.count("\\n") > text.count("\n"):
         text = text.replace("\\r\\n", "\n").replace("\\n", "\n")
     text = _strip_meta_commentary(text)
+    # No celebratory emoji at the start of a line (seen: "✅ The TRD is finalized"); ⚠️ in error messages stays
+    text = re.sub(r"(?m)^(\s*)(?:✅|✔️|✔|🎉|👍|🚀|✨)\s*", r"\1", text)
     text = re.sub(r"\s*\(\s*mandated(?:\s+by\s+user)?\s*\)", "", text, flags=re.IGNORECASE)
     text = _encode_markdown_links(text)
     return text
@@ -1066,6 +1210,9 @@ DEFAULT_HISTORY_TOKEN_BUDGET = 60_000
 
 ROUTING_HISTORY_MESSAGES = 8
 ROUTING_MESSAGE_CHARS = 900
+# The Repo Setup Agent: enough recent turns for "the same for the backend too", not the old document replies (AGT-46)
+REPO_SETUP_HISTORY_MESSAGES = 12
+REPO_SETUP_MESSAGE_CHARS = 1500
 
 
 def routing_history(messages: List[Message], keep: int = ROUTING_HISTORY_MESSAGES,
@@ -1270,6 +1417,8 @@ DECISION FIELDS:
 - action: "delegate" or "respond".
 - agent + operation: required when delegating (operation must be in allowed_operations).
 - reply: required when responding. Friendly, concise Markdown that ends with the clear next step the user can take.
+  No emoji. Never say a document is approved, final, finalized or complete unless the user said exactly that (declining
+  a change - "no, keep it as it is" - is not an approval: say nothing changed).
 - show_document: "PRD" or "TRD" only when the user asks to see that document (rule 8); otherwise null.
 - different_product: true only for a different product described in a chat that already has a PRD (rule 8).
 - title: the name of the PRODUCT the user wants to build, in 2-5 words, based on the whole conversation (e.g. "School Management System", "Clinic Appointment Booking"). Null when no specific product has been described yet: greetings, small talk and questions about you ("what can you do?", "what are you up to?", "what kind of name is DevFoundry?") never produce a title. Never the user's own words, never a question, never a placeholder.
@@ -1385,6 +1534,24 @@ DECISION FIELDS:
             logger.warning("[Routing Guard] respond -> REVIEW_PRD (explicit PRD review request)")
             decision = RoutingDecision(reasoning="explicit PRD review request", user_intent="explicit_next_step",
                                        action="delegate", agent="Requirements_Agent", operation="REVIEW_PRD")
+        # "Let's proceed with repository setup" after the TRD: the proposal straight away, not a question about it
+        # (ISSUES AGT-44: an extra turn "Would you like me to propose a project name?")
+        if (decision.action == "respond" and "GENERATE_PROJECT_PROPOSAL" in allowed_operations(stage, workflow_state)
+                and is_setup_request(user_query)):
+            logger.warning("[Routing Guard] respond -> GENERATE_PROJECT_PROPOSAL (explicit request to start setup)")
+            decision = RoutingDecision(reasoning="explicit request to start repository setup",
+                                       user_intent="explicit_next_step", action="delegate", agent="Repo_Setup_Agent",
+                                       operation="GENERATE_PROJECT_PROPOSAL")
+        # A plain approval ("approved", "looks good") right after a PR review: the posting question, written by code
+        # (seen: "✅ The security review for PR #6 is ready." - nothing is posted without an explicit request)
+        last_reply = next((m.get("text") or "" for m in reversed(history) if m.get("role") == "assistant"), "")
+        if (decision.action == "respond" and pr_review_service.POST_MARKER in last_reply
+                and _PLAIN_APPROVAL.match(user_query or "")
+                and not pr_review_service.is_post_request(user_query, history)):
+            pr_id, _review = pr_review_service.latest_review(((workflow_state or {}).get("repository") or {}))
+            if pr_id:
+                decision = RoutingDecision(reasoning="approval after a review", user_intent=decision.user_intent,
+                                           action="respond", reply=pr_review_service.POST_QUESTION.format(pr_id=pr_id))
         # Posting review comments on a pull request needs an explicit request (like a push)
         if (decision.action == "delegate" and decision.operation == "POST_PR_REVIEW_COMMENTS"
                 and not pr_review_service.is_post_request(user_query, history)):
@@ -1654,9 +1821,7 @@ Put a blank line before and after every heading, divider (---) and list; never p
             # Code only (FEATURES SCAF-R12): install + build each part in a temporary copy, report per part
             logger.info("[Routing Decision] -> Scaffold verification (code)")
             progress.step(OPERATION_STEPS["VERIFY_REPOSITORY_STRUCTURE"])
-            structure = (((workflow_state or {}).get("repository")) or {}).get("structure") or []
-            results = await asyncio.to_thread(verify_structure, structure)
-            response_text = render_verification(results)
+            response_text = await verification_reply(((workflow_state or {}).get("repository")) or {})
 
         elif route_agent == "Repo_Setup_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Repo_Setup_Agent ({operation})")
@@ -1671,8 +1836,11 @@ Put a blank line before and after every heading, divider (---) and list; never p
             if operation in SCAFFOLD_OPERATIONS:
                 workflow_context_note += "\n" + describe_toolchains()
 
-            # Repo_Setup_Agent: the whole conversation (token budget) + the latest message with its workflow context
-            recent_repo_history = message_list[:-1]
+            # Repo_Setup_Agent: the recent conversation, long replies shortened (the PRD/TRD/structure it needs are in
+            # the workflow context below, always current), + the latest message. ISSUES AGT-46: with the whole chat
+            # (the PRD shown four times) a structure edit was ~21.5k tokens: too large for every Groq model.
+            recent_repo_history = routing_history(message_list[:-1], keep=REPO_SETUP_HISTORY_MESSAGES,
+                                                  max_chars=REPO_SETUP_MESSAGE_CHARS)
             context_user_msg = Message(role="user", contents=[user_query + workflow_context_note])
             repo_messages = recent_repo_history + [context_user_msg]
 
@@ -1689,6 +1857,10 @@ Put a blank line before and after every heading, divider (---) and list; never p
             child_raw_json = child_response.messages[-1].text if child_response.messages else ""
             logger.info(f"[Repo_Setup_Agent] Completed in {child_duration}ms")
             persist_repo_setup_output(conversation_id, child_raw_json)
+            if operation == "CREATE_PROJECT" and conversation_id:
+                created = project_created_reply(workflow_state or {}, store.get_workflow_state(conversation_id))
+                if created:
+                    return title_prefix + created
             if (not deferred.get("run") and conversation_id and operation in STRUCTURE_EDIT_OPERATIONS):
                 after = store.get_workflow_state(conversation_id)
                 if ((after.get("repository") or {}).get("structure_version") or 0) > \
@@ -1703,6 +1875,8 @@ Put a blank line before and after every heading, divider (---) and list; never p
                             f"({outcome.get('status')})")
                 return title_prefix + scaffold_reply(operation, outcome, workflow_state or {},
                                                      store.get_workflow_state(conversation_id))
+            if deferred.get("push") is not None and conversation_id:
+                return title_prefix + push_reply(deferred["push"], store.get_workflow_state(conversation_id))
             follow_ups = follow_up_note(conversation_id)
 
             # The structure shown to the user is rendered from the stored files (the same files that get pushed)
@@ -1817,8 +1991,9 @@ Put a blank line before and after every heading, divider (---) and list; never p
         elif route_agent == "Backlog_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Backlog_Agent ({operation})")
             progress.step(OPERATION_STEPS.get(operation, "Working on the work items"))
+            # Small calls (planner + one writer per feature, ISSUES AGT-48): the fast order (Azure -> Groq -> MAQ AI)
             response_text = enforce_closing_line(await run_backlog_operation(
-                client, operation, user_query, message_list, workflow_state or {}))
+                small_client, operation, user_query, message_list, workflow_state or {}))
 
         elif route_agent == "Security_Review_Agent":
             logger.info(f"[Routing Decision] -> Delegating to Security_Review_Agent ({operation}, "

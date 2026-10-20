@@ -24,6 +24,13 @@ class Part:
     run_note: str = ""
     test: List[str] = field(default_factory=list)
     env: List[Tuple[str, str]] = field(default_factory=list)   # (NAME, purpose)
+    port: Optional[int] = None                    # default local port, when the part serves one
+    port_from_env: bool = False                   # it reads PORT (Express / NestJS), so it can be moved
+
+
+# Database client libraries: the README then says DATABASE_URL is needed (ISSUES AGT-47)
+_DB_LIBRARIES = ("prisma", "@prisma/client", "pg", "mysql2", "mysql", "sequelize", "typeorm", "knex", "mongoose",
+                 "mongodb", "drizzle-orm")
 
 
 def _files_by_path(files: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -70,7 +77,12 @@ def _npm_part(folder: str, files: Dict[str, Dict[str, Any]], prefix: str) -> Par
     env = _env_example(files, prefix)
     if "express" in deps and not env:
         env = [("PORT", f"port the API listens on (default {port})")]
+    database = next((lib for lib in _DB_LIBRARIES if lib in deps), None)
+    if database and "DATABASE_URL" not in [name for name, _ in env]:
+        env.append(("DATABASE_URL", f"connection string of the database ({database} is installed; create the "
+                                    "database before the first start)"))
     return Part(folder=folder, title=title, prerequisites=["Node.js (current LTS) and npm"], setup=["npm install"],
+                port=port if run else None, port_from_env=("express" in deps or "@nestjs/core" in deps),
                 run=run, run_note=f"Then open http://localhost:{port}" if port and run else "",
                 test=["npm test"] if "test" in scripts and "no test specified" not in str(scripts.get("test")) else [],
                 env=env)
@@ -195,6 +207,32 @@ def detect_parts(structure: List[Dict[str, Any]]) -> List[Part]:
     return parts
 
 
+def _a(title: str) -> str:
+    """'an API', 'a web app', 'a mobile app' (ISSUES AGT-47: "a api")."""
+    name = title.split(" (")[0]
+    name = name if name.isupper() else name[0].lower() + name[1:]
+    return ("an " if name[:1].lower() in "aeiou" else "a ") + name
+
+
+def _separate_ports(parts: List[Part]) -> None:
+    """Two parts on the same default port (Next.js and Express both use 3000) can't run side by side as the README
+    says: move a part that reads PORT to the next free port and say how (bash and PowerShell)."""
+    used: set = set()
+    for part in sorted(parts, key=lambda p: p.port_from_env):           # fixed-port parts keep theirs
+        if not part.port:
+            continue
+        if part.port in used and part.port_from_env and part.run:
+            port = next(p for p in range(4000, 5000) if p not in used)
+            command = part.run[0]
+            part.run = [f"PORT={port} {command}"]
+            part.run_note = (f"Then open http://localhost:{port} (PowerShell: `$env:PORT={port}; {command}`); it runs "
+                             f"on {port} so it doesn't clash with the other part")
+            part.env = [(n, f"port the API listens on (use {port} next to the web app)" if n == "PORT" else purpose)
+                        for n, purpose in part.env]
+            part.port = port
+        used.add(part.port)
+
+
 def _commands(lines: List[str], folder: str) -> str:
     steps = ([f"cd {folder}"] if folder else []) + lines
     return "```bash\n" + "\n".join(steps) + "\n```"
@@ -205,12 +243,13 @@ def build_readme(project_name: str, description: Optional[str], structure: List[
     parts = detect_parts(structure)
     if not parts:
         return None
+    _separate_ports(parts)
     lines = [f"# {project_name}", ""]
     if description:
         lines += [description.strip().split("\n")[0], ""]
     lines += ["## Getting started", ""]
     if len(parts) > 1:
-        lines += ["The project has " + " and ".join(f"a {p.title.split(' (')[0].lower()} in `{p.folder}/`" for p in parts)
+        lines += ["The project has " + " and ".join(f"{_a(p.title)} in `{p.folder}/`" for p in parts)
                   + ". Set up each part in its own terminal.", ""]
     for part in parts:
         heading = f"### {part.title}" + (f" — `{part.folder}/`" if part.folder else "")
@@ -224,7 +263,8 @@ def build_readme(project_name: str, description: Optional[str], structure: List[
     env = [(p, name, purpose) for p in parts for name, purpose in p.env]
     lines += ["## Environment variables", ""]
     if env:
-        lines += ["Set these in your environment (or a local `.env` file that is never committed):", "",
+        lines += ["Set these as environment variables before you start the part (frameworks that read a local "
+                  "`.env` file can use one; never commit it):", "",
                   "| Variable | Part | What it is for |", "|---|---|---|"]
         lines += [f"| `{name}` | {p.folder or 'root'} | {purpose} |" for p, name, purpose in env]
     else:

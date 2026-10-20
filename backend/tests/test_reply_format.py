@@ -266,6 +266,13 @@ def test_routing_sees_recent_turns_shortened_with_the_last_question_kept():
     assert len(routed[-1].text) <= cs.ROUTING_MESSAGE_CHARS + 10
     import inspect
     assert "routing_history(message_list[:-1])" in inspect.getsource(cs._execute_agent_pipeline)
+    # the Repo Setup Agent gets a compacted history too (AGT-46: a structure edit was ~21.5k tokens)
+    source = inspect.getsource(cs._execute_agent_pipeline)
+    assert "routing_history(message_list[:-1], keep=REPO_SETUP_HISTORY_MESSAGES" in source
+    long_tree = "gym-pass/\n" + "│   ├── file.txt\n" * 400
+    compact = cs.routing_history([Message(role="assistant", contents=[long_tree])] * 20,
+                                 keep=cs.REPO_SETUP_HISTORY_MESSAGES, max_chars=cs.REPO_SETUP_MESSAGE_CHARS)
+    assert len(compact) == 12 and all(len(m.text) <= cs.REPO_SETUP_MESSAGE_CHARS + 10 for m in compact)
 
 
 # ---------------------------------------------------------------------------- LLM-11 / REV-3 / REV-4: code-rendered
@@ -315,3 +322,124 @@ def test_an_update_shows_only_what_changed_and_what_is_now_outdated():
                                  before, before)
     assert same.startswith("Nothing changed in the TRD: Redis is already in the TRD")
     assert cs.requirements_reply("UPDATE_TRD", {"status": "CONFIRMATION_REQUIRED"}, before, after) is None
+
+
+# ---------------------------------------------------------------------------- AGT-49: the push reply is built by code
+
+def test_push_reply_reports_the_real_commits():
+    after = {"repository": {"repo_name": "gym-pass", "branch": "main", "scaffold_commands": [
+        {"command": "npx --yes create-next-app@latest frontend --ts --skip-install"},
+        {"command": "npx --yes express-generator@latest --no-view backend"}]}}
+    result = {"status": "success", "branch": "main", "files_count": 26, "commits": [
+        {"kind": "generator output", "commit_id": "6a9b1c78d650", "files_count": 24,
+         "commit_message": "chore: initial scaffold from generator commands\n\nGenerated with: ...",
+         "commit_url": "https://dev.azure.com/o/p/_git/gym-pass/commit/6a9b1c78d650"},
+        {"kind": "requested changes", "commit_id": "eaf720732274", "files_count": 26,
+         "commit_message": "docs: add README.md and docs/architecture.md\n\nRequested in DevFoundry: 2 added",
+         "changes": {"add": ["/README.md", "/docs/architecture.md"], "edit": [], "delete": []},
+         "commit_url": "https://dev.azure.com/o/p/_git/gym-pass/commit/eaf720732274"}]}
+    text = cs.push_reply(result, after)
+    assert text.startswith("Pushed to **main** of **gym-pass** in 2 commits:")
+    assert "1. `6a9b1c78` chore: initial scaffold from generator commands: the generator output (24 files)" in text
+    assert "2. `eaf72073` docs: add README.md and docs/architecture.md: 2 added" in text   # not "26 files"
+    assert "```bash\nnpx --yes create-next-app@latest frontend --ts --skip-install" in text
+    assert "├──" not in text                                                       # no tree again
+    assert text.count("---") == 1 and text.rstrip().endswith("or tell me what to change next.")
+    follow_up = {"status": "success", "branch": "main", "commits": [
+        {"kind": "follow-up commit", "commit_id": "1234abcd99", "commit_message": "chore: remove frontend/test",
+         "changes": {"add": [], "edit": ["/a"], "delete": ["/b", "/c"]}}]}
+    text = cs.push_reply(follow_up, after)
+    assert "in 1 commit:" in text and "1 changed, 2 removed" in text and "```bash" not in text
+
+
+def test_push_reply_for_already_pushed_and_failures():
+    after = {"repository": {"repo_name": "gym-pass", "branch": "main"}}
+    text = cs.push_reply({"status": "success", "already_pushed": True, "commit_id": "eaf720732274"}, after)
+    assert text.startswith("**gym-pass** is already up to date on **main** (commit `eaf72073`)")
+    text = cs.push_reply({"status": "error", "message": "Permission denied."}, after)
+    assert text.startswith("The push failed: Permission denied. Nothing was pushed.")
+    partial = {"status": "error", "message": "timeout", "generator_commit": {
+        "kind": "generator output", "commit_id": "6a9b1c78", "files_count": 24, "commit_message": "chore: x"}}
+    assert "The generator output was pushed to **main**" in cs.push_reply(partial, after)
+
+
+# ---------------------------------------------------------------------------- AGT-44: Orchestrator replies
+
+def test_explicit_setup_requests_are_recognised():
+    for text in ("Let's proceed with repository setup.", "The TRD looks good. Let's proceed with repository setup.",
+                 "The TRD architecture and technology stack are approved. Let's proceed with project setup and propose "
+                 "the Azure DevOps project name and description.", "go ahead with the Azure DevOps setup",
+                 "set up the project"):
+        assert cs.is_setup_request(text), text
+    for text in ("Not yet, I want to review the TRD first.", "no, don't proceed with repository setup yet",
+                 "what is repository setup?", "The TRD looks good."):
+        assert not cs.is_setup_request(text), text
+
+
+def test_plain_approvals_after_a_review():
+    for text in ("approved", "Approved.", "looks good", "LGTM", "ok thanks", "yes"):
+        assert cs._PLAIN_APPROVAL.match(text), text
+    for text in ("approved, post them", "review PR #6 again", "looks good but check the env file"):
+        assert not cs._PLAIN_APPROVAL.match(text), text
+
+
+def test_project_created_reply_is_built_from_the_stored_state():
+    before = {"project": {"project_name": "GymPass-1910-0854"}}
+    after = {"project": {"project_name": "GymPass-1910-0854", "ado_project_id": "6908c13b-bd59",
+                         "ado_project_url": "https://dev.azure.com/org/GymPass-1910-0854"},
+             "repository": {"repo_name": "gym-pass", "status": "PROPOSED"}}
+    text = cs.project_created_reply(before, after)
+    assert text.startswith("The Azure DevOps project **[GymPass-1910-0854](https://dev.azure.com/org/GymPass-1910-0854)** was created.")
+    assert "Suggested repository name: **gym-pass**." in text and "6908c13b" not in text      # no raw GUID
+    assert text.rstrip().endswith("or tell me a different name.") and text.count("---") == 1
+    assert cs.project_created_reply(after, after) is None                    # nothing new this turn
+
+
+def test_celebratory_emoji_are_removed_but_warnings_stay():
+    text = cs.normalize_reply("✅ The security review for PR #6 is ready.\n\n⚠️ Something is off\n🎉 Done")
+    assert text.startswith("The security review") and "⚠️ Something is off" in text and "\nDone" in text
+
+
+# ---------------------------------------------------------------------------- AGT-42: document rendering
+
+def test_empty_sections_are_said_and_the_trd_reads_stack_first():
+    from app.utils.document_markdown import prd_json_to_markdown, trd_json_to_markdown
+    prd = prd_json_to_markdown({"Objective": "Gym booking", "Non-Goals": []})
+    assert "## Non-Goals\n\nNone stated." in prd
+    trd = trd_json_to_markdown({"Security": {"Compliance": "Not specified"},
+                                "Backend Technology Stack": {"Framework": "Express"},
+                                "Integration & Infrastructure": {"External Integrations": []},
+                                "Frontend Technology Stack": {"Framework": "Next.js"}})
+    order = [line for line in trd.splitlines() if line.startswith("## ")]
+    assert order == ["## Frontend Technology Stack", "## Backend Technology Stack", "## Integration & Infrastructure",
+                     "## Security"]
+    assert "**External Integrations:** None stated." in trd
+
+
+# ---------------------------------------------------------------------------- AGT-40 / AGT-41: update replies
+
+def test_change_notes_are_short_plain_bullets():
+    long_note = ("Assumptions: replaced assumption 2 (fixed class capacity) with the payment rule. Non-Goals: added online "
+                 "payment as a non-goal. FR-001: removed 'remaining capacity' from the class list display because the "
+                 "capacity assumption was removed. FR-003: removed because it existed solely to support that assumption.")
+    notes = cs.readable_change_notes(long_note)
+    assert len(notes) == 4 and notes[0].startswith("Assumptions: replaced assumption 2")
+    trd = cs.readable_change_notes("Database Technology Stack.database: PostgreSQL -> MySQL (user requested MySQL). "
+                                   "Integration & Infrastructure.deployment: managed PostgreSQL -> managed MySQL.")
+    assert trd == ["Database Technology Stack (database): PostgreSQL → MySQL (user requested MySQL). "
+                   "Integration & Infrastructure (deployment): managed PostgreSQL → managed MySQL."]
+    assert cs.readable_change_notes(["- FR-016: added class capacity", ""]) == ["FR-016: added class capacity"]
+
+
+def test_a_question_about_a_change_is_not_the_readiness_questionnaire():
+    data = {"status": "CLARIFICATION_REQUIRED", "workflow_stage": "PRD", "readiness": {"R1": "provided"},
+            "known_so_far": "Assumption 2 is about class capacity, not payments.",
+            "questions": [{"question": "Replace assumption 2 or add a new assumption?",
+                           "choices": ["Replace assumption 2", "Add a new assumption"]}]}
+    text = cs.requirements_reply("UPDATE_PRD", data, {}, {})
+    assert text.startswith("Before I change the PRD, I need to check one thing. Nothing has been changed yet.")
+    assert "essentials known" not in text and "make reasonable assumptions" not in text
+    assert "**Replace assumption 2 or add a new assumption?**" in text and "   - Add a new assumption" in text
+    assert text.rstrip().endswith("Answer and I'll update the PRD.")
+    first = cs.requirements_reply("GENERATE_PRD", data, {}, {})               # a new PRD keeps the questionnaire
+    assert first.startswith("Before I can write the PRD")

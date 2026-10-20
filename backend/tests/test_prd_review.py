@@ -61,9 +61,12 @@ def test_review_cards_and_add_to_prd_chips():
     labels = [label for label, _ in chips]
     assert labels == ["Add the 2 must-add items to the PRD", "Add Notifications to the PRD", "Add Dark mode to the PRD",
                       "Keep the PRD as it is"]
-    assert chips[0][1] == ("Add these requirements to the PRD:\n- Only admins can delete a book; members edit only their "
-                           "own reviews.\n- Users sign in with email and password; sessions expire after 30 minutes.")
-    assert chips[1][1] == "Add this requirement to the PRD: Members get an email when a reserved book is available."
+    assert chips[0][1] == ("Update the PRD with these architect review items (change the named FRs instead of adding "
+                           "duplicates; one testable rule per FR):\n- Add: Only admins can delete a book; members edit "
+                           "only their own reviews.\n- Add: Users sign in with email and password; sessions expire after "
+                           "30 minutes.")
+    assert chips[1][1] == ("Add this requirement to the PRD (architect review): Members get an email when a reserved book "
+                           "is available.")
     # the chips answer the review (UX-10), through the normal chip mechanism
     assert [c["label"] for c in question_chips(text)] == labels
 
@@ -99,6 +102,7 @@ class FakeAgent:
 
     async def run(self, messages, options=None):
         FakeAgent.calls += 1
+        FakeAgent.last_request = messages[0].text
         answer = FakeAgent.answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
@@ -120,3 +124,27 @@ def test_review_prd_renders_the_typed_answer(monkeypatch):
 def test_review_prd_failures_and_missing_prd(monkeypatch):
     assert run_review(monkeypatch, [RuntimeError("busy"), "nope"], {"prd": {"a": 1}}) == prd_review.FAILED_MESSAGE
     assert run_review(monkeypatch, [], {"prd": None}) == prd_review.NO_PRD_MESSAGE and FakeAgent.calls == 0
+
+
+def test_an_item_that_extends_an_existing_requirement_says_so(monkeypatch):
+    # seen (GymPass): sign-in and role rules suggested again although FR-012 / FR-013 had them -> duplicate FRs
+    review = PrdReview(items=[
+        ReviewItem(priority="must", area="Roles", finding="Permissions are vague.", extends="fr-013",
+                   suggestion="Members manage only their own bookings; trainers only their own classes."),
+        ReviewItem(priority="must", area="Capacity", finding="No limit.", extends="FR-099",
+                   suggestion="Each class has a maximum capacity set by the owner.")])
+    cleaned = clean_review(review, {"FR-012", "FR-013"})
+    assert [i.extends for i in cleaned.items] == ["FR-013", ""]                  # unknown ids are dropped
+    text = render_review(cleaned, 3)
+    assert "> **Change FR-013 to:** Members manage only their own bookings" in text
+    assert "> **Add to the PRD:** Each class has a maximum capacity" in text
+    cards = review_cards(text)
+    assert [(c[2], c[4]) for c in cards] == [("Roles", "FR-013"), ("Capacity", "")]
+    chips = dict(review_chips(text))
+    assert "- Change FR-013 to: Members manage only their own bookings" in chips["Add the 2 must-add items to the PRD"]
+
+
+def test_the_review_sees_the_requirement_list(monkeypatch):
+    prd = {"Functional Requirements": [{"id": "FR-012", "requirement": "Users sign in."}]}
+    run_review(monkeypatch, [REVIEW.model_dump_json()], {"prd": prd, "prd_version": 3})
+    assert "functional_requirements: [{\"id\": \"FR-012\"" in FakeAgent.last_request

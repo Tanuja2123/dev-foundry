@@ -134,7 +134,16 @@ Update rules (UPDATE_PRD):
   - Keep existing FR IDs; new FRs continue the sequence; IDs of removed FRs are never reused.
   - Never drop or replace a requirement unless the user asks or it is an unambiguous replacement. If the request contradicts an
     existing requirement without saying which one prevails, return CLARIFICATION_REQUIRED.
-  - change_notes: one line per added, modified or removed section or FR ID, with the reason.
+  - Never remove an FR, a field or a rule as a SIDE EFFECT of another change (e.g. replacing an assumption): keep it and add an
+    Open Question about it instead. Only remove what the user asked to remove.
+  - Adding requirements (e.g. items from an architect review): first compare with the existing FRs. If an FR already covers
+    the topic (sign-in, roles and permissions, capacity...), EXTEND or reword that FR (same id) instead of adding a duplicate.
+    Each FR states ONE testable capability or rule: split a request that holds several rules ("retention + encryption +
+    deletion") into several FRs. FRs that come from an architect review have source "Architecture review". Also update the
+    sections the change touches: Target Users (a new capability of a role), User Experience and User Flow (a new step).
+  - change_notes: one line per change, in plain words with the section name and the reason, at most 25 words each (e.g.
+    "Assumptions: replaced assumption 2 (class capacity) with the payment rule, as requested"). No field paths such as
+    "Section.field".
 
 ==================================================
 5. TRD
@@ -147,6 +156,9 @@ Update rules (UPDATE_PRD):
     * Bad: "React is a mature, widely-adopted component framework with a large ecosystem of libraries and an active community, which keeps developer velocity high for a small-to-medium deployment. Its component-based architecture aligns naturally with the modular monolith design..."
     * Good: "React organizes the interface into dedicated feature modules (catalog, cart, order tracking, admin) matching the backend domain boundaries. Paired with TypeScript, it ensures type safety across financial transactions, inventory state, and responsive order-status views."
   - Technology specified by the user or PRD (stack, cloud, language, compliance) is used as given.
+  - DevFoundry creates the project, repository and boards in Azure DevOps: CI/CD is Azure Pipelines unless the user names another
+    tool. Hosting / cloud platform: only what the user or PRD states; otherwise "Not specified - choose the hosting platform
+    (open decision)". Never pick a cloud provider on your own.
   - NEVER append annotations like "(mandated by user)", "(mandated)", or "(as requested)" to technology names or any fields in the TRD. Always write the pure, clean name of the technology only (e.g. "React", "Python 3.12+", "FastAPI", "PostgreSQL").
   - No constraint for a layer: recommend a mainstream, actively maintained, officially supported option. Prefer proven over
     novel; never deprecated or end-of-life options. No version
@@ -161,7 +173,9 @@ Update rules (UPDATE_PRD):
     "Not specified - depends on where the product runs (see the PRD's open questions)".
 Update rules (UPDATE_TRD):
   - Change only the requested technology and its direct dependents (ORM/driver, migrations, auth library, test tooling, deployment).
-    Keep everything else verbatim. change_notes: each changed field as "field: old -> new" plus the reason for dependent changes.
+    Keep everything else verbatim. change_notes: one line per change in plain words, e.g. "Database: PostgreSQL → MySQL
+    (requested)" or "Deployment: managed MySQL instead of PostgreSQL (follows the database change)"; never field paths such as
+    "Database Technology Stack.database".
   - Rewrite the rationale of every section you change so it explains why the NEW choice fits this project (strictly 2 sharp, project-specific sentences under 45 words, zero generic filler; if the user confirmed a weaker
     fit, one of the two sentences names the trade-off they accepted).
   - Technology-change assessment: whenever the request replaces a technology (language, framework, database, platform, cloud,
@@ -218,7 +232,7 @@ it) or "assumed" (the user asked you to proceed). "COMPLETE" is only allowed whe
     "Target Users": ["Role - what they need from the product"],
     "Goals": ["Outcome. Metric: ...; Target: ..."],
     "Functional Requirements": [
-      {"id": "FR-001", "requirement": "The system shall ...", "source": "User request | <document name> | Prior PRD | Assumption"}
+      {"id": "FR-001", "requirement": "The system shall ...", "source": "User request | <document name> | Prior PRD | Assumption | Architecture review"}
     ],
     "User Experience": "...",
     "User Flow": ["Step 1", "Step 2"],

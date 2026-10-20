@@ -121,7 +121,7 @@ def test_expected_file_warnings_are_returned(monkeypatch):
         _write(kwargs["cwd"], "web/README.md", "# only a readme")       # no package.json / vite.config / index.html
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(ss.subprocess, "run", fake_run)
+    monkeypatch.setattr(ss, "run_process", fake_run)
     result = ss.run_scaffold_commands([{"command": "npx --yes create-vite@latest web --template react-ts"}])
     assert result.warnings and "package.json" in result.warnings[0]
 

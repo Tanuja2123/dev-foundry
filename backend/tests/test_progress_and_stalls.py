@@ -338,3 +338,46 @@ def test_the_bubble_says_when_a_backup_model_answers():
     assert lc.backup_notice(maq, ["[Azure OpenAI]: 403"]) == (
         "The main model is busy, so a backup (MAQ AI (SLM)) is answering; this can take a few minutes")
     assert lc.backup_notice(groq, ["[Azure OpenAI]: 403"]).endswith("is answering")
+
+
+def _clients(first_streams):
+    from agent_framework import Message  # noqa: F401
+
+    class StreamingClient:
+        calls = 0
+
+        def get_response(self, stream=False, **kwargs):
+            StreamingClient.calls += 1
+            return FakeStream(first_streams[min(StreamingClient.calls, len(first_streams)) - 1])
+
+    class Answering:
+        calls = 0
+
+        async def _answer(self):
+            return "groq-answer"
+
+        def get_response(self, stream=False, **kwargs):
+            Answering.calls += 1
+            return self._answer()
+    return StreamingClient, Answering
+
+
+def test_a_stall_before_the_first_token_retries_the_same_provider_once(fast_limits):
+    # seen live (ref eeabebc5): MAQ AI sent nothing for 120 s, then answered the identical retry
+    from agent_framework import Message
+    StreamingClient, Answering = _clients([[5.0], [0.01, 0.01]])
+    maq = lc.ProviderSpec("maq_ai", "MAQ AI (SLM)", StreamingClient(), "qwen")
+    groq = lc.ProviderSpec("groq", "Groq", Answering(), "gpt-oss-20b")
+    result = asyncio.run(lc.FallbackChatCompletionClient([maq, groq]).get_response(
+        [Message(role="user", contents=["add a docs folder"])]))
+    assert result == "the TRD" and StreamingClient.calls == 2 and Answering.calls == 0
+
+
+def test_two_stalls_before_the_first_token_move_on(fast_limits):
+    from agent_framework import Message
+    StreamingClient, Answering = _clients([[5.0], [5.0]])
+    maq = lc.ProviderSpec("maq_ai", "MAQ AI (SLM)", StreamingClient(), "qwen")
+    groq = lc.ProviderSpec("groq", "Groq", Answering(), "gpt-oss-20b")
+    result = asyncio.run(lc.FallbackChatCompletionClient([maq, groq]).get_response(
+        [Message(role="user", contents=["add a docs folder"])]))
+    assert result == "groq-answer" and StreamingClient.calls == 2 and Answering.calls == 1

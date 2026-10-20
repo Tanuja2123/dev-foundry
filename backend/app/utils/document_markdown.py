@@ -41,6 +41,10 @@ def prd_json_to_markdown(data: Any) -> str:
 
     def render_section(key: str, value: Any) -> None:
         lines.append(f"## {key}\n")
+        if not value:                       # an empty section is said, not left as a bare heading (ISSUES AGT-42)
+            lines.append(f"{EMPTY_TEXT}\n")
+            lines.append("")
+            return
         if isinstance(value, str):
             lines.append(f"{value}\n")
         elif isinstance(value, list):
@@ -98,12 +102,22 @@ def _clean_mandated(text: Any) -> Any:
     return text
 
 
+EMPTY_TEXT = "None stated."
+# The TRD reads stack first, then infrastructure and security (the model's order varied: Security came first)
+TRD_SECTION_ORDER = ("summary", "frontend", "backend", "database", "integration", "infrastructure", "security")
+
+
+def _trd_section_rank(key: str) -> int:
+    lowered = key.lower()
+    return next((n for n, word in enumerate(TRD_SECTION_ORDER) if word in lowered), len(TRD_SECTION_ORDER))
+
+
 def trd_json_to_markdown(data: Any) -> str:
     """
     Converts a TRD JSONB dict to a Markdown string.
 
     Each top-level key is a major section (Backend Technology Stack, Security, etc.)
-    containing nested string/list/dict values.
+    containing nested string/list/dict values. Sections follow TRD_SECTION_ORDER; empty values say "None stated."
     """
     if not data or not isinstance(data, dict):
         return ""
@@ -113,7 +127,9 @@ def trd_json_to_markdown(data: Any) -> str:
         indent = "  " * depth
         heading = "###" if depth == 0 else "####"
 
-        if isinstance(value, str):
+        if value is None or value == "" or value == [] or value == {}:
+            lines.append(f"{indent}**{_title(key)}:** {EMPTY_TEXT}\n")
+        elif isinstance(value, str):
             clean_str = _clean_mandated(value)
             lines.append(f"{indent}**{_title(key)}:** {clean_str}\n")
         elif isinstance(value, list):
@@ -130,7 +146,7 @@ def trd_json_to_markdown(data: Any) -> str:
         else:
             lines.append(f"{indent}**{_title(key)}:** {_clean_mandated(str(value))}\n")
 
-    for section_key, section_value in data.items():
+    for section_key, section_value in sorted(data.items(), key=lambda item: _trd_section_rank(item[0])):
         lines.append(f"## {section_key}\n")
         if isinstance(section_value, dict):
             for k, v in section_value.items():

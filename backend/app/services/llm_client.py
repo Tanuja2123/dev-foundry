@@ -374,7 +374,7 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                 started = time.time()
                 progress.detail(backup_notice(provider, errors))
 
-                try:
+                async def call_provider() -> Any:
                     res = provider.client.get_response(
                         messages=provider_messages,
                         stream=stream or stream_internally,
@@ -389,6 +389,20 @@ class FallbackChatCompletionClient(OpenAIChatCompletionClient):
                         res = await res
                     if stream_internally:
                         res = await read_stream_with_watchdog(res, provider)
+                    return res
+
+                try:
+                    try:
+                        res = await call_provider()
+                    except StreamStalledError as stalled:
+                        if stalled.updates != 0:
+                            raise
+                        # Not a single token before the stall limit: a cold start or a queue at the gateway, not a
+                        # stuck answer - try the same provider once more before giving up (ISSUES AGT-46, ref eeabebc5)
+                        logger.warning(f"[LLM Fallback] '{provider.name}' sent nothing for {stream_stall_seconds():.0f}s; "
+                                       "trying it once more")
+                        progress.detail(f"{provider.name} is slow to start; trying it once more")
+                        res = await call_provider()
                     if is_empty_response(res):
                         raise RuntimeError("empty response (no text and no tool call)")
                     logger.info(f"[LLM Dispatch] '{provider.name}' answered in {time.time() - started:.1f}s")
@@ -549,6 +563,10 @@ DEFAULT_STREAM_STALL_SECONDS = 120.0
 class StreamStalledError(RuntimeError):
     """A streamed answer stopped producing text (or exceeded the provider's total time)."""
 
+    def __init__(self, message: str, updates: Optional[int] = None):
+        super().__init__(message)
+        self.updates = updates          # how many updates arrived before it stopped (0 = not a single token)
+
 
 def stream_stall_seconds() -> float:
     """STREAM_STALL_SECONDS: a streamed answer with no new text for this long is abandoned (default 120)."""
@@ -599,7 +617,7 @@ async def read_stream_with_watchdog(stream: Any, provider: Any) -> Any:
                 idle += waited
                 if idle >= stall:
                     raise StreamStalledError(f"the stream stalled: no new text for {stall:.0f}s "
-                                             f"(after {time.time() - started:.0f}s, {updates} updates)")
+                                             f"(after {time.time() - started:.0f}s, {updates} updates)", updates)
                 continue
             try:
                 next_update.result()
