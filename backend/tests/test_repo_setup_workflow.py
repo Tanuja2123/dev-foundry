@@ -395,7 +395,7 @@ def test_a_stopped_turn_never_saves_a_structure_afterwards(db, ado):
     ({"remove": ["/frontend/.idea/a.xml", "/frontend/linux/x.cc", "/frontend/macos/y.swift", "/frontend/windows/z.cpp"]},
      "chore: remove 4 files in frontend/.idea, frontend/linux, frontend/macos and 1 more"),
     ({"add": ["/docs/architecture.md"]}, "docs: add docs/architecture.md"),
-    ({"add": ["/backend/app/auth.py", "/backend/app/users.py"]}, "feat: add 2 files in backend/app"),
+    ({"add": ["/backend/app/auth.py", "/backend/app/users.py"]}, "feat: add backend/app/auth.py and backend/app/users.py"),
     ({"edit": ["/backend/main.go"]}, "refactor: update backend/main.go"),
 ])
 def test_commit_messages_describe_the_commit(change, expected):
@@ -407,5 +407,13 @@ def test_commit_messages_describe_the_commit(change, expected):
     message = rsa.changes_commit_message(base, files, "v2 -> v3")
     subject, body = message.split("\n\n", 1)
     assert subject == expected
-    assert body.startswith("Requested in DevFoundry:") and "Structure v2 -> v3." in body
+    assert body.startswith("On top of the generator output:") and "Structure v2 -> v3." in body
     assert rsa.changes_commit_message(base, base) == rsa.CHANGES_COMMIT_MESSAGE      # nothing changed
+
+
+def test_the_readme_is_not_called_a_requested_change():
+    # AGT-45: "then your requested changes (1 added)" when the only change was DevFoundry's README
+    from app.services.agents.repo_setup_agent import changes_commit_message
+    base = [{"path": "/package.json", "content": "{}"}]
+    message = changes_commit_message(base, base + [{"path": "/README.md", "content": "# App"}], "v1")
+    assert message.startswith("docs: add README.md") and "README.md is written by DevFoundry" in message

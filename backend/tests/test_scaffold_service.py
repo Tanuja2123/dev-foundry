@@ -6,6 +6,7 @@ run the real `uv` CLI.
 """
 import base64
 import os
+import shlex
 import shutil
 import subprocess
 
@@ -81,7 +82,7 @@ def runner(monkeypatch):
         return subprocess.CompletedProcess(argv, code, out, err)
 
     monkeypatch.setattr(ss, "_resolve_executable", lambda name: f"/usr/bin/{name}" if name in ("uv", "npx", "npm") else None)
-    monkeypatch.setattr(ss.subprocess, "run", fake_run)
+    monkeypatch.setattr(ss, "run_process", fake_run)
     monkeypatch.setattr(ss, "_command_version", lambda command, args: None)   # no version lookups here
     return calls
 
@@ -241,9 +242,10 @@ def test_runs_commands_in_order_and_captures_exact_output(runner):
     # order, working folders and execution settings
     assert [os.path.basename(c["argv"][0]) for c in runner] == ["npx", "uv", "uv"]
     assert runner[2]["cwd"].replace("\\", "/").endswith("/backend")
-    assert all(c["shell"] is False and c["stdin"] == subprocess.DEVNULL and c["timeout"] for c in runner)
-    assert [c.to_dict() for c in result.commands] == [{"command": c["command"], "cwd": c.get("cwd", ".")}
-                                                      for c in FULLSTACK_COMMANDS]
+    assert all(c["timeout"] and "AZURE_DEVOPS_PAT" not in c["env"] for c in runner)   # no shell / stdin: run_process
+    # recorded as executed (shell-safe quoting; no automatic flags apply to these three) - AGT-45
+    assert [c.to_dict() for c in result.commands] == [{"command": shlex.join(shlex.split(c["command"])),
+                                                       "cwd": c.get("cwd", ".")} for c in FULLSTACK_COMMANDS]
 
 
 def test_commands_get_no_secrets_and_run_non_interactively(runner, monkeypatch):
@@ -285,7 +287,7 @@ def test_timeout_is_reported(monkeypatch):
     def slow(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
 
-    monkeypatch.setattr(ss.subprocess, "run", slow)
+    monkeypatch.setattr(ss, "run_process", slow)
     with pytest.raises(AdoPushError) as info:
         ss.run_scaffold_commands([{"command": "uv init x"}], timeout_seconds=5)
     assert info.value.error_type == "COMMAND_TIMEOUT"
@@ -293,7 +295,7 @@ def test_timeout_is_reported(monkeypatch):
 
 def test_commands_that_produce_nothing_fail(monkeypatch):
     monkeypatch.setattr(ss, "_resolve_executable", lambda name: "/usr/bin/uv")
-    monkeypatch.setattr(ss.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(ss, "run_process", lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", ""))
     with pytest.raises(AdoPushError) as info:
         ss.run_scaffold_commands([{"command": "uv lock"}])
     assert info.value.error_type == "SCAFFOLD_EMPTY"
@@ -465,7 +467,7 @@ def test_display_shows_markers_and_commit_plan_and_commands_only_after_the_push(
     pushed = render_structure_for_display(store.get_workflow_state(CONV))
     assert "Created by running these commands" in pushed
     assert "npx --yes create-vite@latest frontend --template react-ts" in pushed
-    assert "uv add --no-sync fastapi[standard]    # in backend/" in pushed
+    assert "uv add --no-sync 'fastapi[standard]'    # in backend/" in pushed     # executed command, shell-safe
 
 
 def test_agent_context_lists_paths_but_not_generated_contents(db, ado, runner):
@@ -543,3 +545,76 @@ def test_flutter_defaults_to_mobile_platforms():
     with_web = apply_auto_flags(flutter, ["create", "--platforms", "android,ios,web", "app"])
     assert "--platforms=android,ios" not in with_web                       # the agent's choice (from the TRD) wins
     assert find_generator                                                    # imported for completeness
+
+
+# ---------------------------------------------------------------------------- process runner, dependency steps (AGT-37/38/45)
+
+def test_run_process_runs_without_a_shell_and_kills_the_whole_tree_on_timeout(tmp_path):
+    import sys
+    import time
+    done = ss.run_process([sys.executable, "-c", "print('hello')"], cwd=str(tmp_path), env=dict(os.environ), timeout=30)
+    assert done.returncode == 0 and done.stdout.strip() == "hello"
+    # a parent whose child keeps the output pipe open (like npm.cmd -> node on Windows) must not block past the limit
+    child = ("import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+             "time.sleep(60)")
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        ss.run_process([sys.executable, "-c", child], cwd=str(tmp_path), env=dict(os.environ), timeout=2)
+    assert time.monotonic() - started < 25
+
+
+def _fake_npm(monkeypatch, behaviour):
+    calls = []
+    monkeypatch.setattr(ss, "_resolve_executable", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(ss, "_command_version", lambda command, args: None)
+
+    def run(argv, **kwargs):
+        calls.append(argv[1:])
+        if argv[1] == "init":
+            _write(kwargs["cwd"], "package.json", '{"name": "app"}')
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return behaviour(argv, kwargs)
+    monkeypatch.setattr(ss, "run_process", run)
+    return calls
+
+
+ERESOLVE = ("npm error code ERESOLVE\nnpm error ERESOLVE could not resolve\nnpm error While resolving: vitest@5.0.5\n"
+            "npm error Found: @types/node@20.19.43\nnpm error A complete log of this run can be found in: C:\\x.log")
+
+
+def test_a_failing_dependency_step_is_skipped_with_the_reason(monkeypatch):
+    calls = _fake_npm(monkeypatch, lambda argv, kw: subprocess.CompletedProcess(
+        argv, 1, "", "npm error 404 Not Found - leftpadx"))
+    result = ss.run_scaffold_commands([{"command": "npm init -y"},
+                                       {"command": "npm install leftpadx --package-lock-only"}])
+    assert [c.command for c in result.commands] == ["npm init -y"]          # the skipped step is not recorded
+    assert "failed and was skipped (404 Not Found - leftpadx)" in result.warnings[0]
+    assert len(calls) == 2
+
+
+def test_eresolve_is_retried_once_with_legacy_peer_deps(monkeypatch):
+    def behaviour(argv, kw):
+        ok = "--legacy-peer-deps" in argv
+        return subprocess.CompletedProcess(argv, 0 if ok else 1, "", "" if ok else ERESOLVE)
+    calls = _fake_npm(monkeypatch, behaviour)
+    result = ss.run_scaffold_commands([{"command": "npm init -y"},
+                                       {"command": "npm install --save-dev vitest --package-lock-only"}])
+    assert calls[-1][-1] == "--legacy-peer-deps" and len(calls) == 3
+    assert result.commands[-1].command.endswith("--legacy-peer-deps")     # recorded as it ran
+    assert "needed `--legacy-peer-deps`" in result.warnings[0] and "Found: @types/node@20.19.43" in result.warnings[0]
+
+
+def test_a_failing_generator_still_fails_and_says_why(monkeypatch):
+    monkeypatch.setattr(ss, "_resolve_executable", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(ss, "run_process", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 1, "", "error: Project already exists at `x`"))
+    with pytest.raises(AdoPushError) as info:
+        ss.run_scaffold_commands([{"command": "uv init x"}])
+    assert info.value.error_type == "COMMAND_FAILED"
+    assert str(info.value).endswith("failed with exit code 1: Project already exists at `x`")
+
+
+def test_error_summary_keeps_the_reason_and_drops_log_paths():
+    summary = ss.error_summary(ERESOLVE)
+    assert "ERESOLVE could not resolve" in summary and "Found: @types/node@20.19.43" in summary
+    assert "complete log" not in summary

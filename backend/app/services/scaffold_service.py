@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -499,26 +500,48 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
             os.makedirs(cwd, exist_ok=True)
             logger.info(f"[Scaffold] Running `{' '.join(args)}` in /{'' if command.cwd == '.' else command.cwd}")
             progress.detail(f"Running `{' '.join(args)[:120]}`")
+            dependency_step = is_dependency_step(args)
             try:
-                proc = subprocess.run([_resolve_executable(args[0]), *args[1:]], cwd=cwd, env=env, shell=False,
-                                      stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
-                                      errors="replace", timeout=timeout)
+                proc = run_process([_resolve_executable(args[0]), *args[1:]], cwd=cwd, env=env, timeout=timeout)
+                output = _tail((proc.stdout or "") + "\n" + (proc.stderr or ""))
+                if (proc.returncode != 0 and dependency_step and args[0] in ("npm", "pnpm") and "ERESOLVE" in output
+                        and "--legacy-peer-deps" not in args):
+                    # A peer-dependency conflict between the template's pins and the newest package (seen: Next.js
+                    # pins @types/node 20, Vitest 5 wants 22+): retry once accepting it, and say so
+                    logger.warning(f"[Scaffold] `{' '.join(args)}`: ERESOLVE, retrying with --legacy-peer-deps")
+                    args = args + ["--legacy-peer-deps"]
+                    proc = run_process([_resolve_executable(args[0]), *args[1:]], cwd=cwd, env=env, timeout=timeout)
+                    if proc.returncode == 0:
+                        warnings.append(f"`{' '.join(args)}` needed `--legacy-peer-deps`: {error_summary(output, 200)}. "
+                                        "Check those versions before relying on them.")
+                    output = _tail((proc.stdout or "") + "\n" + (proc.stderr or ""))
             except subprocess.TimeoutExpired as e:
+                logger.warning(f"[Scaffold] `{' '.join(args)}` did not finish within {timeout} s")
+                if dependency_step:
+                    warnings.append(f"`{' '.join(args)}` took longer than {timeout} s and was skipped; add those "
+                                    "packages later.")
+                    continue
                 raise _error(f"`{command.command}` did not finish within {timeout} seconds.", "COMMAND_TIMEOUT",
                              _tail(str(e.stdout or "")))
             except OSError as e:
                 raise _error(f"`{command.command}` could not be started: {e}", "COMMAND_FAILED")
-            output = _tail((proc.stdout or "") + "\n" + (proc.stderr or ""))
-            outputs.append({"command": command.command, "cwd": command.cwd, "exit_code": proc.returncode})
+            outputs.append({"command": " ".join(args), "cwd": command.cwd, "exit_code": proc.returncode})
             if proc.returncode != 0:
-                logger.warning(f"[Scaffold] `{command.command}` exited with {proc.returncode}")
-                raise _error(f"`{command.command}` failed with exit code {proc.returncode}.", "COMMAND_FAILED", output)
+                reason = error_summary(output)
+                logger.warning(f"[Scaffold] `{' '.join(args)}` exited with {proc.returncode}: {reason}\n{output}")
+                if dependency_step:
+                    warnings.append(f"`{' '.join(args)}` failed and was skipped ({reason or 'no error text'}). "
+                                    "The generated project is complete without it; add those packages later.")
+                    continue
+                raise _error(f"`{command.command}` failed with exit code {proc.returncode}"
+                             + (f": {reason}" if reason else "."), "COMMAND_FAILED", output)
             generator = next((g for g in GENERATORS if g.id == command.generator), None)
             missing = missing_expected_files(cwd, generator) if generator else []
             if missing:
                 warnings.append(f"`{command.command}` (in /{'' if command.cwd == '.' else command.cwd}) did not "
                                 f"produce the expected {', '.join(missing)}; check the generator options.")
             command.version = _command_version(command, args)
+            command.command = shlex.join(args)          # the command that really ran, incl. automatic flags (AGT-45)
             executed.append(command)
 
         files, skipped = collect_files(workspace)
@@ -536,6 +559,61 @@ def run_scaffold_commands(commands: Iterable[Any], timeout_seconds: Optional[int
     logger.info(f"[Scaffold] {len(executed)} step(s) produced {len(structure)} files in {duration}s")
     return ScaffoldResult(files=structure, commands=executed, outputs=outputs, skipped=skipped,
                           duration_seconds=duration, warnings=warnings)
+
+
+def run_process(argv: List[str], *, cwd: str, env: Mapping[str, str], timeout: float,
+                **_: Any) -> subprocess.CompletedProcess:
+    """
+    Runs a command without a shell and with no stdin. On a timeout the WHOLE process tree is stopped (ISSUES AGT-38:
+    `subprocess.run(timeout=…)` only killed `npm.cmd` on Windows; its `node` child kept the output pipes open, so the
+    call waited ~16 minutes instead of 10). Raises subprocess.TimeoutExpired like subprocess.run.
+    """
+    windows = os.name == "nt"
+    proc = subprocess.Popen(argv, cwd=cwd, env=dict(env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", shell=False,
+                            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0,
+                            start_new_session=not windows)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if windows:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, subprocess.SubprocessError):
+            proc.kill()
+        try:
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+# "Add dependencies" steps (npm install <pkgs>, uv add, cargo add, go get, composer require, dotnet add package): if one
+# of them fails, the generated project is still complete, so it is skipped with a note instead of failing everything
+# (ISSUES AGT-37: one extra `npm install vitest playwright` lost the whole structure).
+_DEPENDENCY_STEPS = {("npm", "install"), ("npm", "i"), ("npm", "add"), ("pnpm", "add"), ("yarn", "add"),
+                     ("bun", "add"), ("uv", "add"), ("cargo", "add"), ("go", "get"), ("composer", "require"),
+                     ("dotnet", "add")}
+
+
+def is_dependency_step(args: List[str]) -> bool:
+    return len(args) >= 3 and (args[0], args[1]) in _DEPENDENCY_STEPS and any(not a.startswith("-") for a in args[2:])
+
+
+def error_summary(output: str, limit: int = 300) -> str:
+    """The lines that say why a command failed (npm's "ERESOLVE … While resolving … Found …", a Python traceback's
+    last line…), for the user-facing reply. The full output goes to the log."""
+    lines = [re.sub(r"^(npm (?:error|ERR!)|error:?)\s*", "", line.strip(), flags=re.IGNORECASE)
+             for line in (output or "").splitlines()]
+    lines = [line for line in lines if line and not line.lower().startswith(
+        ("a complete log", "for a full report", "fix the upstream", "c:\\", "/home", "/root"))]
+    wanted = [line for line in lines if re.search(r"ERESOLVE|While resolving|Found:|Could not resolve|conflict|"
+                                                  r"not found|No matching|error|failed", line, re.IGNORECASE)]
+    summary = "; ".join(dict.fromkeys(wanted or lines[-2:]))
+    return (summary[:limit].rstrip() + "…") if len(summary) > limit else summary
 
 
 def decode_file(item: Mapping[str, str]) -> bytes:

@@ -214,27 +214,65 @@ def db(monkeypatch):
 
 
 class FakeAgent:
-    def __init__(self, outputs):
-        self.outputs, self.calls = list(outputs), []
+    """Answers by a function of the request payload (planner / writer), records every call."""
+    def __init__(self, answer):
+        self.answer, self.calls = answer, []
 
     async def run(self, messages):
-        self.calls.append(messages)
-        return SimpleNamespace(messages=[SimpleNamespace(text=self.outputs.pop(0))])
+        payload = json.loads(messages[0].text)
+        self.calls.append((payload, messages))
+        text = self.answer(payload, len(messages))
+        if isinstance(text, Exception):
+            raise text
+        return SimpleNamespace(messages=[SimpleNamespace(text=text)])
+
+
+PLAN = {"epic": {"title": "Online clinic booking", "goal": "Patients book online.", "scope": "Booking.",
+                 "success_criteria": []},
+        "features": [{"key": "F1", "title": "Booking", "description": "Book appointments.", "out_of_scope": [],
+                      "stories": [{"requirements": ["FR-001"], "domain": "Booking", "title": "Book a free slot"},
+                                  {"requirements": ["FR-002"], "domain": "Notifications", "title": "Send reminders"}]},
+                     {"key": "F2", "title": "Schedules", "description": "Manage schedules.", "out_of_scope": [],
+                      "stories": [{"requirements": ["FR-003"], "domain": "Schedules", "title": "Manage schedules"}]}],
+        "enablers": [], "tasks": "none", "rewrite": ["all"], "instruction": "", "change_summary": "Drafted."}
+
+
+def _writer(payload, with_tasks=False):
+    return json.dumps({"stories": [
+        {"key": s["key"], "user_story": f"As a user, I want {s['title']} so that it works.", "context": "From the PRD.",
+         "acceptance_criteria": [f"Given {s['key']}, when used, then it works"], "notes": "",
+         "tasks": [{"layer": "Backend", "title": f"Implement {s['title']}", "description": "API.",
+                    "done_when": "Tests pass."}] if with_tasks or payload.get("tasks") == "add" else []}
+        for s in payload["stories"]]})
+
+
+def _agents(monkeypatch, plan, writer=_writer):
+    planner, writer_agent = FakeAgent(plan), FakeAgent(writer)
+    monkeypatch.setattr(backlog_service, "get_backlog_planner", lambda client: planner)
+    monkeypatch.setattr(backlog_service, "get_backlog_writer", lambda client: writer_agent)
+    return planner, writer_agent
 
 
 def _state():
     return store.get_workflow_state(CONV)
 
 
-def test_draft_is_validated_stored_and_rendered(db, monkeypatch):
-    agent = FakeAgent(["not json", json.dumps({"status": "COMPLETE", "backlog": DRAFT, "change_summary": "Drafted."})])
-    monkeypatch.setattr(backlog_service, "get_backlog_agent", lambda client: agent)
+def test_draft_is_planned_then_written_per_feature_validated_stored_and_rendered(db, monkeypatch):
+    planner, writer = _agents(monkeypatch, lambda payload, n: "not json" if n == 1 else json.dumps(PLAN))
     reply = asyncio.run(backlog_service.run_backlog_operation(None, "GENERATE_WORK_ITEMS_PROPOSAL", "Plan the work items",
-                                                              [], _state()))
-    assert len(agent.calls) == 2                                          # one repair attempt
-    assert "approved_prd_json" in agent.calls[0][-1].text
+                                                              ["a long conversation"], _state()))
+    assert len(planner.calls) == 2                                       # one repair attempt
+    plan_request = planner.calls[0][0]
+    assert plan_request["requirements"][0] == {"id": "FR-001", "text": PRD["Functional Requirements"][0]["requirement"]}
+    assert "a long conversation" not in json.dumps(plan_request)          # no chat history (AGT-48)
+    assert len(writer.calls) == 2                                         # one writer call per feature
+    assert sorted(len(call[0]["stories"]) for call in writer.calls) == [1, 2]
     project = store.get_project(CONV)
-    assert project["work_items_proposal"]["features"][0]["key"] == "F1"
+    stories = [s for f in project["work_items_proposal"]["features"] for s in f["stories"]]
+    assert [s["title"] for s in stories] == ["[FR-001] [Booking]: Book a free slot",
+                                             "[FR-002] [Notifications]: Send reminders",
+                                             "[FR-003] [Schedules]: Manage schedules"]
+    assert stories[0]["parts"]["user_story"].startswith("As a user") and stories[0]["acceptance_criteria"]
     assert project["work_items_proposal_prd_version"] == 1
     assert reply.startswith("Here is the suggested **Azure Boards backlog** for **Clinic-Booking**")
     assert "1 epic, 2 features and 3 stories" in reply
@@ -242,14 +280,53 @@ def test_draft_is_validated_stored_and_rendered(db, monkeypatch):
     assert [s["label"] for s in wr.next_steps(_state())] == ["Approve and create Azure Boards items", "Request modifications to work items draft"]
 
 
-def test_update_sends_the_current_draft(db, monkeypatch):
-    store.update_project(store.get_project(CONV)["project_id"], work_items_proposal=DRAFT)
-    agent = FakeAgent([json.dumps({"status": "COMPLETE", "backlog": DRAFT, "change_summary": "Renamed F2."})])
-    monkeypatch.setattr(backlog_service, "get_backlog_agent", lambda client: agent)
+def _draft_first(db, monkeypatch):
+    _agents(monkeypatch, lambda payload, n: json.dumps(PLAN))
+    asyncio.run(backlog_service.run_backlog_operation(None, "GENERATE_WORK_ITEMS_PROPOSAL", "Plan", [], _state()))
+
+
+def test_update_rewrites_only_the_touched_stories(db, monkeypatch):
+    _draft_first(db, monkeypatch)
+    renamed = json.loads(json.dumps(PLAN))
+    renamed["features"][1]["title"] = "Doctor Schedules"
+    renamed["features"][1]["stories"][0]["title"] = "Manage doctors' weekly schedules"
+    renamed.update(rewrite=["FR-003"], instruction="Add a criterion for overlapping slots", change_summary="Renamed F2.")
+    planner, writer = _agents(monkeypatch, lambda payload, n: json.dumps(renamed))
     reply = asyncio.run(backlog_service.run_backlog_operation(None, "UPDATE_WORK_ITEMS_PROPOSAL", "Rename F2", [],
                                                               _state()))
-    assert "current_work_items_draft_json" in agent.calls[0][-1].text
+    outline = planner.calls[0][0]["current_outline"]
+    assert [s["key"] for f in outline["features"] for s in f["stories"]] == ["FR-001", "FR-002", "FR-003"]
+    assert "acceptance_criteria" not in json.dumps(outline)               # the outline has no long texts
+    assert len(writer.calls) == 1 and [s["key"] for s in writer.calls[0][0]["stories"]] == ["FR-003"]
+    assert writer.calls[0][0]["stories"][0]["current"]["acceptance_criteria"]   # the writer sees what to change
+    assert writer.calls[0][0]["instruction"] == "Add a criterion for overlapping slots"
     assert reply.startswith("Here is the updated, suggested **Azure Boards backlog** for **Clinic-Booking**. Renamed F2.")
+    stories = [s for f in store.get_project(CONV)["work_items_proposal"]["features"] for s in f["stories"]]
+    assert stories[0]["parts"]["user_story"] == "As a user, I want Book a free slot so that it works."   # kept
+
+
+def test_add_tasks_keeps_them_on_later_updates(db, monkeypatch):
+    _draft_first(db, monkeypatch)
+    with_tasks = dict(PLAN, tasks="add", rewrite=["all"], instruction="Add 2-5 tasks per story")
+    _agents(monkeypatch, lambda payload, n: json.dumps(with_tasks))
+    reply = asyncio.run(backlog_service.run_backlog_operation(None, "UPDATE_WORK_ITEMS_PROPOSAL", "Add tasks", [],
+                                                              _state()))
+    assert "Task [Backend]: Implement Book a free slot" in reply
+    # a later rename where the planner forgets to say "tasks": the existing tasks stay
+    rename = dict(PLAN, tasks="none", rewrite=[], change_summary="Renamed.")
+    _, writer = _agents(monkeypatch, lambda payload, n: json.dumps(rename))
+    asyncio.run(backlog_service.run_backlog_operation(None, "UPDATE_WORK_ITEMS_PROPOSAL", "Rename", [], _state()))
+    assert writer.calls == []                                             # nothing to rewrite
+    stories = [s for f in store.get_project(CONV)["work_items_proposal"]["features"] for s in f["stories"]]
+    assert all(s["tasks"] for s in stories)
+
+
+def test_a_failed_step_saves_nothing_and_says_why_with_a_reference(db, monkeypatch):
+    _agents(monkeypatch, lambda payload, n: json.dumps(PLAN), writer=lambda payload, n: RuntimeError("all busy"))
+    reply = asyncio.run(backlog_service.run_backlog_operation(None, "GENERATE_WORK_ITEMS_PROPOSAL", "Plan", [],
+                                                              _state()))
+    assert reply.startswith("I couldn't draft the work items this time because the AI service is busy")
+    assert "(Reference: " in reply and store.get_project(CONV).get("work_items_proposal") in (None, {})
 
 
 def test_create_stores_the_items_and_marks_the_draft_synced(db, monkeypatch):
@@ -418,11 +495,13 @@ def test_tasks_are_created_as_children_with_their_layer(boards):
     assert _field(story["patch"], "System.Tags") == "DevFoundry; FR-002; FR-003; Booking"
 
 
-def test_backlog_prompt_asks_for_parts_not_full_titles():
-    from app.services.agents.backlog_agent import BACKLOG_PROMPT
-    for rule in ("2-3 features", "groups 1-4 closely related requirements", "ONLY when the user asks for tasks",
-                 "The system adds \"[FR-ids] [Domain]: \" in front", "\"user_story\"", "\"done_when\""):
-        assert rule in BACKLOG_PROMPT
+def test_backlog_prompts_ask_for_parts_not_full_titles():
+    from app.services.agents.backlog_agent import PLANNER_PROMPT, WRITER_PROMPT
+    for rule in ("2-3 features", "groups 1-4 closely related requirements", "\"tasks\": \"add\" when the user asks",
+                 "the system adds \"[FR-ids] [Domain]: \"", "\"rewrite\""):
+        assert rule in PLANNER_PROMPT
+    for rule in ("\"user_story\"", "\"done_when\"", "Never vague", "never change it"):
+        assert rule in WRITER_PROMPT
 
 
 def test_technical_enablers_and_uncovered_goals():
@@ -447,3 +526,25 @@ def test_technical_enablers_and_uncovered_goals():
     # every FR is still in exactly one story; enablers have no requirement ids
     covered = [r for f in backlog["features"] for s in f["stories"] for r in s["requirements"]]
     assert sorted(covered) == ["FR-001", "FR-002", "FR-003", "FR-004", "FR-005"]
+
+
+def test_a_plan_that_misses_requirements_is_asked_again_then_completed(db, monkeypatch):
+    # seen live (GymPass): the planner left out 5 of 16 requirements; they ended up without acceptance criteria
+    partial = json.loads(json.dumps(PLAN))
+    partial["features"] = partial["features"][:1]                         # FR-003 missing
+    planner, writer = _agents(monkeypatch, lambda payload, n: json.dumps(PLAN if "correction" in payload else partial))
+    asyncio.run(backlog_service.run_backlog_operation(None, "GENERATE_WORK_ITEMS_PROPOSAL", "Plan", [], _state()))
+    assert len(planner.calls) == 2 and "FR-003" in planner.calls[1][0]["correction"]
+    stories = [s for f in store.get_project(CONV)["work_items_proposal"]["features"] for s in f["stories"]]
+    assert all(s["acceptance_criteria"] for s in stories)
+
+
+def test_requirements_still_missing_get_their_own_written_stories(db, monkeypatch):
+    partial = json.loads(json.dumps(PLAN))
+    partial["features"] = partial["features"][:1]
+    planner, writer = _agents(monkeypatch, lambda payload, n: json.dumps(partial))
+    asyncio.run(backlog_service.run_backlog_operation(None, "GENERATE_WORK_ITEMS_PROPOSAL", "Plan", [], _state()))
+    features = store.get_project(CONV)["work_items_proposal"]["features"]
+    other = next(f for f in features if f["title"] == "Other requirements")
+    assert [s["key"] for s in other["stories"]] == ["FR-003"] and other["stories"][0]["acceptance_criteria"]
+    assert any(call[0]["feature"]["title"] == "Other requirements" for call in writer.calls)

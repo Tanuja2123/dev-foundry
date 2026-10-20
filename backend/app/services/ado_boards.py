@@ -160,7 +160,9 @@ def normalize_backlog(draft: Any, prd: Optional[Dict[str, Any]]) -> Tuple[Dict[s
             "description": _join_sections(
                 ("Goal", _text(epic_in.get("goal") or epic_in.get("description")) or objective),
                 ("Scope", _text(epic_in.get("scope"))),
-                ("Success criteria", _bullets(_criteria(epic_in.get("success_criteria")) or [g for g in goals if g])))}
+                ("Success criteria", _bullets(_criteria(epic_in.get("success_criteria")) or [g for g in goals if g]))),
+            "parts": {"goal": _text(epic_in.get("goal")), "scope": _text(epic_in.get("scope")),
+                      "success_criteria": _criteria(epic_in.get("success_criteria"))}}
 
     features, used, seen_features = [], set(), set()
     for feature_in in draft.get("features") or []:
@@ -195,6 +197,10 @@ def normalize_backlog(draft: Any, prd: Optional[Dict[str, Any]]) -> Tuple[Dict[s
                     ("Notes", _text(story_in.get("notes"), 800))),
                 "acceptance_criteria": _criteria(story_in.get("acceptance_criteria")),
                 "tasks": [],
+                # the agent's parts, so a later update can keep this story's details without rewriting them
+                "parts": {"user_story": _text(story_in.get("user_story"), 600),
+                          "context": _text(story_in.get("context") or story_in.get("description"), 1500),
+                          "notes": _text(story_in.get("notes"), 800)},
             }
             for n, task_in in enumerate(story_in.get("tasks") or [], start=1):
                 if not isinstance(task_in, dict) or n > 8:
@@ -206,7 +212,9 @@ def normalize_backlog(draft: Any, prd: Optional[Dict[str, Any]]) -> Tuple[Dict[s
                 story["tasks"].append({
                     "key": f"{reqs[0]}-T{n}", "layer": layer, "title": f"[{layer}]: {task_action}"[:MAX_TITLE],
                     "description": _join_sections(("", _text(task_in.get("description"), 800)),
-                                                  ("Done when", _text(task_in.get("done_when"), 300)))})
+                                                  ("Done when", _text(task_in.get("done_when"), 300))),
+                    "parts": {"layer": layer, "title": task_action, "description": _text(task_in.get("description"), 800),
+                              "done_when": _text(task_in.get("done_when"), 300)}})
             stories.append(story)
         if not stories:
             continue
@@ -215,7 +223,9 @@ def normalize_backlog(draft: Any, prd: Optional[Dict[str, Any]]) -> Tuple[Dict[s
                          "description": _join_sections(
                              ("", _text(feature_in.get("description"), 1000)),
                              ("Out of scope", _bullets(_criteria(feature_in.get("out_of_scope"))))),
-                         "stories": stories})
+                         "stories": stories,
+                         "parts": {"description": _text(feature_in.get("description"), 1000),
+                                   "out_of_scope": _criteria(feature_in.get("out_of_scope"))}})
 
     # Technical enablers (FEATURES REV-9): stories for the non-functional goals, each linked to the goals it supports
     goals = [_text(g.get("goal") if isinstance(g, dict) else g, 400) for g in (prd or {}).get("Goals") or []]
@@ -233,7 +243,8 @@ def normalize_backlog(draft: Any, prd: Optional[Dict[str, Any]]) -> Tuple[Dict[s
             "description": _join_sections(
                 ("", _text(enabler.get("description"), 1000)),
                 ("Supports", _bullets([f"Goal {g}: {goals[g - 1]}" for g in numbers]))),
-            "acceptance_criteria": _criteria(enabler.get("acceptance_criteria")), "tasks": []})
+            "acceptance_criteria": _criteria(enabler.get("acceptance_criteria")), "tasks": [],
+            "goal_numbers": numbers, "parts": {"description": _text(enabler.get("description"), 1000)}})
 
     missing = [(req_id, text) for req_id, text in requirements if req_id not in used]
     if missing:
@@ -293,7 +304,8 @@ def flatten(backlog: Dict[str, Any]) -> List[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def render_backlog(backlog: Dict[str, Any], types: Optional[Dict[str, str]] = None,
-                   created: Optional[Dict[str, Any]] = None) -> str:
+                   created: Optional[Dict[str, Any]] = None, criteria_for: Optional[set] = None) -> str:
+    """The backlog as a nested list. criteria_for: show acceptance criteria only for these story keys (None = all)."""
     types = types or {"epic": "Epic", "feature": "Feature", "story": "Product Backlog Item"}
     created = created or {}
 
@@ -306,8 +318,9 @@ def render_backlog(backlog: Dict[str, Any], types: Optional[Dict[str, str]] = No
         lines.append(f"**{types.get('feature') or 'Group'}: {feature['title']}**{ref(feature['key'])}")
         for story in feature["stories"]:
             lines.append(f"- {story['title']}{ref(story['key'])}")
-            for criterion in story.get("acceptance_criteria") or []:
-                lines.append(f"  - {criterion}")
+            if criteria_for is None or story["key"] in criteria_for:
+                for criterion in story.get("acceptance_criteria") or []:
+                    lines.append(f"  - {criterion}")
             for task in story.get("tasks") or []:
                 lines.append(f"  - Task {task['title']}{ref(task['key'])}")
         lines.append("")

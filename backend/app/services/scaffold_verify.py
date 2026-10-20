@@ -3,23 +3,28 @@
 the saved structure in a temporary copy on the DevFoundry server, and reports ✓ / ✗ per part. Nothing in the project
 or the repository changes. No LLM involved.
 
-Safety: dependencies are installed with the package managers' "no install scripts" options where they exist, inside a
-throwaway folder that is deleted afterwards; a part whose toolchain is not installed on the server is reported as "not
-checked" instead of being guessed.
+Safety: only the GENERATED project is checked (Repository.scaffold_structure, the official generators' output): files the
+user added or changed through the chat are never run on the server, because a build runs project code (package.json
+scripts, mix.exs, build.gradle). Dependencies are installed with the package managers' "no install scripts" options
+where they exist, inside a throwaway folder that is deleted afterwards; a part whose toolchain is not installed on the
+server is reported as "not checked" instead of being guessed. SCAFFOLD_VERIFY=off switches the check off (e.g. on a
+shared server until it runs in a container).
 """
 import base64
+import contextvars
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional
 
 from app.core.logger import logger
 from app.services import progress
 from app.services.project_readme import detect_parts
-from app.services.scaffold_service import _command_env
+from app.services.scaffold_service import _command_env, run_process
 
 DEFAULT_TIMEOUT_SECONDS = 600
 
@@ -36,7 +41,7 @@ def verify_commands(title: str, files: Dict[str, Dict[str, Any]], prefix: str) -
     if "(Next.js)" in title or "(Vite)" in title or "(Angular)" in title or "(NestJS)" in title \
             or "(Express)" in title or "(Node.js)" in title:
         package = str((files.get(f"{prefix}/package.json") or {}).get("content") or "")
-        steps = ["npm install --ignore-scripts --no-audit --no-fund"]
+        steps = ["npm install --ignore-scripts --prefer-offline --no-audit --no-fund"]
         if '"build"' in package:
             steps.append("npm run build")
         return steps
@@ -81,60 +86,80 @@ def _tail(text: str, lines: int = 8) -> str:
     return "\n".join([line for line in (text or "").strip().splitlines() if line.strip()][-lines:])[:1500]
 
 
-def verify_structure(structure: List[Dict[str, Any]], runner=subprocess.run) -> List[Dict[str, Any]]:
-    """[{"part", "folder", "status": ok|failed|skipped, "commands", "detail"}] for every recognised part."""
+def _verify_part(part: Any, files: Dict[str, Dict[str, Any]], root: str, runner: Callable[..., Any],
+                 timeout: int) -> Dict[str, Any]:
+    prefix = f"/{part.folder}" if part.folder else ""
+    commands = verify_commands(part.title, files, prefix)
+    result = {"part": part.title, "folder": part.folder, "status": "ok", "commands": commands, "detail": "",
+              "no_build": bool(commands) and len(commands) == 1 and commands[0].startswith("npm install")}
+    if not commands:
+        result.update(status="skipped", detail="no build step is known for this part")
+    missing = sorted({c.split()[0] for c in commands if not shutil.which(c.split()[0])})
+    if missing:
+        result.update(status="skipped", detail=f"`{'`, `'.join(missing)}` isn't installed on the DevFoundry server")
+        commands = []
+    cwd = os.path.join(root, *part.folder.split("/")) if part.folder else root
+    for command in commands:
+        progress.detail(f"Running `{command}`" + (f" in {part.folder}/" if part.folder else ""))
+        started = time.time()
+        args = shlex.split(command)
+        try:
+            # Same way the generators run: the resolved executable (npm.cmd on Windows), no shell, no stdin, and the
+            # whole process tree is stopped on a timeout (ISSUES AGT-38)
+            done = runner([shutil.which(args[0]) or args[0], *args[1:]], cwd=cwd, env=_command_env(), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Not a failure of the scaffold: the install was too slow on this server (seen: 404 npm packages, all
+            # from the cache, took 395 s on a Windows machine) - so the result is unknown, not "broken"
+            logger.warning(f"[Scaffold Verify] {part.title}: `{command}` did not finish within {timeout} s")
+            result.update(status="timeout", detail=f"`{command}` took longer than {timeout // 60} minutes on this "
+                                                   "server (slow network or disk), so the result is unknown")
+            break
+        except OSError as exc:
+            logger.warning(f"[Scaffold Verify] {part.title}: `{command}` could not start: {exc}")
+            result.update(status="failed", detail=f"`{command}` could not start: {exc}")
+            break
+        logger.info(f"[Scaffold Verify] {part.title}: `{command}` -> {done.returncode} ({time.time() - started:.0f}s)")
+        if done.returncode != 0:
+            result.update(status="failed", detail=f"`{command}` failed:\n" + _tail(done.stderr or done.stdout))
+            break
+    return result
+
+
+def verify_structure(structure: List[Dict[str, Any]], runner: Callable[..., Any] = run_process
+                     ) -> List[Dict[str, Any]]:
+    """[{"part", "folder", "status": ok|failed|skipped|timeout, "commands", "detail", "no_build"}] per recognised
+    part. The parts are checked in parallel (each in its own folder of one temporary copy)."""
     files = {f["path"]: f for f in structure or [] if isinstance(f, dict) and f.get("path")}
     parts = detect_parts(structure)
-    results: List[Dict[str, Any]] = []
+    timeout = verify_timeout_seconds()
     with tempfile.TemporaryDirectory(prefix="devfoundry-verify-") as root:
         _materialize(structure, root)
-        for part in parts:
-            prefix = f"/{part.folder}" if part.folder else ""
-            commands = verify_commands(part.title, files, prefix)
-            result = {"part": part.title, "folder": part.folder, "status": "ok", "commands": commands, "detail": ""}
-            if not commands:
-                result.update(status="skipped", detail="no build step is known for this part")
-            missing = sorted({c.split()[0] for c in commands if not shutil.which(c.split()[0])})
-            if missing:
-                result.update(status="skipped",
-                              detail=f"`{'`, `'.join(missing)}` isn't installed on the DevFoundry server")
-                commands = []
-            cwd = os.path.join(root, *part.folder.split("/")) if part.folder else root
-            for command in commands:
-                progress.detail(f"Running `{command}`" + (f" in {part.folder}/" if part.folder else ""))
-                started = time.time()
-                args = shlex.split(command)
-                try:
-                    # Same way the generators run: the resolved executable (npm.cmd on Windows), no shell, no stdin
-                    done = runner([shutil.which(args[0]) or args[0], *args[1:]], cwd=cwd, env=_command_env(),
-                                  shell=False, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace", timeout=verify_timeout_seconds())
-                except subprocess.TimeoutExpired:
-                    result.update(status="failed", detail=f"`{command}` took longer than {verify_timeout_seconds()} s")
-                    break
-                except OSError as exc:
-                    result.update(status="failed", detail=f"`{command}` could not start: {exc}")
-                    break
-                logger.info(f"[Scaffold Verify] {part.title}: `{command}` -> {done.returncode} "
-                            f"({time.time() - started:.0f}s)")
-                if done.returncode != 0:
-                    result.update(status="failed", detail=f"`{command}` failed:\n" + _tail(done.stderr or done.stdout))
-                    break
-            results.append(result)
-    return results
+        if not parts:
+            return []
+        with ThreadPoolExecutor(max_workers=len(parts), thread_name_prefix="scaffold-verify") as pool:
+            # copy_context: progress.detail() in the worker threads reports to this conversation
+            futures = [pool.submit(contextvars.copy_context().run, _verify_part, part, files, root, runner, timeout)
+                       for part in parts]
+            return [future.result() for future in futures]
 
 
-def render_verification(results: List[Dict[str, Any]]) -> str:
+def render_verification(results: List[Dict[str, Any]], excluded: int = 0) -> str:
     if not results:
         return ("I couldn't recognise any part of this structure to check (no known project files), so nothing was "
                 "verified.\n\n---\n\nTell me which stack it uses, or regenerate the structure.")
-    lines = ["**Scaffold check**: I installed the dependencies and built each part in a temporary copy (nothing in "
-             "your project changed).", ""]
+    intro = ("**Scaffold check**: I installed the dependencies and built each part of the generated project in a "
+             "temporary copy (nothing in your project changed).")
+    if excluded:
+        intro += (f" Your {excluded} added or changed file{'s are' if excluded != 1 else ' is'} not part of this "
+                  "check: code you add is never run on the DevFoundry server.")
+    lines = [intro, ""]
     for r in results:
         where = f" — `{r['folder']}/`" if r["folder"] else ""
         if r["status"] == "ok":
-            lines.append(f"- {r['part']}{where} ✓ (" + ", ".join(f"`{c}`" for c in r["commands"]) + ")")
-        elif r["status"] == "skipped":
+            checked = ", ".join(f"`{c}`" for c in r["commands"])
+            note = " (it has no build script, so only the install was checked)" if r.get("no_build") else ""
+            lines.append(f"- {r['part']}{where} ✓ checked with {checked}{note}")
+        elif r["status"] in ("skipped", "timeout"):
             lines.append(f"- {r['part']}{where}: not checked, {r['detail']}")
         else:
             first, _, rest = r["detail"].partition("\n")
@@ -142,7 +167,12 @@ def render_verification(results: List[Dict[str, Any]]) -> str:
             if rest.strip():
                 lines += ["", "```text", rest.strip(), "```"]
     failed = [r for r in results if r["status"] == "failed"]
+    timed_out = [r for r in results if r["status"] == "timeout"]
     lines += ["", "---", ""]
-    lines.append("Tell me what to fix, or ask me to regenerate the structure." if failed else
-                 "Everything that could be checked installs and builds. Say **push to main** when you're ready.")
+    if failed:
+        lines.append("Tell me what to fix, or ask me to regenerate the structure.")
+    elif timed_out:
+        lines.append("Ask me to verify again later, or say **push to main** if the rest looks right.")
+    else:
+        lines.append("Everything that could be checked installs and builds. Say **push to main** when you're ready.")
     return "\n".join(lines)
